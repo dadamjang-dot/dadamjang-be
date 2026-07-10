@@ -1,26 +1,70 @@
 # dadamjang be
 
-다담장 커머스 플랫폼의 GraphQL API와 도메인 규칙을 담당합니다.
+다담장 커머스 플랫폼의 NestJS GraphQL API입니다.
 
 ## 도메인
 
-- 상품·오퍼·최종 가격 계산
-- 개인화 피드·Growth 실험·이벤트
-- 장바구니·주문·배송 예정일·recovery action
-- 파트너 상품 draft·품질 검증·발행
+- Auth: 이메일 회원가입/로그인, 카카오 로그인/가입, access/refresh token
+- Catalog: category, product, sku
+- Feed: 개인화 상품 피드
+- Wishlist: 위시템 저장/삭제
+- Cart: 장바구니 추가/삭제/조회
+- Order: mock checkout, 주문 조회
+- Partner: 사업자 이메일/사업자 등록번호 기반 파트너
+- Admin: 초대 기반 BO 계정
+- Media: Cloudflare R2/Images 기반 업로드 계약
+- Event: growth/event logging
 
-## 기술 방향
+## 기술
 
-- NestJS modular monolith
-- GraphQL query, mutation, subscription
-- PostgreSQL transaction과 append-only 이벤트 로그
+- NestJS
+- GraphQL
+- PostgreSQL
+- Drizzle ORM
+- Redis
+- Sentry
+- Datadog structured logging
 
-## 계약 원칙
+## 로컬 실행
 
-GraphQL schema가 프론트엔드와의 단일 계약입니다. 가격 계산과 주문 상태 전이는 서버에서만 확정합니다.
+```bash
+cp .env.example .env
+pnpm install
+pnpm db:up
+pnpm migrate
+pnpm start:dev
+```
 
-## 관측
+로컬 의존성은 `docker-compose.yml`에서 PostgreSQL 중심으로 실행합니다.
 
-- Datadog: 구조화된 HTTP 로그와 AWS 인프라 관측
-- Sentry: NestJS 예외와 성능 trace. `SENTRY_DSN`이 비어 있으면 전송하지 않습니다.
-Dadamjang GraphQL API and commerce domain services
+## 검증
+
+```bash
+pnpm lint
+pnpm build
+pnpm test
+```
+
+## 인증 계약
+
+- FO 로그인은 `portal: FO`를 사용합니다.
+- access token은 `Authorization: Bearer <accessToken>` 또는 cookie를 지원합니다.
+- refresh token은 native 앱을 위해 `Authorization: Bearer <refreshToken>`도 지원합니다.
+- Kakao callback은 `DADAMJANG_FO_AUTH_REDIRECT_URL`이 있으면 앱 deep link로 redirect합니다.
+
+## 환경 변수
+
+주요 값은 `.env.example`을 기준으로 설정합니다.
+
+- `JWT_ACCESS_TOKEN_SECRET`
+- `JWT_REFRESH_TOKEN_SECRET`
+- `EMAIL_CODE_PEPPER`
+- `KAKAO_CLIENT_ID`
+- `KAKAO_CALLBACK_URL`
+- `DADAMJANG_FO_AUTH_REDIRECT_URL`
+- `RESEND_API_KEY`
+- `CLOUDFLARE_R2_*`
+- `SENTRY_DSN`
+- `DATADOG_*`
+
+비밀값은 Git에 커밋하지 않습니다.
