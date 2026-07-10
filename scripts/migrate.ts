@@ -37,19 +37,24 @@ const main = async () => {
     for (const file of files) {
       const sql = await fs.readFile(path.join(migrationsDir, file), "utf8");
       const checksum = sha256(sql);
-      const applied = await pool.query<{ checksum: string }>('SELECT "checksum" FROM "_migrations" WHERE "name" = $1', [
-        file,
-      ]);
+      const applied = await pool.query<{ checksum: string }>(
+        'SELECT "checksum" FROM "_migrations" WHERE "name" = $1',
+        [file],
+      );
 
       if (applied.rowCount) {
-        if (applied.rows[0].checksum !== checksum) throw new Error(`migration checksum changed: ${file}`);
+        if (applied.rows[0].checksum !== checksum)
+          throw new Error(`migration checksum changed: ${file}`);
         continue;
       }
 
       await pool.query("BEGIN");
       try {
         await pool.query(sql);
-        await pool.query('INSERT INTO "_migrations" ("name", "checksum") VALUES ($1, $2)', [file, checksum]);
+        await pool.query('INSERT INTO "_migrations" ("name", "checksum") VALUES ($1, $2)', [
+          file,
+          checksum,
+        ]);
         await pool.query("COMMIT");
         console.log(`applied ${file}`);
       } catch (error) {

@@ -8,6 +8,15 @@ import { AuthErrorMessage } from "src/modules/auth/auth.error";
 import { AuthService } from "src/modules/auth/auth.service";
 import { AuthRequest, JwtPayload } from "src/modules/auth/auth.types";
 
+type RefreshRequest = AuthRequest & { refreshToken?: string };
+
+const refreshTokenFromRequest = (request: Request) => {
+  const authorization = request.headers.authorization;
+
+  if (authorization?.startsWith("Bearer ")) return authorization.slice("Bearer ".length);
+  return request.cookies?.refresh_token ?? null;
+};
+
 @Injectable()
 export class JwtRefreshTokenStrategy extends PassportStrategy(Strategy, "refresh_token") {
   /**
@@ -23,7 +32,7 @@ export class JwtRefreshTokenStrategy extends PassportStrategy(Strategy, "refresh
     super({
       jwtFromRequest: ExtractJwt.fromExtractors([
         (request: Request) => {
-          return request.cookies?.refresh_token ?? null;
+          return refreshTokenFromRequest(request);
         },
       ]),
       secretOrKey: configService.getOrThrow<string>("JWT_REFRESH_TOKEN_SECRET"),
@@ -40,8 +49,8 @@ export class JwtRefreshTokenStrategy extends PassportStrategy(Strategy, "refresh
    * @returns refresh token payload
    * @throws {CustomUnauthorizedException} refresh token이 없거나 저장된 값과 다를 때
    */
-  async validate(req: AuthRequest, payload: JwtPayload & { deviceId: string }) {
-    const refreshToken = req.cookies?.refresh_token;
+  async validate(req: RefreshRequest, payload: JwtPayload & { deviceId: string }) {
+    const refreshToken = refreshTokenFromRequest(req);
 
     if (!refreshToken) {
       throw new CustomUnauthorizedException(AuthErrorMessage.RefreshTokenUndefined);
@@ -53,6 +62,7 @@ export class JwtRefreshTokenStrategy extends PassportStrategy(Strategy, "refresh
       throw new CustomUnauthorizedException(AuthErrorMessage.RefreshTokenWrong);
     }
     req.user = payload;
+    req.refreshToken = refreshToken;
 
     return payload;
   }

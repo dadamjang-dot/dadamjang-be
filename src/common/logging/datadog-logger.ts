@@ -3,7 +3,7 @@ import { LoggerService } from "@nestjs/common";
 type LogLevel = "debug" | "error" | "log" | "verbose" | "warn";
 
 export class DatadogLogger implements LoggerService {
-  private readonly service = process.env.DD_SERVICE ?? "demo-backend";
+  private readonly service = process.env.DD_SERVICE ?? "dadamjang-be";
   private readonly env = process.env.DD_ENV ?? process.env.NODE_ENV ?? "development";
   private readonly version = process.env.DD_VERSION;
 

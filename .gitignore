@@ -2,3 +2,13 @@ node_modules/
 dist/
 .env
 .workflow
+.DS_Store
+*.log
+coverage/
+.env.*
+!.env.example
+.nyc_output/
+tmp/
+temp/
+*.tsbuildinfo
+*.orig.*

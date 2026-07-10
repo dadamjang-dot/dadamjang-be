@@ -1,31 +1,33 @@
-import tsParser from "@typescript-eslint/parser";
-import tsPlugin from "@typescript-eslint/eslint-plugin";
-import prettierConfig from "eslint-config-prettier";
+/// <reference types="node" />
 
-const config: Record<string, unknown>[] = [
+import eslint from "@eslint/js";
+import { defineConfig } from "eslint/config";
+import globals from "globals";
+import prettierRecommended from "eslint-plugin-prettier/recommended";
+import tseslint from "typescript-eslint";
+
+export default defineConfig(
   {
-    ignores: ["dist/**", "node_modules/**"],
+    ignores: ["dist/**", "coverage/**", "node_modules/**"],
   },
+  eslint.configs.recommended,
+  tseslint.configs.recommended,
   {
     files: ["{src,test}/**/*.ts"],
     languageOptions: {
-      parser: tsParser,
+      globals: {
+        ...globals.node,
+        ...globals.jest,
+      },
       parserOptions: {
         project: "tsconfig.json",
         tsconfigRootDir: process.cwd(),
-        sourceType: "module",
       },
     },
-    plugins: {
-      "@typescript-eslint": tsPlugin,
-    },
     rules: {
-      ...tsPlugin.configs.recommended.rules,
-      ...prettierConfig.rules,
       "@typescript-eslint/no-explicit-any": "error",
       "@typescript-eslint/no-unused-vars": ["error", { argsIgnorePattern: "^_" }],
     },
   },
-];
-
-export default config;
+  prettierRecommended,
+);

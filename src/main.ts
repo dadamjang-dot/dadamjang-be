@@ -1,3 +1,4 @@
+import "./instrument";
 import { NestFactory } from "@nestjs/core";
 import { AppModule } from "./modules/app.module";
 import { Logger } from "@nestjs/common";
@@ -5,6 +6,7 @@ import cookieParser from "cookie-parser";
 import passport from "passport";
 import { randomUUID } from "crypto";
 import { DatadogLogger } from "src/common/logging/datadog-logger";
+import { SentryGlobalFilter } from "@sentry/nestjs/setup";
 
 /**
  * Nest 애플리케이션을 생성하고 HTTP 서버를 시작한다.
@@ -14,6 +16,7 @@ import { DatadogLogger } from "src/common/logging/datadog-logger";
 const bootstrap = async () => {
   const app = await NestFactory.create(AppModule, { logger: new DatadogLogger() });
   const logger = new Logger("Http");
+  app.useGlobalFilters(new SentryGlobalFilter(app.getHttpAdapter()));
 
   app
     .getHttpAdapter()
@@ -43,10 +46,11 @@ const bootstrap = async () => {
   app.enableCors({
     origin: process.env.CLIENT_URL,
     methods: "GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS",
+    allowedHeaders: "Content-Type, Authorization, sentry-trace, baggage",
     credentials: true,
   });
 
-  await app.listen(5500);
+  await app.listen(Number(process.env.PORT ?? 5500));
 };
 
 bootstrap();

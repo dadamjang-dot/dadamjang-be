@@ -1,9 +1,11 @@
-const config = {
-  tabWidth: 2,
-  useTabs: false,
-  singleQuote: false,
-  trailingComma: "all",
-  printWidth: 120,
-} satisfies import("prettier").Config;
+import type { Config } from "prettier";
 
-module.exports = config;
+const config: Config = {
+  printWidth: 120,
+  singleQuote: false,
+  tabWidth: 2,
+  trailingComma: "all",
+  useTabs: false,
+};
+
+export default config;
