@@ -66,6 +66,15 @@ CREATE TABLE "wishlists" (
 );
 CREATE INDEX "wishlists_user_created_idx" ON "wishlists" ("userId", "createdAt");
 
+CREATE TABLE "comparisonItems" (
+  "comparisonItemId" uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  "userId" uuid NOT NULL REFERENCES "users"("userId"),
+  "productId" uuid NOT NULL REFERENCES "products"("productId"),
+  "createdAt" timestamp NOT NULL DEFAULT now(),
+  UNIQUE ("userId", "productId")
+);
+CREATE INDEX "comparison_items_user_created_idx" ON "comparisonItems" ("userId", "createdAt");
+
 CREATE TABLE "carts" (
   "cartId" uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   "userId" uuid NOT NULL UNIQUE REFERENCES "users"("userId"),

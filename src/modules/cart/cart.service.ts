@@ -31,12 +31,16 @@ export class CartService {
 
   upsertItem = async (userId: string, input: UpsertCartItemInput) => {
     if (input.quantity < 1) throw new CustomBadRequestException("Quantity must be positive");
-    const [sku] = await this.db
+    const [row] = await this.db
       .select()
       .from(productSkus)
+      .innerJoin(products, eq(productSkus.productId, products.productId))
       .where(and(eq(productSkus.skuId, input.skuId), eq(productSkus.isActive, true)))
       .limit(1);
-    if (!sku) throw new CustomNotFoundException("SKU not found");
+    if (!row) throw new CustomNotFoundException("SKU not found");
+    if (row.products.status !== "PUBLISHED") throw new CustomBadRequestException("Product is unavailable");
+    if (row.productSkus.stock < input.quantity)
+      throw new CustomBadRequestException(`Insufficient stock for ${row.productSkus.code}`);
     const cart = await this.getOrCreateCart(userId);
     await this.db
       .insert(cartItems)

@@ -60,12 +60,90 @@ export class ProductConnectionType {
   hasNextPage!: boolean;
 }
 
+@ObjectType()
+export class ProductPriceSummaryType {
+  @Field()
+  productId!: string;
+  @Field()
+  name!: string;
+  @Field(() => String, { nullable: true })
+  thumbnail!: string | null;
+  @Field(() => Int)
+  basePrice!: number;
+  @Field(() => Int)
+  finalPrice!: number;
+  @Field()
+  priceRevision!: string;
+  @Field()
+  lowestPriceEvidenceSummary!: string;
+}
+
+@ObjectType()
+export class ProductPriceSummaryConnectionType {
+  @Field(() => [ProductPriceSummaryType])
+  nodes!: ProductPriceSummaryType[];
+  @Field(() => String, { nullable: true })
+  nextCursor!: string | null;
+  @Field()
+  hasNextPage!: boolean;
+}
+
+@ObjectType()
+export class ProductPriceHistoryItemType {
+  @Field()
+  label!: string;
+  @Field(() => Int)
+  price!: number;
+  @Field()
+  recordedAt!: Date;
+}
+
+@ObjectType()
+export class ProductCouponConditionType {
+  @Field()
+  title!: string;
+  @Field(() => Int)
+  discountAmount!: number;
+  @Field()
+  condition!: string;
+}
+
+@ObjectType()
+export class ProductShippingPolicyType {
+  @Field()
+  title!: string;
+  @Field(() => Int)
+  shippingFee!: number;
+  @Field()
+  condition!: string;
+}
+
+@ObjectType()
+export class ProductPriceEvidenceType {
+  @Field()
+  productId!: string;
+  @Field()
+  priceRevision!: string;
+  @Field(() => [ProductPriceHistoryItemType])
+  priceHistory!: ProductPriceHistoryItemType[];
+  @Field(() => [ProductCouponConditionType])
+  couponConditions!: ProductCouponConditionType[];
+  @Field(() => ProductShippingPolicyType)
+  shippingPolicy!: ProductShippingPolicyType;
+  @Field()
+  offerSource!: string;
+  @Field()
+  calculatedAt!: Date;
+}
+
 @InputType()
 export class ProductFilterInput {
   @Field(() => String, { nullable: true })
   categoryId?: string;
   @Field(() => String, { nullable: true })
   query?: string;
+  @Field(() => String, { nullable: true })
+  sort?: "LATEST" | "LOW_PRICE" | "POPULAR";
   @Field(() => String, { nullable: true })
   after?: string;
   @Field(() => Int, { nullable: true })

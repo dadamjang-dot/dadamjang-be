@@ -179,6 +179,24 @@ export const wishlists = pgTable(
   ],
 );
 
+export const comparisonItems = pgTable(
+  "comparisonItems",
+  {
+    comparisonItemId: uuid("comparisonItemId").primaryKey().defaultRandom(),
+    userId: uuid("userId")
+      .notNull()
+      .references(() => users.userId),
+    productId: uuid("productId")
+      .notNull()
+      .references(() => products.productId),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+  },
+  (table) => [
+    unique("comparison_items_user_product_unique").on(table.userId, table.productId),
+    index("comparison_items_user_created_idx").on(table.userId, table.createdAt),
+  ],
+);
+
 export const carts = pgTable("carts", {
   cartId: uuid("cartId").primaryKey().defaultRandom(),
   userId: uuid("userId")

@@ -10,6 +10,8 @@ import {
   CreateCategoryInput,
   ProductConnectionType,
   ProductFilterInput,
+  ProductPriceEvidenceType,
+  ProductPriceSummaryConnectionType,
   ProductType,
 } from "./catalog.types";
 
@@ -27,9 +29,25 @@ export class CatalogResolver {
     return this.catalogService.listProducts(filter ?? {});
   }
 
+  @Query(() => ProductPriceSummaryConnectionType)
+  productPriceSummaries(
+    @Args("filter", { type: () => ProductFilterInput, nullable: true })
+    filter?: ProductFilterInput,
+  ) {
+    return this.catalogService.listProductPriceSummaries(filter ?? {});
+  }
+
   @Query(() => ProductType)
   product(@Args("productId") productId: string) {
     return this.catalogService.getProduct(productId);
+  }
+
+  @Query(() => ProductPriceEvidenceType)
+  productPriceEvidence(
+    @Args("productId") productId: string,
+    @Args("priceRevision", { nullable: true }) priceRevision?: string,
+  ) {
+    return this.catalogService.getProductPriceEvidence(productId, priceRevision);
   }
 
   @Mutation(() => CategoryType)
