@@ -23,6 +23,24 @@
 
 목록/비교 query는 상세 가격 근거를 포함하지 않습니다. 가격 변경 처리 시 전체 상품 목록 invalidate 대신 `productId + priceRevision` 기준 evidence/offer key만 갱신하는 것을 기본 전략으로 둡니다.
 
+## Checkout 정합성 계약
+
+- `checkoutCart(input)`은 `idempotencyKey`를 필수로 받습니다.
+- `checkoutIdempotencyKeys`는 `userId + idempotencyKey` unique constraint로 중복 checkout을 막습니다.
+- 같은 key로 재요청하면 저장된 `orderId`의 기존 주문을 반환합니다.
+- 주문 생성, order item 생성, SKU 재고 차감, cart 비우기는 하나의 PostgreSQL transaction에서 처리합니다.
+- SKU 재고 차감은 조건부 update로 수행해 stock이 0 미만이 되지 않게 합니다.
+- 재사용된 checkout 요청은 `CHECKOUT_IDEMPOTENCY_REUSED` activity event로 기록합니다.
+
+측정 기준:
+
+- 중복 checkout 요청 수
+- idempotency 재사용 처리 수
+- 재고 차감 실패율
+- oversell 재현 수
+- checkout mutation p95
+- 주문 생성 후 장바구니 cache 불일치 수
+
 ## 기술
 
 - NestJS

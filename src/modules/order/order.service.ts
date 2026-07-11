@@ -6,22 +6,23 @@ import {
   activityEvents,
   cartItems,
   carts,
+  checkoutIdempotencyKeys,
   orderItems,
   orders,
   productSkus,
   products,
 } from "src/modules/database/schema";
 
-type CheckoutInput = { forcePaymentFailure?: boolean };
+type CheckoutInput = { forcePaymentFailure?: boolean; idempotencyKey?: string };
 const orderNumber = () =>
   `DJ-${new Date().toISOString().slice(0, 10).replaceAll("-", "")}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
 const allowedTransitions: Record<string, string[]> = {
-  PAYMENT_PENDING: ["PAID", "PAYMENT_FAILED"],
-  PAID: ["PREPARING", "CANCELLED"],
-  PREPARING: ["SHIPPED", "CANCELLED"],
-  SHIPPED: ["DELIVERED"],
-  DELIVERED: [],
-  PAYMENT_FAILED: [],
+  PAYMENT_PENDING: ["PAID", "FAILED", "CANCELLED"],
+  PAID: ["FULFILLING", "CANCELLED"],
+  FULFILLING: ["COMPLETED", "CANCELLED"],
+  COMPLETED: [],
+  CANCELLED: [],
+  FAILED: [],
 };
 
 @Injectable()
@@ -30,6 +31,29 @@ export class OrderService {
 
   checkoutCart = async (userId: string, input: CheckoutInput) =>
     this.db.transaction(async (tx) => {
+      if (!input.idempotencyKey?.trim()) throw new CustomBadRequestException("idempotencyKey is required");
+      const checkoutKey = input.idempotencyKey.trim();
+      const [existingIdempotency] = await tx
+        .select()
+        .from(checkoutIdempotencyKeys)
+        .where(and(eq(checkoutIdempotencyKeys.userId, userId), eq(checkoutIdempotencyKeys.idempotencyKey, checkoutKey)))
+        .limit(1);
+      if (existingIdempotency?.orderId) {
+        await tx.insert(activityEvents).values({
+          actorUserId: userId,
+          eventType: "CHECKOUT_IDEMPOTENCY_REUSED",
+          subjectType: "ORDER",
+          subjectId: existingIdempotency.orderId,
+          payload: { idempotencyKey: checkoutKey },
+        });
+        return this.getOrderInTransaction(tx, userId, existingIdempotency.orderId);
+      }
+      if (existingIdempotency) throw new CustomBadRequestException("Checkout already processing");
+      const [idempotencyRecord] = await tx
+        .insert(checkoutIdempotencyKeys)
+        .values({ userId, idempotencyKey: checkoutKey })
+        .returning();
+
       const [cart] = await tx.select().from(carts).where(eq(carts.userId, userId)).limit(1);
       if (!cart) throw new CustomBadRequestException("Cart is empty");
       const rows = await tx
@@ -58,7 +82,7 @@ export class OrderService {
         const [failedOrder] = await tx
           .update(orders)
           .set({
-            status: "PAYMENT_FAILED",
+            status: "FAILED",
             paymentStatus: "FAILED",
             paymentFailureReason: "Mock payment rejected",
             updatedAt: new Date(),
@@ -72,6 +96,12 @@ export class OrderService {
           subjectId: order.orderId,
           payload: { totalAmount },
         });
+        await this.markIdempotencyCompleted(
+          tx,
+          idempotencyRecord.checkoutIdempotencyKeyId,
+          failedOrder.orderId,
+          "FAILED",
+        );
         return {
           ...failedOrder,
           items: await tx.select().from(orderItems).where(eq(orderItems.orderId, order.orderId)),
@@ -101,6 +131,12 @@ export class OrderService {
         subjectId: order.orderId,
         payload: { totalAmount },
       });
+      await this.markIdempotencyCompleted(
+        tx,
+        idempotencyRecord.checkoutIdempotencyKeyId,
+        paidOrder.orderId,
+        "COMPLETED",
+      );
       return {
         ...paidOrder,
         items: await tx.select().from(orderItems).where(eq(orderItems.orderId, order.orderId)),
@@ -117,7 +153,11 @@ export class OrderService {
   };
 
   getOrder = async (userId: string, orderId: string) => {
-    const [order] = await this.db
+    return this.getOrderInTransaction(this.db, userId, orderId);
+  };
+
+  private getOrderInTransaction = async (tx: Pick<Database, "select">, userId: string, orderId: string) => {
+    const [order] = await tx
       .select()
       .from(orders)
       .where(and(eq(orders.orderId, orderId), eq(orders.userId, userId)))
@@ -125,9 +165,20 @@ export class OrderService {
     if (!order) throw new CustomNotFoundException("Order not found");
     return {
       ...order,
-      items: await this.db.select().from(orderItems).where(eq(orderItems.orderId, orderId)),
+      items: await tx.select().from(orderItems).where(eq(orderItems.orderId, orderId)),
     };
   };
+
+  private markIdempotencyCompleted = async (
+    tx: Pick<Database, "update">,
+    checkoutIdempotencyKeyId: string,
+    orderId: string,
+    status: "COMPLETED" | "FAILED",
+  ) =>
+    tx
+      .update(checkoutIdempotencyKeys)
+      .set({ orderId, status, updatedAt: new Date() })
+      .where(eq(checkoutIdempotencyKeys.checkoutIdempotencyKeyId, checkoutIdempotencyKeyId));
 
   transitionOrder = async (orderId: string, nextStatus: string) => {
     const [order] = await this.db.select().from(orders).where(eq(orders.orderId, orderId)).limit(1);

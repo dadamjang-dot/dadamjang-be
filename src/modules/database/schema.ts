@@ -260,6 +260,25 @@ export const orderItems = pgTable("orderItems", {
   createdAt: timestamp("createdAt").defaultNow().notNull(),
 });
 
+export const checkoutIdempotencyKeys = pgTable(
+  "checkoutIdempotencyKeys",
+  {
+    checkoutIdempotencyKeyId: uuid("checkoutIdempotencyKeyId").primaryKey().defaultRandom(),
+    userId: uuid("userId")
+      .notNull()
+      .references(() => users.userId),
+    idempotencyKey: varchar("idempotencyKey", { length: 120 }).notNull(),
+    orderId: uuid("orderId").references(() => orders.orderId),
+    status: varchar("status", { length: 30 }).notNull().default("PROCESSING"),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().notNull(),
+  },
+  (table) => [
+    unique("checkout_idempotency_user_key_unique").on(table.userId, table.idempotencyKey),
+    index("checkout_idempotency_order_idx").on(table.orderId),
+  ],
+);
+
 export const adminInvites = pgTable(
   "adminInvites",
   {

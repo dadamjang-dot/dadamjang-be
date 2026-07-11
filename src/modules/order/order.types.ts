@@ -40,6 +40,9 @@ export class OrderType {
 
 @InputType()
 export class CheckoutCartInput {
+  @Field(() => String)
+  idempotencyKey!: string;
+
   @Field(() => Boolean, { nullable: true })
   forcePaymentFailure?: boolean;
 }

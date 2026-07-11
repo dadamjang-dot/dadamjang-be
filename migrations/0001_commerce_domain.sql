@@ -115,6 +115,18 @@ CREATE TABLE "orderItems" (
   "createdAt" timestamp NOT NULL DEFAULT now()
 );
 
+CREATE TABLE "checkoutIdempotencyKeys" (
+  "checkoutIdempotencyKeyId" uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  "userId" uuid NOT NULL REFERENCES "users"("userId"),
+  "idempotencyKey" varchar(120) NOT NULL,
+  "orderId" uuid REFERENCES "orders"("orderId"),
+  "status" varchar(30) NOT NULL DEFAULT 'PROCESSING',
+  "createdAt" timestamp NOT NULL DEFAULT now(),
+  "updatedAt" timestamp NOT NULL DEFAULT now(),
+  UNIQUE ("userId", "idempotencyKey")
+);
+CREATE INDEX "checkout_idempotency_order_idx" ON "checkoutIdempotencyKeys" ("orderId");
+
 CREATE TABLE "adminInvites" (
   "inviteId" uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   "email" varchar(255) NOT NULL UNIQUE,
