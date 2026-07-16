@@ -1,5 +1,6 @@
 import { Inject, Injectable } from "@nestjs/common";
 import { and, desc, eq } from "drizzle-orm";
+import { WishlistErrorMessage } from "./wishlist.error";
 import { CatalogService } from "src/modules/catalog/catalog.service";
 import { CustomNotFoundException } from "src/common/errors/custom-exceptions";
 import { Database, DRIZZLE } from "src/modules/database/database.module";
@@ -32,7 +33,8 @@ export class WishlistService {
 
   add = async (userId: string, productId: string) => {
     const [product] = await this.db.select().from(products).where(eq(products.productId, productId)).limit(1);
-    if (!product || product.status !== "PUBLISHED") throw new CustomNotFoundException("Product not found");
+    if (!product || product.status !== "PUBLISHED")
+      throw new CustomNotFoundException(WishlistErrorMessage.ProductNotFound);
     const [wishlist] = await this.db.insert(wishlists).values({ userId, productId }).onConflictDoNothing().returning();
     await this.db.insert(activityEvents).values({
       actorUserId: userId,

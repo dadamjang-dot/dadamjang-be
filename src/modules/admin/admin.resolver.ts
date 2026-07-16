@@ -7,6 +7,7 @@ import { CustomUnauthorizedException } from "src/common/errors/custom-exceptions
 import { JwtAccessTokenGuard } from "src/guards/accessToken.guard";
 import { RolesGuard } from "src/guards/roles.guard";
 import { AdminService } from "./admin.service";
+import { AdminErrorMessage } from "./admin.error";
 import {
   AcceptAdminInviteInput,
   AdminInviteType,
@@ -20,7 +21,7 @@ import { OrderType } from "src/modules/order/order.types";
 
 const currentUserId = (context: { req?: { user?: { userId?: string } } }) => {
   const userId = context.req?.user?.userId;
-  if (!userId) throw new CustomUnauthorizedException("Authentication required");
+  if (!userId) throw new CustomUnauthorizedException(AdminErrorMessage.AuthenticationRequired);
   return userId;
 };
 

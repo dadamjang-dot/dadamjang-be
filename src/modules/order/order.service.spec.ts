@@ -1,4 +1,5 @@
 import { CustomBadRequestException } from "src/common/errors/custom-exceptions";
+import { OrderErrorMessage } from "./order.error";
 import { OrderService } from "./order.service";
 
 describe("OrderService", () => {
@@ -7,7 +8,7 @@ describe("OrderService", () => {
       transaction: async (callback: (tx: unknown) => Promise<unknown>) => callback({}),
     };
     const service = new OrderService(db as never);
-    await expect(service.checkoutCart("user-1", {})).rejects.toThrow("idempotencyKey is required");
+    await expect(service.checkoutCart("user-1", {})).rejects.toThrow(OrderErrorMessage.IdempotencyKeyRequired);
   });
 
   it("rejects an empty cart before calling payment", async () => {

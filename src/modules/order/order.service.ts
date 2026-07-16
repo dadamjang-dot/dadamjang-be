@@ -1,6 +1,7 @@
 import { Inject, Injectable } from "@nestjs/common";
 import { and, desc, eq, gte, sql } from "drizzle-orm";
 import { CustomBadRequestException, CustomNotFoundException } from "src/common/errors/custom-exceptions";
+import { OrderErrorMessage, getInsufficientStockMessage, getCannotTransitionMessage } from "./order.error";
 import { Database, DRIZZLE } from "src/modules/database/database.module";
 import {
   activityEvents,
@@ -31,7 +32,7 @@ export class OrderService {
 
   checkoutCart = async (userId: string, input: CheckoutInput) =>
     this.db.transaction(async (tx) => {
-      if (!input.idempotencyKey?.trim()) throw new CustomBadRequestException("idempotencyKey is required");
+      if (!input.idempotencyKey?.trim()) throw new CustomBadRequestException(OrderErrorMessage.IdempotencyKeyRequired);
       const checkoutKey = input.idempotencyKey.trim();
       const [existingIdempotency] = await tx
         .select()
@@ -48,23 +49,23 @@ export class OrderService {
         });
         return this.getOrderInTransaction(tx, userId, existingIdempotency.orderId);
       }
-      if (existingIdempotency) throw new CustomBadRequestException("Checkout already processing");
+      if (existingIdempotency) throw new CustomBadRequestException(OrderErrorMessage.CheckoutProcessing);
       const [idempotencyRecord] = await tx
         .insert(checkoutIdempotencyKeys)
         .values({ userId, idempotencyKey: checkoutKey })
         .returning();
 
       const [cart] = await tx.select().from(carts).where(eq(carts.userId, userId)).limit(1);
-      if (!cart) throw new CustomBadRequestException("Cart is empty");
+      if (!cart) throw new CustomBadRequestException(OrderErrorMessage.CartEmpty);
       const rows = await tx
         .select()
         .from(cartItems)
         .innerJoin(productSkus, eq(cartItems.skuId, productSkus.skuId))
         .innerJoin(products, eq(productSkus.productId, products.productId))
         .where(eq(cartItems.cartId, cart.cartId));
-      if (rows.length === 0) throw new CustomBadRequestException("Cart is empty");
+      if (rows.length === 0) throw new CustomBadRequestException(OrderErrorMessage.CartEmpty);
       if (rows.some(({ productSkus: sku, products: product }) => !sku.isActive || product.status !== "PUBLISHED"))
-        throw new CustomBadRequestException("Cart contains an unavailable item");
+        throw new CustomBadRequestException(OrderErrorMessage.CartContainsUnavailableItem);
       const totalAmount = rows.reduce((sum, row) => sum + row.productSkus.price * row.cartItems.quantity, 0);
       const [order] = await tx.insert(orders).values({ orderNumber: orderNumber(), userId, totalAmount }).returning();
       await tx.insert(orderItems).values(
@@ -116,7 +117,7 @@ export class OrderService {
           })
           .where(and(eq(productSkus.skuId, row.productSkus.skuId), gte(productSkus.stock, row.cartItems.quantity)))
           .returning();
-        if (!updatedSku) throw new CustomBadRequestException(`Insufficient stock for ${row.productSkus.code}`);
+        if (!updatedSku) throw new CustomBadRequestException(getInsufficientStockMessage(row.productSkus.code));
       }
       const [paidOrder] = await tx
         .update(orders)
@@ -162,7 +163,7 @@ export class OrderService {
       .from(orders)
       .where(and(eq(orders.orderId, orderId), eq(orders.userId, userId)))
       .limit(1);
-    if (!order) throw new CustomNotFoundException("Order not found");
+    if (!order) throw new CustomNotFoundException(OrderErrorMessage.OrderNotFound);
     return {
       ...order,
       items: await tx.select().from(orderItems).where(eq(orderItems.orderId, orderId)),
@@ -182,9 +183,9 @@ export class OrderService {
 
   transitionOrder = async (orderId: string, nextStatus: string) => {
     const [order] = await this.db.select().from(orders).where(eq(orders.orderId, orderId)).limit(1);
-    if (!order) throw new CustomNotFoundException("Order not found");
+    if (!order) throw new CustomNotFoundException(OrderErrorMessage.OrderNotFound);
     if (!allowedTransitions[order.status]?.includes(nextStatus))
-      throw new CustomBadRequestException(`Cannot transition ${order.status} to ${nextStatus}`);
+      throw new CustomBadRequestException(getCannotTransitionMessage(order.status, nextStatus));
     const [updated] = await this.db
       .update(orders)
       .set({ status: nextStatus, updatedAt: new Date() })

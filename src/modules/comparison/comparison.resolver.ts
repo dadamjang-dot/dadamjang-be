@@ -6,12 +6,13 @@ import { CustomUnauthorizedException } from "src/common/errors/custom-exceptions
 import { ProductPriceSummaryType } from "src/modules/catalog/catalog.types";
 import { JwtAccessTokenGuard } from "src/guards/accessToken.guard";
 import { RolesGuard } from "src/guards/roles.guard";
+import { ComparisonErrorMessage } from "./comparison.error";
 import { ComparisonService } from "./comparison.service";
 import { ComparisonItemType } from "./comparison.types";
 
 const currentUserId = (context: { req?: { user?: { userId?: string } } }) => {
   const userId = context.req?.user?.userId;
-  if (!userId) throw new CustomUnauthorizedException("Authentication required");
+  if (!userId) throw new CustomUnauthorizedException(ComparisonErrorMessage.AuthenticationRequired);
   return userId;
 };
 

@@ -5,12 +5,13 @@ import { Roles } from "src/auth/roles.decorator";
 import { CustomUnauthorizedException } from "src/common/errors/custom-exceptions";
 import { JwtAccessTokenGuard } from "src/guards/accessToken.guard";
 import { RolesGuard } from "src/guards/roles.guard";
+import { EventErrorMessage } from "./event.error";
 import { EventService } from "./event.service";
 import { ActivityEventType, RecordActivityEventInput } from "./event.types";
 
 const currentUserId = (context: { req?: { user?: { userId?: string } } }) => {
   const userId = context.req?.user?.userId;
-  if (!userId) throw new CustomUnauthorizedException("Authentication required");
+  if (!userId) throw new CustomUnauthorizedException(EventErrorMessage.AuthenticationRequired);
   return userId;
 };
 

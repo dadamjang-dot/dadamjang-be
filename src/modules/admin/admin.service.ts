@@ -8,6 +8,7 @@ import { OrderService } from "src/modules/order/order.service";
 import { CustomBadRequestException, CustomNotFoundException } from "src/common/errors/custom-exceptions";
 import { Database, DRIZZLE } from "src/modules/database/database.module";
 import { adminInvites, auditLogs, partners, users } from "src/modules/database/schema";
+import { AdminErrorMessage } from "./admin.error";
 import { CreateAdminInviteInput, ReviewPartnerInput, ReviewProductInput, TransitionOrderInput } from "./admin.types";
 
 @Injectable()
@@ -33,7 +34,7 @@ export class AdminService {
         })
         .where(eq(partners.partnerId, input.partnerId))
         .returning();
-      if (!partner) throw new CustomNotFoundException("Partner not found");
+      if (!partner) throw new CustomNotFoundException(AdminErrorMessage.PartnerNotFound);
       if (input.approved)
         await tx
           .update(users)
@@ -116,7 +117,7 @@ export class AdminService {
           ),
         )
         .limit(1);
-      if (!invite) throw new CustomBadRequestException("Invalid or expired admin invite");
+      if (!invite) throw new CustomBadRequestException(AdminErrorMessage.InvalidOrExpiredInvite);
       const [existingUser] = await tx.select().from(users).where(eq(users.email, invite.email.toLowerCase())).limit(1);
       const userId = existingUser?.userId ?? randomUUID();
       if (existingUser) {
@@ -135,7 +136,7 @@ export class AdminService {
         .set({ acceptedByUserId: userId, acceptedAt: new Date() })
         .where(eq(adminInvites.inviteId, invite.inviteId))
         .returning();
-      if (!acceptedInvite) throw new CustomBadRequestException("Invalid or expired admin invite");
+      if (!acceptedInvite) throw new CustomBadRequestException(AdminErrorMessage.InvalidOrExpiredInvite);
       return { ...invite, token: null };
     });
 }

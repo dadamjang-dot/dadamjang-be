@@ -1,5 +1,6 @@
 import { Inject, Injectable } from "@nestjs/common";
 import { desc, eq, inArray } from "drizzle-orm";
+import { FeedErrorMessage } from "./feed.error";
 import { CatalogService } from "src/modules/catalog/catalog.service";
 import { CustomBadRequestException } from "src/common/errors/custom-exceptions";
 import { Database, DRIZZLE } from "src/modules/database/database.module";
@@ -16,7 +17,7 @@ const decodeCursor = (cursor: string): FeedCursor => {
     if (!Number.isInteger(parsed.offset) || parsed.offset < 0) throw new Error("invalid");
     return parsed;
   } catch {
-    throw new CustomBadRequestException("Invalid feed cursor");
+    throw new CustomBadRequestException(FeedErrorMessage.InvalidCursor);
   }
 };
 

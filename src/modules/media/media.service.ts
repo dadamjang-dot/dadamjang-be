@@ -4,6 +4,7 @@ import { PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { randomUUID } from "crypto";
 import { CustomBadRequestException } from "src/common/errors/custom-exceptions";
+import { MediaErrorMessage } from "./media.error";
 import type { CreateProductImageUploadInput, ProductImageUploadTarget } from "./media.types";
 
 const supportedContentTypes = new Set(["image/jpeg", "image/png", "image/webp"]);
@@ -33,7 +34,7 @@ export class MediaService {
 
   createProductUpload = async (input: CreateProductImageUploadInput): Promise<ProductImageUploadTarget> => {
     if (!supportedContentTypes.has(input.contentType)) {
-      throw new CustomBadRequestException("지원하지 않는 이미지 형식입니다.");
+      throw new CustomBadRequestException(MediaErrorMessage.UnsupportedType);
     }
 
     const extension = input.filename.split(".").pop()?.toLowerCase();
@@ -49,7 +50,7 @@ export class MediaService {
   };
 
   getProductImageUrl = async (key: string, width?: number): Promise<string> => {
-    if (!key.startsWith("products/")) throw new CustomBadRequestException("유효하지 않은 이미지 키입니다.");
+    if (!key.startsWith("products/")) throw new CustomBadRequestException(MediaErrorMessage.InvalidKey);
     return this.transformedUrl(key, width);
   };
 

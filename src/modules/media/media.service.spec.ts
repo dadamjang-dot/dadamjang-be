@@ -1,4 +1,5 @@
 import { ConfigService } from "@nestjs/config";
+import { MediaErrorMessage } from "./media.error";
 import { MediaService } from "./media.service";
 
 const createService = () => {
@@ -28,6 +29,6 @@ describe("MediaService", () => {
   it("rejects image keys outside the product namespace", async () => {
     const service = createService();
 
-    await expect(service.getProductImageUrl("private/product.jpg")).rejects.toThrow("유효하지 않은 이미지 키입니다.");
+    await expect(service.getProductImageUrl("private/product.jpg")).rejects.toThrow(MediaErrorMessage.InvalidKey);
   });
 });

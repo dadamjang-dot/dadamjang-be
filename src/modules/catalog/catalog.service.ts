@@ -3,6 +3,7 @@ import { and, desc, eq, ilike, inArray, lt } from "drizzle-orm";
 import { CustomBadRequestException, CustomNotFoundException } from "src/common/errors/custom-exceptions";
 import { Database, DRIZZLE } from "src/modules/database/database.module";
 import { categories, productSkus, products } from "src/modules/database/schema";
+import { CatalogErrorMessage } from "./catalog.error";
 import {
   CreateCategoryInput,
   CreateProductDraftInput,
@@ -24,7 +25,7 @@ export const decodeProductCursor = (cursor: string): ProductCursor => {
       throw new Error("invalid cursor");
     return value;
   } catch {
-    throw new CustomBadRequestException("Invalid product cursor");
+    throw new CustomBadRequestException(CatalogErrorMessage.InvalidCursor);
   }
 };
 
@@ -142,14 +143,14 @@ export class CatalogService {
       .from(products)
       .where(and(eq(products.productId, productId), eq(products.status, "PUBLISHED")))
       .limit(1);
-    if (!product) throw new CustomNotFoundException("Product not found");
+    if (!product) throw new CustomNotFoundException(CatalogErrorMessage.ProductNotFound);
     return (await this.withSkus([product]))[0];
   };
 
   createDraft = async (partnerId: string, input: CreateProductDraftInput) => {
     if (input.skus.length === 0) throw new CustomBadRequestException("At least one SKU is required");
     if (input.skus.some((sku) => sku.price < 0 || sku.stock < 0))
-      throw new CustomBadRequestException("Price and stock must be non-negative");
+      throw new CustomBadRequestException(CatalogErrorMessage.InvalidPriceOrStock);
     return this.db.transaction(async (tx) => {
       const [product] = await tx
         .insert(products)
@@ -172,7 +173,7 @@ export class CatalogService {
       .from(products)
       .where(and(eq(products.productId, productId), eq(products.partnerId, partnerId)))
       .limit(1);
-    if (!product) throw new CustomNotFoundException("Product not found");
+    if (!product) throw new CustomNotFoundException(CatalogErrorMessage.ProductNotFound);
     return (await this.withSkus([product]))[0];
   };
 
@@ -186,7 +187,7 @@ export class CatalogService {
       })
       .where(eq(products.productId, productId))
       .returning();
-    if (!product) throw new CustomNotFoundException("Product not found");
+    if (!product) throw new CustomNotFoundException(CatalogErrorMessage.ProductNotFound);
     return product;
   };
 
@@ -202,7 +203,7 @@ export class CatalogService {
         ),
       )
       .returning();
-    if (!product) throw new CustomBadRequestException("Product must be approved before publishing");
+    if (!product) throw new CustomBadRequestException(CatalogErrorMessage.PublishUnapprovedProduct);
     return product;
   };
 

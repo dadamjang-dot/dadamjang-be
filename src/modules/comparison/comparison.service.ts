@@ -1,6 +1,7 @@
 import { Inject, Injectable } from "@nestjs/common";
 import { and, desc, eq } from "drizzle-orm";
 import { CustomNotFoundException } from "src/common/errors/custom-exceptions";
+import { ComparisonErrorMessage } from "./comparison.error";
 import { CatalogService } from "src/modules/catalog/catalog.service";
 import { Database, DRIZZLE } from "src/modules/database/database.module";
 import { activityEvents, comparisonItems, products } from "src/modules/database/schema";
@@ -42,7 +43,8 @@ export class ComparisonService {
 
   add = async (userId: string, productId: string) => {
     const product = await this.catalogService.getProduct(productId);
-    if (!product || product.status !== "PUBLISHED") throw new CustomNotFoundException("Product not found");
+    if (!product || product.status !== "PUBLISHED")
+      throw new CustomNotFoundException(ComparisonErrorMessage.ProductNotFound);
     const [item] = await this.db
       .insert(comparisonItems)
       .values({ userId, productId })

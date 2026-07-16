@@ -3,6 +3,7 @@ import { desc, eq, lt } from "drizzle-orm";
 import { CustomBadRequestException, CustomNotFoundException } from "src/common/errors/custom-exceptions";
 import { Database, DRIZZLE } from "src/modules/database/database.module";
 import { stylePosts } from "src/modules/database/schema";
+import { StylePostErrorMessage } from "./style-posts.error";
 import { CreateStylePostInput, StylePostConnectionType, StylePostType } from "./style-posts.types";
 
 type StylePostCursor = { createdAt: string; stylePostId: string };
@@ -16,7 +17,7 @@ const decodeCursor = (cursor: string): StylePostCursor => {
     if (!value.createdAt || !value.stylePostId || Number.isNaN(Date.parse(value.createdAt))) throw new Error("invalid");
     return value;
   } catch {
-    throw new CustomBadRequestException("Invalid style post cursor");
+    throw new CustomBadRequestException(StylePostErrorMessage.InvalidCursor);
   }
 };
 
@@ -40,7 +41,7 @@ export class StylePostsService {
 
   get = async (stylePostId: string): Promise<StylePostType> => {
     const [post] = await this.db.select().from(stylePosts).where(eq(stylePosts.stylePostId, stylePostId)).limit(1);
-    if (!post) throw new CustomNotFoundException("Style post not found");
+    if (!post) throw new CustomNotFoundException(StylePostErrorMessage.NotFound);
     return this.toType(post);
   };
 

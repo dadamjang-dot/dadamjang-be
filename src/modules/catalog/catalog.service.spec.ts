@@ -1,3 +1,4 @@
+import { CatalogErrorMessage } from "./catalog.error";
 import { decodeProductCursor, encodeProductCursor } from "./catalog.service";
 
 describe("catalog cursor", () => {
@@ -7,6 +8,6 @@ describe("catalog cursor", () => {
   });
 
   it("rejects malformed cursors", () => {
-    expect(() => decodeProductCursor("not-a-cursor")).toThrow("Invalid product cursor");
+    expect(() => decodeProductCursor("not-a-cursor")).toThrow(CatalogErrorMessage.InvalidCursor);
   });
 });

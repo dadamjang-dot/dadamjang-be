@@ -3,6 +3,7 @@ import { and, eq } from "drizzle-orm";
 import { CustomBadRequestException, CustomNotFoundException } from "src/common/errors/custom-exceptions";
 import { Database, DRIZZLE } from "src/modules/database/database.module";
 import { activityEvents, cartItems, carts, productSkus, products } from "src/modules/database/schema";
+import { CartErrorMessage, getInsufficientStockMessage } from "./cart.error";
 import { CartType, UpsertCartItemInput } from "./cart.types";
 
 @Injectable()
@@ -30,17 +31,17 @@ export class CartService {
   };
 
   upsertItem = async (userId: string, input: UpsertCartItemInput) => {
-    if (input.quantity < 1) throw new CustomBadRequestException("Quantity must be positive");
+    if (input.quantity < 1) throw new CustomBadRequestException(CartErrorMessage.QuantityMustBePositive);
     const [row] = await this.db
       .select()
       .from(productSkus)
       .innerJoin(products, eq(productSkus.productId, products.productId))
       .where(and(eq(productSkus.skuId, input.skuId), eq(productSkus.isActive, true)))
       .limit(1);
-    if (!row) throw new CustomNotFoundException("SKU not found");
-    if (row.products.status !== "PUBLISHED") throw new CustomBadRequestException("Product is unavailable");
+    if (!row) throw new CustomNotFoundException(CartErrorMessage.SkuNotFound);
+    if (row.products.status !== "PUBLISHED") throw new CustomBadRequestException(CartErrorMessage.ProductUnavailable);
     if (row.productSkus.stock < input.quantity)
-      throw new CustomBadRequestException(`Insufficient stock for ${row.productSkus.code}`);
+      throw new CustomBadRequestException(getInsufficientStockMessage(row.productSkus.code));
     const cart = await this.getOrCreateCart(userId);
     await this.db
       .insert(cartItems)
@@ -75,7 +76,7 @@ export class CartService {
     const [cart] = await this.db.insert(carts).values({ userId }).onConflictDoNothing().returning();
     if (cart) return cart;
     const [existing] = await this.db.select().from(carts).where(eq(carts.userId, userId)).limit(1);
-    if (!existing) throw new Error("Cart creation failed");
+    if (!existing) throw new Error(CartErrorMessage.CartCreationFailed);
     return existing;
   };
 }

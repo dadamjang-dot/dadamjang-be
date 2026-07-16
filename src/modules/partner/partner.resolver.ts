@@ -6,12 +6,13 @@ import { CreateProductDraftInput, ProductType } from "src/modules/catalog/catalo
 import { CustomUnauthorizedException } from "src/common/errors/custom-exceptions";
 import { JwtAccessTokenGuard } from "src/guards/accessToken.guard";
 import { RolesGuard } from "src/guards/roles.guard";
+import { PartnerErrorMessage } from "./partner.error";
 import { PartnerService } from "./partner.service";
 import { ApplyPartnerInput, PartnerType } from "./partner.types";
 
 const currentUserId = (context: { req?: { user?: { userId?: string } } }) => {
   const userId = context.req?.user?.userId;
-  if (!userId) throw new CustomUnauthorizedException("Authentication required");
+  if (!userId) throw new CustomUnauthorizedException(PartnerErrorMessage.AuthenticationRequired);
   return userId;
 };
 

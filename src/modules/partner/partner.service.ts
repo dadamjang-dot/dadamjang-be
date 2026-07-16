@@ -6,6 +6,7 @@ import { CustomBadRequestException, CustomNotFoundException } from "src/common/e
 import { Database, DRIZZLE } from "src/modules/database/database.module";
 import { EmailService } from "src/modules/email/email.service";
 import { activityEvents, partners } from "src/modules/database/schema";
+import { PartnerErrorMessage } from "./partner.error";
 import { ApplyPartnerInput } from "./partner.types";
 
 @Injectable()
@@ -18,7 +19,7 @@ export class PartnerService {
 
   apply = async (ownerUserId: string, input: ApplyPartnerInput) => {
     const [existing] = await this.db.select().from(partners).where(eq(partners.ownerUserId, ownerUserId)).limit(1);
-    if (existing) throw new CustomBadRequestException("Partner application already exists");
+    if (existing) throw new CustomBadRequestException(PartnerErrorMessage.AlreadyExists);
     const businessEmail = this.emailService.normalizeEmail(input.businessEmail);
     await this.emailService.consumeVerifiedEmailToken(input.businessEmailVerificationToken, businessEmail);
     const [partner] = await this.db
@@ -41,21 +42,21 @@ export class PartnerService {
 
   getMine = async (ownerUserId: string) => {
     const [partner] = await this.db.select().from(partners).where(eq(partners.ownerUserId, ownerUserId)).limit(1);
-    if (!partner) throw new CustomNotFoundException("Partner application not found");
+    if (!partner) throw new CustomNotFoundException(PartnerErrorMessage.NotFound);
     return partner;
   };
 
   createDraft = async (ownerUserId: string, input: CreateProductDraftInput) => {
     const partner = await this.getMine(ownerUserId);
     if (partner.status !== "APPROVED")
-      throw new CustomBadRequestException("Partner approval is required before product creation");
+      throw new CustomBadRequestException(PartnerErrorMessage.ApprovalRequiredForProduct);
     return this.catalogService.createDraft(partner.partnerId, input);
   };
 
   publishProduct = async (ownerUserId: string, productId: string) => {
     const partner = await this.getMine(ownerUserId);
     if (partner.status !== "APPROVED")
-      throw new CustomBadRequestException("Partner approval is required before publishing");
+      throw new CustomBadRequestException(PartnerErrorMessage.ApprovalRequiredForPublishing);
     return this.catalogService.publishProduct(partner.partnerId, productId);
   };
 }
