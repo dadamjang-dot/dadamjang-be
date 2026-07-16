@@ -12,3 +12,6 @@ tmp/
 temp/
 *.tsbuildinfo
 *.orig.*
+
+# iCloud exclusions
+node_modules.nosync
