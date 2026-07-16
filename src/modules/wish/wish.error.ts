@@ -1,4 +1,4 @@
-export enum WishlistErrorMessage {
+export enum WishErrorMessage {
   ProductNotFound = "Product not found",
   AuthenticationRequired = "Authentication required",
 }

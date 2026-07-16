@@ -4,6 +4,7 @@ import { CustomBadRequestException, CustomNotFoundException } from "src/common/e
 import { Database, DRIZZLE } from "src/modules/database/database.module";
 import { categories, productSkus, products } from "src/modules/database/schema";
 import { CatalogErrorMessage } from "./catalog.error";
+import { MAX_PAGE_SIZE } from "./catalog.constant";
 import {
   CreateCategoryInput,
   CreateProductDraftInput,
@@ -14,7 +15,6 @@ import {
 } from "./catalog.types";
 
 type ProductCursor = { createdAt: string; productId: string };
-const MAX_PAGE_SIZE = 50;
 
 export const encodeProductCursor = (cursor: ProductCursor) => Buffer.from(JSON.stringify(cursor)).toString("base64url");
 

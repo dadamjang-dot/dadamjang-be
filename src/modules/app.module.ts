@@ -14,7 +14,7 @@ import { EventModule } from "./event/event.module";
 import { FeedModule } from "./feed/feed.module";
 import { OrderModule } from "./order/order.module";
 import { PartnerModule } from "./partner/partner.module";
-import { WishlistModule } from "./wishlist/wishlist.module";
+import { WishModule } from "./wish/wish.module";
 import { StylePostsModule } from "./style-posts/style-posts.module";
 
 @Module({
@@ -40,7 +40,7 @@ import { StylePostsModule } from "./style-posts/style-posts.module";
     FeedModule,
     OrderModule,
     PartnerModule,
-    WishlistModule,
+    WishModule,
     StylePostsModule,
   ],
 })

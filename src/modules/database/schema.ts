@@ -178,10 +178,10 @@ export const productSkus = pgTable(
   (table) => [index("product_skus_product_idx").on(table.productId, table.isActive)],
 );
 
-export const wishlists = pgTable(
-  "wishlists",
+export const wishes = pgTable(
+  "wishes",
   {
-    wishlistId: uuid("wishlistId").primaryKey().defaultRandom(),
+    wishId: uuid("wishId").primaryKey().defaultRandom(),
     userId: uuid("userId")
       .notNull()
       .references(() => users.userId),
@@ -191,8 +191,8 @@ export const wishlists = pgTable(
     createdAt: timestamp("createdAt").defaultNow().notNull(),
   },
   (table) => [
-    unique("wishlists_user_product_unique").on(table.userId, table.productId),
-    index("wishlists_user_created_idx").on(table.userId, table.createdAt),
+    unique("wishes_user_product_unique").on(table.userId, table.productId),
+    index("wishes_user_created_idx").on(table.userId, table.createdAt),
   ],
 );
 

@@ -12,7 +12,7 @@ import {
 } from "src/modules/order/order.error";
 import { PartnerErrorMessage } from "src/modules/partner/partner.error";
 import { StylePostErrorMessage } from "src/modules/style-posts/style-posts.error";
-import { WishlistErrorMessage } from "src/modules/wishlist/wishlist.error";
+import { WishErrorMessage } from "src/modules/wish/wish.error";
 
 describe("Module Error Messages", () => {
   it("defines admin error messages correctly", () => {
@@ -80,8 +80,8 @@ describe("Module Error Messages", () => {
     expect(StylePostErrorMessage.AuthenticationRequired).toBe("Authentication required");
   });
 
-  it("defines wishlist error messages correctly", () => {
-    expect(WishlistErrorMessage.ProductNotFound).toBe("Product not found");
-    expect(WishlistErrorMessage.AuthenticationRequired).toBe("Authentication required");
+  it("defines wish error messages correctly", () => {
+    expect(WishErrorMessage.ProductNotFound).toBe("Product not found");
+    expect(WishErrorMessage.AuthenticationRequired).toBe("Authentication required");
   });
 });

@@ -2,9 +2,9 @@ import { Field, ObjectType } from "@nestjs/graphql";
 import { ProductType } from "src/modules/catalog/catalog.types";
 
 @ObjectType()
-export class WishlistType {
+export class WishType {
   @Field()
-  wishlistId!: string;
+  wishId!: string;
   @Field()
   productId!: string;
   @Field()

@@ -1,6 +1,7 @@
 import { Inject, Injectable } from "@nestjs/common";
 import { and, desc, eq, gte, sql } from "drizzle-orm";
 import { CustomBadRequestException, CustomNotFoundException } from "src/common/errors/custom-exceptions";
+import { ALLOWED_TRANSITIONS } from "./order.constant";
 import { OrderErrorMessage, getInsufficientStockMessage, getCannotTransitionMessage } from "./order.error";
 import { Database, DRIZZLE } from "src/modules/database/database.module";
 import {
@@ -17,14 +18,6 @@ import {
 type CheckoutInput = { forcePaymentFailure?: boolean; idempotencyKey?: string };
 const orderNumber = () =>
   `DJ-${new Date().toISOString().slice(0, 10).replaceAll("-", "")}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
-const allowedTransitions: Record<string, string[]> = {
-  PAYMENT_PENDING: ["PAID", "FAILED", "CANCELLED"],
-  PAID: ["FULFILLING", "CANCELLED"],
-  FULFILLING: ["COMPLETED", "CANCELLED"],
-  COMPLETED: [],
-  CANCELLED: [],
-  FAILED: [],
-};
 
 @Injectable()
 export class OrderService {
@@ -184,7 +177,7 @@ export class OrderService {
   transitionOrder = async (orderId: string, nextStatus: string) => {
     const [order] = await this.db.select().from(orders).where(eq(orders.orderId, orderId)).limit(1);
     if (!order) throw new CustomNotFoundException(OrderErrorMessage.OrderNotFound);
-    if (!allowedTransitions[order.status]?.includes(nextStatus))
+    if (!ALLOWED_TRANSITIONS[order.status]?.includes(nextStatus))
       throw new CustomBadRequestException(getCannotTransitionMessage(order.status, nextStatus));
     const [updated] = await this.db
       .update(orders)

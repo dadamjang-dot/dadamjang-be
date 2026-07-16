@@ -4,10 +4,10 @@ import { CustomBadRequestException, CustomNotFoundException } from "src/common/e
 import { Database, DRIZZLE } from "src/modules/database/database.module";
 import { stylePosts } from "src/modules/database/schema";
 import { StylePostErrorMessage } from "./style-posts.error";
+import { MAX_PAGE_SIZE } from "./style-posts.constant";
 import { CreateStylePostInput, StylePostConnectionType, StylePostType } from "./style-posts.types";
 
 type StylePostCursor = { createdAt: string; stylePostId: string };
-const MAX_PAGE_SIZE = 50;
 
 const encodeCursor = (cursor: StylePostCursor) => Buffer.from(JSON.stringify(cursor)).toString("base64url");
 

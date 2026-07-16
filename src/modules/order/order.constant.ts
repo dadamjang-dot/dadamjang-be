@@ -1,0 +1,8 @@
+export const ALLOWED_TRANSITIONS: Record<string, string[]> = {
+  PAYMENT_PENDING: ["PAID", "FAILED", "CANCELLED"],
+  PAID: ["FULFILLING", "CANCELLED"],
+  FULFILLING: ["COMPLETED", "CANCELLED"],
+  COMPLETED: [],
+  CANCELLED: [],
+  FAILED: [],
+};

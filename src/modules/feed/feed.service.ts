@@ -1,13 +1,14 @@
 import { Inject, Injectable } from "@nestjs/common";
 import { desc, eq, inArray } from "drizzle-orm";
 import { FeedErrorMessage } from "./feed.error";
+import { MAX_PAGE_SIZE } from "./feed.constant";
 import { CatalogService } from "src/modules/catalog/catalog.service";
 import { CustomBadRequestException } from "src/common/errors/custom-exceptions";
 import { Database, DRIZZLE } from "src/modules/database/database.module";
-import { activityEvents, products, wishlists } from "src/modules/database/schema";
+import { activityEvents, products, wishes } from "src/modules/database/schema";
 
 type FeedCursor = { offset: number };
-const MAX_PAGE_SIZE = 50;
+
 const stableHash = (value: string) =>
   [...value].reduce((hash, character) => ((hash << 5) - hash + character.charCodeAt(0)) | 0, 0) >>> 0;
 const encodeCursor = (cursor: FeedCursor) => Buffer.from(JSON.stringify(cursor)).toString("base64url");
@@ -32,9 +33,9 @@ export class FeedService {
     const pageSize = Math.min(Math.max(first, 1), MAX_PAGE_SIZE);
     const offset = after ? decodeCursor(after).offset : 0;
     const likedProducts = await this.db
-      .select({ productId: wishlists.productId })
-      .from(wishlists)
-      .where(eq(wishlists.userId, userId));
+      .select({ productId: wishes.productId })
+      .from(wishes)
+      .where(eq(wishes.userId, userId));
     const viewed = await this.db
       .select({ subjectId: activityEvents.subjectId })
       .from(activityEvents)

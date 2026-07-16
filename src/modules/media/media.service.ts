@@ -5,9 +5,8 @@ import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { randomUUID } from "crypto";
 import { CustomBadRequestException } from "src/common/errors/custom-exceptions";
 import { MediaErrorMessage } from "./media.error";
+import { SUPPORTED_CONTENT_TYPES } from "./media.constant";
 import type { CreateProductImageUploadInput, ProductImageUploadTarget } from "./media.types";
-
-const supportedContentTypes = new Set(["image/jpeg", "image/png", "image/webp"]);
 
 @Injectable()
 export class MediaService {
@@ -33,7 +32,7 @@ export class MediaService {
   }
 
   createProductUpload = async (input: CreateProductImageUploadInput): Promise<ProductImageUploadTarget> => {
-    if (!supportedContentTypes.has(input.contentType)) {
+    if (!SUPPORTED_CONTENT_TYPES.has(input.contentType)) {
       throw new CustomBadRequestException(MediaErrorMessage.UnsupportedType);
     }
 
