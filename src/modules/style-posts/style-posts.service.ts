@@ -1,5 +1,5 @@
 import { Inject, Injectable } from "@nestjs/common";
-import { and, desc, eq, lt } from "drizzle-orm";
+import { desc, eq, lt } from "drizzle-orm";
 import { CustomBadRequestException, CustomNotFoundException } from "src/common/errors/custom-exceptions";
 import { Database, DRIZZLE } from "src/modules/database/database.module";
 import { stylePosts } from "src/modules/database/schema";
@@ -47,14 +47,13 @@ export class StylePostsService {
   list = async (after?: string, first?: number): Promise<StylePostConnectionType> => {
     const pageSize = Math.min(Math.max(first ?? 20, 1), MAX_PAGE_SIZE);
     const cursor = after ? decodeCursor(after) : undefined;
-    const conditions = cursor ? [lt(stylePosts.createdAt, new Date(cursor.createdAt))] : [];
-    let query = this.db
-      .select()
-      .from(stylePosts)
-      .orderBy(desc(stylePosts.createdAt), desc(stylePosts.stylePostId))
-      .limit(pageSize + 1);
-    if (conditions.length) query = query.where(and(...conditions));
-    const rows = await query;
+    const query = cursor
+      ? this.db
+          .select()
+          .from(stylePosts)
+          .where(lt(stylePosts.createdAt, new Date(cursor.createdAt)))
+      : this.db.select().from(stylePosts);
+    const rows = await query.orderBy(desc(stylePosts.createdAt), desc(stylePosts.stylePostId)).limit(pageSize + 1);
     const nodes = rows.slice(0, pageSize).map((row) => this.toType(row));
     const hasNextPage = rows.length > pageSize;
     const tail = nodes[nodes.length - 1];

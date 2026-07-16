@@ -22,5 +22,5 @@
     "noFallthroughCasesInSwitch": false,
     "esModuleInterop": true
   },
-  "exclude": ["dist", "node_modules", "eslint.config.ts", "prettier.config.ts"]
+  "exclude": ["dist", "node_modules", "node_modules.nosync", "eslint.config.ts", "prettier.config.ts"]
 }
