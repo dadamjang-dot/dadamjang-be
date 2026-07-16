@@ -143,6 +143,23 @@ export const products = pgTable(
   ],
 );
 
+export const stylePosts = pgTable(
+  "stylePosts",
+  {
+    stylePostId: uuid("stylePostId").primaryKey().defaultRandom(),
+    authorId: uuid("authorId")
+      .notNull()
+      .references(() => users.userId),
+    title: varchar("title", { length: 200 }).notNull(),
+    content: text("content").notNull(),
+    imageUrls: jsonb("imageUrls").$type<string[]>().notNull().default([]),
+    isPartner: boolean("isPartner").notNull().default(false),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().notNull(),
+  },
+  (table) => [index("style_posts_author_created_idx").on(table.authorId, table.createdAt)],
+);
+
 export const productSkus = pgTable(
   "productSkus",
   {
@@ -341,3 +358,4 @@ export type Partner = typeof partners.$inferSelect;
 export type Product = typeof products.$inferSelect;
 export type ProductSku = typeof productSkus.$inferSelect;
 export type Order = typeof orders.$inferSelect;
+export type StylePost = typeof stylePosts.$inferSelect;

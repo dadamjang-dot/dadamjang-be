@@ -15,6 +15,7 @@ import { FeedModule } from "./feed/feed.module";
 import { OrderModule } from "./order/order.module";
 import { PartnerModule } from "./partner/partner.module";
 import { WishlistModule } from "./wishlist/wishlist.module";
+import { StylePostsModule } from "./style-posts/style-posts.module";
 
 @Module({
   imports: [
@@ -40,6 +41,7 @@ import { WishlistModule } from "./wishlist/wishlist.module";
     OrderModule,
     PartnerModule,
     WishlistModule,
+    StylePostsModule,
   ],
 })
 export class AppModule {}
