@@ -22,7 +22,7 @@ export class WishResolver {
   constructor(private readonly wishService: WishService) {}
 
   @Query(() => [WishType])
-  wish(@Context() context: { req?: { user?: { userId?: string } } }) {
+  wishlist(@Context() context: { req?: { user?: { userId?: string } } }) {
     return this.wishService.list(currentUserId(context));
   }
 
