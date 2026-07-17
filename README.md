@@ -7,7 +7,7 @@
 - Auth: 이메일 회원가입/로그인, 카카오 로그인/가입, access/refresh token
 - Catalog: category, product, sku
 - Feed: 개인화 상품 피드
-- Wishlist: 위시템 저장/삭제
+- Wish: 위시템 저장/삭제
 - Cart: 장바구니 추가/삭제/조회
 - Order: mock checkout, 주문 조회
 - Partner: 사업자 이메일/사업자 등록번호 기반 파트너
