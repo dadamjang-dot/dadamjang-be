@@ -7,6 +7,7 @@ import { RolesGuard } from "src/guards/roles.guard";
 import { CatalogService } from "./catalog.service";
 import {
   CategoryType,
+  CatalogFilterOptionsType,
   CreateCategoryInput,
   ProductConnectionType,
   ProductFilterInput,
@@ -22,6 +23,11 @@ export class CatalogResolver {
   @Query(() => [CategoryType])
   categories() {
     return this.catalogService.listCategories();
+  }
+
+  @Query(() => CatalogFilterOptionsType)
+  catalogFilterOptions() {
+    return this.catalogService.listCatalogFilterOptions();
   }
 
   @Query(() => ProductConnectionType)

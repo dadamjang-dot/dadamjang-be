@@ -1,27 +1,34 @@
 import { Inject, Injectable } from "@nestjs/common";
-import { and, desc, eq, ilike, inArray, lt } from "drizzle-orm";
+import { and, asc, desc, eq, gte, ilike, inArray, lte, sql } from "drizzle-orm";
 import { CustomBadRequestException, CustomNotFoundException } from "src/common/errors/custom-exceptions";
 import { Database, DRIZZLE } from "src/modules/database/database.module";
-import { categories, productSkus, products } from "src/modules/database/schema";
+import { brands, categories, colors, productSkus, products, sizes } from "src/modules/database/schema";
 import { CatalogErrorMessage } from "./catalog.error";
 import { MAX_PAGE_SIZE } from "./catalog.constant";
 import {
+  CatalogFilterOptionsType,
   CreateCategoryInput,
   CreateProductDraftInput,
   ProductFilterInput,
   ProductPriceEvidenceType,
   ProductPriceSummaryType,
+  ProductSort,
   ProductType,
 } from "./catalog.types";
 
-type ProductCursor = { createdAt: string; productId: string };
+type ProductCursor = { createdAt: string; productId: string; sortValue?: number };
 
 export const encodeProductCursor = (cursor: ProductCursor) => Buffer.from(JSON.stringify(cursor)).toString("base64url");
 
 export const decodeProductCursor = (cursor: string): ProductCursor => {
   try {
     const value = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8")) as ProductCursor;
-    if (!value.createdAt || !value.productId || Number.isNaN(Date.parse(value.createdAt)))
+    if (
+      !value.createdAt ||
+      !value.productId ||
+      Number.isNaN(Date.parse(value.createdAt)) ||
+      (value.sortValue !== undefined && !Number.isFinite(value.sortValue))
+    )
       throw new Error("invalid cursor");
     return value;
   } catch {
@@ -40,45 +47,47 @@ export class CatalogService {
       .where(eq(categories.isActive, true))
       .orderBy(categories.sortOrder, categories.name);
 
+  listCatalogFilterOptions = async (): Promise<CatalogFilterOptionsType> => {
+    const [categoryRows, brandRows, colorRows, sizeRows] = await Promise.all([
+      this.db
+        .select()
+        .from(categories)
+        .where(eq(categories.isActive, true))
+        .orderBy(asc(categories.sortOrder), asc(categories.name)),
+      this.db.select().from(brands).where(eq(brands.isActive, true)).orderBy(asc(brands.name)),
+      this.db.select().from(colors).where(eq(colors.isActive, true)).orderBy(asc(colors.name)),
+      this.db.select().from(sizes).where(eq(sizes.isActive, true)).orderBy(asc(sizes.sortOrder), asc(sizes.name)),
+    ]);
+    return {
+      categories: categoryRows,
+      brands: brandRows,
+      colors: colorRows,
+      sizes: sizeRows,
+    };
+  };
+
   createCategory = async (input: CreateCategoryInput) => {
     const [category] = await this.db.insert(categories).values(input).returning();
     return category;
   };
 
   listProducts = async (filter: ProductFilterInput) => {
-    const { rows, first } = await this.listProductRows(filter);
-    const nodes = await this.sortProducts(await this.withSkus(rows.slice(0, first)), filter.sort);
-    const hasNextPage = rows.length > first;
-    const tail = nodes[nodes.length - 1];
+    const { nodes, hasNextPage, nextCursor, totalCount } = await this.listCatalogProducts(filter);
     return {
       nodes,
       hasNextPage,
-      nextCursor:
-        hasNextPage && tail
-          ? encodeProductCursor({
-              createdAt: tail.createdAt.toISOString(),
-              productId: tail.productId,
-            })
-          : null,
+      nextCursor,
+      totalCount,
     };
   };
 
   listProductPriceSummaries = async (filter: ProductFilterInput) => {
-    const { rows, first } = await this.listProductRows(filter);
-    const productsWithSkus = await this.sortProducts(await this.withSkus(rows.slice(0, first)), filter.sort);
-    const nodes = productsWithSkus.map((product) => this.toPriceSummary(product));
-    const hasNextPage = rows.length > first;
-    const tail = productsWithSkus[productsWithSkus.length - 1];
+    const { nodes: productsWithSkus, hasNextPage, nextCursor, totalCount } = await this.listCatalogProducts(filter);
     return {
-      nodes,
+      nodes: productsWithSkus.map((product) => this.toPriceSummary(product)),
       hasNextPage,
-      nextCursor:
-        hasNextPage && tail
-          ? encodeProductCursor({
-              createdAt: tail.createdAt.toISOString(),
-              productId: tail.productId,
-            })
-          : null,
+      nextCursor,
+      totalCount,
     };
   };
 
@@ -120,21 +129,63 @@ export class CatalogService {
     };
   };
 
-  private listProductRows = async (filter: ProductFilterInput) => {
+  private listCatalogProducts = async (filter: ProductFilterInput) => {
     const first = Math.min(Math.max(filter.first ?? 20, 1), MAX_PAGE_SIZE);
     const cursor = filter.after ? decodeProductCursor(filter.after) : undefined;
+    const conditions = this.productConditions(filter);
+    const [rows, countRows] = await Promise.all([
+      this.db
+        .select()
+        .from(products)
+        .where(and(...conditions))
+        .orderBy(desc(products.createdAt), desc(products.productId)),
+      this.db
+        .select({ count: sql<number>`count(*)` })
+        .from(products)
+        .where(and(...conditions)),
+    ]);
+    const filtered = (await this.withSkus(rows)).filter((product) => this.matchesFilter(product, filter));
+    const sorted = this.sortProducts(filtered, filter.sort);
+    const start = cursor ? this.cursorStart(sorted, cursor, filter.sort) : 0;
+    const page = sorted.slice(start, start + first + 1);
+    const nodes = page.slice(0, first);
+    const hasNextPage = page.length > first;
+    const tail = nodes[nodes.length - 1];
+    return {
+      nodes,
+      hasNextPage,
+      nextCursor: hasNextPage && tail ? encodeProductCursor(this.toProductCursor(tail, filter.sort)) : null,
+      totalCount: Number(countRows[0]?.count ?? sorted.length),
+    };
+  };
+
+  private productConditions = (filter: ProductFilterInput) => {
     const conditions = [eq(products.status, "PUBLISHED")];
     if (filter.categoryId) conditions.push(eq(products.categoryId, filter.categoryId));
     if (filter.query?.trim()) conditions.push(ilike(products.title, `%${filter.query.trim()}%`));
-    if (cursor) conditions.push(lt(products.createdAt, new Date(cursor.createdAt)));
+    if (filter.brandIds?.length) conditions.push(inArray(products.brandId, filter.brandIds));
+    if (filter.saleOnly !== undefined) conditions.push(eq(products.isOnSale, filter.saleOnly));
+    if (filter.expressOnly !== undefined) conditions.push(eq(products.isExpressDelivery, filter.expressOnly));
 
-    const rows = await this.db
-      .select()
-      .from(products)
-      .where(and(...conditions))
-      .orderBy(desc(products.createdAt), desc(products.productId))
-      .limit(first + 1);
-    return { rows, first };
+    const skuConditions = [sql`${productSkus.productId} = ${products.productId}`, sql`${productSkus.isActive} = true`];
+    if (filter.colorIds?.length) skuConditions.push(inArray(productSkus.colorId, filter.colorIds));
+    if (filter.sizeIds?.length) skuConditions.push(inArray(productSkus.sizeId, filter.sizeIds));
+    if (filter.colorIds?.length || filter.sizeIds?.length) {
+      conditions.push(sql`exists (select 1 from ${productSkus} where ${sql.join(skuConditions, sql` and `)})`);
+    }
+
+    if (filter.minPrice !== undefined || filter.maxPrice !== undefined) {
+      const lowestPrice = sql<number>`(
+        select min(${productSkus.price})
+        from ${productSkus}
+        where ${productSkus.productId} = ${products.productId}
+          and ${productSkus.isActive} = true
+      )`;
+      if (filter.minPrice !== undefined) conditions.push(gte(lowestPrice, filter.minPrice));
+      if (filter.maxPrice !== undefined) conditions.push(lte(lowestPrice, filter.maxPrice));
+    }
+
+    return conditions;
   };
 
   getProduct = async (productId: string) => {
@@ -157,9 +208,12 @@ export class CatalogService {
         .values({
           partnerId,
           categoryId: input.categoryId,
+          brandId: input.brandId,
           title: input.title,
           description: input.description,
           imageUrls: input.imageUrls,
+          isOnSale: input.isOnSale,
+          isExpressDelivery: input.isExpressDelivery,
         })
         .returning();
       await tx.insert(productSkus).values(input.skus.map((sku) => ({ ...sku, productId: product.productId })));
@@ -213,9 +267,12 @@ export class CatalogService {
       .select()
       .from(productSkus)
       .where(
-        inArray(
-          productSkus.productId,
-          productRows.map((product) => product.productId),
+        and(
+          inArray(
+            productSkus.productId,
+            productRows.map((product) => product.productId),
+          ),
+          eq(productSkus.isActive, true),
         ),
       )
       .orderBy(productSkus.createdAt);
@@ -227,21 +284,90 @@ export class CatalogService {
     }));
   };
 
-  private sortProducts = async (nodes: ProductType[], sort?: ProductFilterInput["sort"]) => {
-    if (sort === "LOW_PRICE") {
-      return [...nodes].sort((a, b) => this.lowestSkuPrice(a) - this.lowestSkuPrice(b));
-    }
-    if (sort === "POPULAR") {
-      return [...nodes].sort(
-        (a, b) => b.skus.reduce((sum, sku) => sum + sku.stock, 0) - a.skus.reduce((sum, sku) => sum + sku.stock, 0),
-      );
-    }
-    return nodes;
+  private matchesFilter = (product: ProductType, filter: ProductFilterInput) => {
+    if (filter.brandIds?.length && (!product.brandId || !filter.brandIds.includes(product.brandId))) return false;
+    if (
+      (filter.colorIds?.length || filter.sizeIds?.length) &&
+      !product.skus.some(
+        (sku) =>
+          (!filter.colorIds?.length || (sku.colorId !== null && filter.colorIds.includes(sku.colorId))) &&
+          (!filter.sizeIds?.length || (sku.sizeId !== null && filter.sizeIds.includes(sku.sizeId))),
+      )
+    )
+      return false;
+    if (filter.saleOnly !== undefined && product.isOnSale !== filter.saleOnly) return false;
+    if (filter.expressOnly !== undefined && product.isExpressDelivery !== filter.expressOnly) return false;
+    const lowestPrice = this.lowestSkuPrice(product);
+    if (filter.minPrice !== undefined && lowestPrice < filter.minPrice) return false;
+    if (filter.maxPrice !== undefined && lowestPrice > filter.maxPrice) return false;
+    return true;
   };
 
-  private lowestSkuPrice = (product: ProductType) => Math.min(...product.skus.map((sku) => sku.price));
+  private sortProducts = (nodes: ProductType[], sort?: ProductFilterInput["sort"]) =>
+    [...nodes].sort((left, right) => this.compareProducts(left, right, sort));
 
-  private highestSkuPrice = (product: ProductType) => Math.max(...product.skus.map((sku) => sku.price));
+  private compareProducts = (left: ProductType, right: ProductType, sort?: ProductFilterInput["sort"]) => {
+    const selectedSort = sort ?? ProductSort.RECOMMENDED;
+    const valueComparison =
+      selectedSort === ProductSort.LOW_PRICE
+        ? this.lowestSkuPrice(left) - this.lowestSkuPrice(right)
+        : selectedSort === ProductSort.HIGH_PRICE
+          ? this.highestSkuPrice(right) - this.highestSkuPrice(left)
+          : selectedSort === ProductSort.POPULAR
+            ? this.stockTotal(right) - this.stockTotal(left)
+            : right.createdAt.getTime() - left.createdAt.getTime();
+    if (valueComparison !== 0) return valueComparison;
+    const createdAtComparison = right.createdAt.getTime() - left.createdAt.getTime();
+    return createdAtComparison !== 0 ? createdAtComparison : right.productId.localeCompare(left.productId);
+  };
+
+  private cursorStart = (nodes: ProductType[], cursor: ProductCursor, sort?: ProductFilterInput["sort"]) => {
+    const cursorIndex = nodes.findIndex((node) => node.productId === cursor.productId);
+    if (cursorIndex >= 0) return cursorIndex + 1;
+    const start = nodes.findIndex((node) => this.compareProductToCursor(node, cursor, sort) > 0);
+    return start >= 0 ? start : nodes.length;
+  };
+
+  private compareProductToCursor = (product: ProductType, cursor: ProductCursor, sort?: ProductFilterInput["sort"]) => {
+    const selectedSort = sort ?? ProductSort.RECOMMENDED;
+    if (
+      selectedSort !== ProductSort.LATEST &&
+      selectedSort !== ProductSort.RECOMMENDED &&
+      cursor.sortValue !== undefined
+    ) {
+      const productValue = this.sortValue(product, selectedSort);
+      const valueComparison =
+        selectedSort === ProductSort.LOW_PRICE ? productValue - cursor.sortValue : cursor.sortValue - productValue;
+      if (valueComparison !== 0) return valueComparison;
+    }
+    const createdAtComparison = Date.parse(cursor.createdAt) - product.createdAt.getTime();
+    return createdAtComparison !== 0 ? createdAtComparison : cursor.productId.localeCompare(product.productId);
+  };
+
+  private toProductCursor = (product: ProductType, sort?: ProductFilterInput["sort"]): ProductCursor => {
+    const selectedSort = sort ?? ProductSort.RECOMMENDED;
+    return {
+      createdAt: product.createdAt.toISOString(),
+      productId: product.productId,
+      ...(selectedSort === ProductSort.LATEST || selectedSort === ProductSort.RECOMMENDED
+        ? {}
+        : { sortValue: this.sortValue(product, selectedSort) }),
+    };
+  };
+
+  private sortValue = (product: ProductType, sort: ProductSort) => {
+    if (sort === ProductSort.LOW_PRICE) return this.lowestSkuPrice(product);
+    if (sort === ProductSort.HIGH_PRICE) return this.highestSkuPrice(product);
+    return this.stockTotal(product);
+  };
+
+  private stockTotal = (product: ProductType) => product.skus.reduce((sum, sku) => sum + sku.stock, 0);
+
+  private lowestSkuPrice = (product: ProductType) =>
+    product.skus.length > 0 ? Math.min(...product.skus.map((sku) => sku.price)) : 0;
+
+  private highestSkuPrice = (product: ProductType) =>
+    product.skus.length > 0 ? Math.max(...product.skus.map((sku) => sku.price)) : 0;
 
   private toPriceSummary = (product: ProductType): ProductPriceSummaryType => {
     const finalPrice = this.lowestSkuPrice(product);

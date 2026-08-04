@@ -97,6 +97,47 @@ export const categories = pgTable(
   (table) => [index("categories_parent_sort_idx").on(table.parentId, table.sortOrder)],
 );
 
+export const brands = pgTable(
+  "brands",
+  {
+    brandId: uuid("brandId").primaryKey().defaultRandom(),
+    name: varchar("name", { length: 100 }).notNull(),
+    slug: varchar("slug", { length: 120 }).notNull().unique(),
+    isActive: boolean("isActive").notNull().default(true),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().notNull(),
+  },
+  (table) => [index("brands_active_name_idx").on(table.isActive, table.name)],
+);
+
+export const colors = pgTable(
+  "colors",
+  {
+    colorId: uuid("colorId").primaryKey().defaultRandom(),
+    name: varchar("name", { length: 80 }).notNull(),
+    slug: varchar("slug", { length: 100 }).notNull().unique(),
+    hexCode: varchar("hexCode", { length: 7 }),
+    isActive: boolean("isActive").notNull().default(true),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().notNull(),
+  },
+  (table) => [index("colors_active_name_idx").on(table.isActive, table.name)],
+);
+
+export const sizes = pgTable(
+  "sizes",
+  {
+    sizeId: uuid("sizeId").primaryKey().defaultRandom(),
+    name: varchar("name", { length: 80 }).notNull(),
+    slug: varchar("slug", { length: 100 }).notNull().unique(),
+    sortOrder: integer("sortOrder").notNull().default(0),
+    isActive: boolean("isActive").notNull().default(true),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().notNull(),
+  },
+  (table) => [index("sizes_active_sort_idx").on(table.isActive, table.sortOrder, table.name)],
+);
+
 export const partners = pgTable(
   "partners",
   {
@@ -124,6 +165,7 @@ export const products = pgTable(
     partnerId: uuid("partnerId")
       .notNull()
       .references(() => partners.partnerId),
+    brandId: uuid("brandId").references(() => brands.brandId),
     categoryId: uuid("categoryId")
       .notNull()
       .references(() => categories.categoryId),
@@ -133,12 +175,16 @@ export const products = pgTable(
     status: varchar("status", { length: 20 }).notNull().default("DRAFT"),
     approvalStatus: varchar("approvalStatus", { length: 20 }).notNull().default("PENDING"),
     rejectionReason: text("rejectionReason"),
+    isOnSale: boolean("isOnSale").notNull().default(false),
+    isExpressDelivery: boolean("isExpressDelivery").notNull().default(false),
     publishedAt: timestamp("publishedAt"),
     createdAt: timestamp("createdAt").defaultNow().notNull(),
     updatedAt: timestamp("updatedAt").defaultNow().notNull(),
   },
   (table) => [
     index("products_catalog_idx").on(table.status, table.categoryId, table.createdAt),
+    index("products_brand_idx").on(table.brandId, table.status),
+    index("products_catalog_flags_idx").on(table.status, table.isOnSale, table.isExpressDelivery),
     index("products_partner_idx").on(table.partnerId, table.status),
   ],
 );
@@ -167,6 +213,8 @@ export const productSkus = pgTable(
     productId: uuid("productId")
       .notNull()
       .references(() => products.productId),
+    colorId: uuid("colorId").references(() => colors.colorId),
+    sizeId: uuid("sizeId").references(() => sizes.sizeId),
     code: varchar("code", { length: 80 }).notNull().unique(),
     optionName: varchar("optionName", { length: 160 }).notNull(),
     price: integer("price").notNull(),
@@ -175,7 +223,11 @@ export const productSkus = pgTable(
     createdAt: timestamp("createdAt").defaultNow().notNull(),
     updatedAt: timestamp("updatedAt").defaultNow().notNull(),
   },
-  (table) => [index("product_skus_product_idx").on(table.productId, table.isActive)],
+  (table) => [
+    index("product_skus_product_idx").on(table.productId, table.isActive),
+    index("product_skus_color_idx").on(table.colorId, table.productId),
+    index("product_skus_size_idx").on(table.sizeId, table.productId),
+  ],
 );
 
 export const wishes = pgTable(
@@ -354,6 +406,9 @@ export type EmailVerificationToken = typeof emailVerificationTokens.$inferSelect
 export type PasswordResetToken = typeof passwordResetTokens.$inferSelect;
 export type KakaoSignupToken = typeof kakaoSignupTokens.$inferSelect;
 export type Category = typeof categories.$inferSelect;
+export type Brand = typeof brands.$inferSelect;
+export type Color = typeof colors.$inferSelect;
+export type Size = typeof sizes.$inferSelect;
 export type Partner = typeof partners.$inferSelect;
 export type Product = typeof products.$inferSelect;
 export type ProductSku = typeof productSkus.$inferSelect;
