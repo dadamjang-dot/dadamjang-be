@@ -1,4 +1,17 @@
-import { boolean, index, integer, jsonb, pgTable, text, timestamp, unique, uuid, varchar } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
+import {
+  boolean,
+  index,
+  integer,
+  jsonb,
+  pgTable,
+  text,
+  timestamp,
+  unique,
+  uniqueIndex,
+  uuid,
+  varchar,
+} from "drizzle-orm/pg-core";
 
 export const users = pgTable("users", {
   userId: uuid("userId").primaryKey(),
@@ -244,11 +257,15 @@ export const stylePostLikes = pgTable(
       .notNull()
       .references(() => users.userId, { onDelete: "cascade" }),
     createdAt: timestamp("createdAt").defaultNow().notNull(),
+    deletedAt: timestamp("deletedAt"),
   },
   (table) => [
-    unique("style_post_likes_post_user_unique").on(table.stylePostId, table.userId),
+    uniqueIndex("style_post_likes_active_unique")
+      .on(table.stylePostId, table.userId)
+      .where(sql`${table.deletedAt} IS NULL`),
     index("style_post_likes_post_created_idx").on(table.stylePostId, table.createdAt),
     index("style_post_likes_user_created_idx").on(table.userId, table.createdAt),
+    index("style_post_likes_snapshot_idx").on(table.stylePostId, table.createdAt, table.deletedAt),
   ],
 );
 

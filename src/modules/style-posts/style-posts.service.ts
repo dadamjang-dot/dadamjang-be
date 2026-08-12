@@ -1,5 +1,7 @@
 import { Inject, Injectable } from "@nestjs/common";
-import { and, asc, desc, eq, inArray, or, sql } from "drizzle-orm";
+import { ConfigService } from "@nestjs/config";
+import { createHmac, timingSafeEqual } from "crypto";
+import { and, asc, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import { CustomBadRequestException, CustomNotFoundException } from "src/common/errors/custom-exceptions";
 import { Database, DRIZZLE } from "src/modules/database/database.module";
 import {
@@ -29,8 +31,8 @@ import {
 } from "./style-posts.types";
 
 const PURCHASED_ORDER_STATUSES = ["PAID", "FULFILLING", "COMPLETED"] as const;
-const STYLE_POST_CATEGORIES = Object.values(StylePostCategory);
-const STYLE_POST_SORTS = Object.values(StylePostSort);
+const STYLE_POST_CATEGORIES = new Set<string>(Object.values(StylePostCategory));
+const STYLE_POST_SORTS = new Set<string>(Object.values(StylePostSort));
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const STYLE_POST_ID_REFERENCE = sql.raw('"stylePosts"."stylePostId"');
 
@@ -39,6 +41,7 @@ type StylePostCursor = {
   sort: StylePostSort;
   sortValue: number;
   createdAt: string;
+  snapshotAt: string;
   stylePostId: string;
 };
 
@@ -52,22 +55,43 @@ type PurchasedStyleProductRow = {
   lastPurchasedAt: Date;
 };
 
-const encodeCursor = (cursor: StylePostCursor) => Buffer.from(JSON.stringify(cursor)).toString("base64url");
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
 
-const decodeCursor = (value: string): StylePostCursor => {
+const isStylePostCursor = (value: unknown): value is StylePostCursor => {
+  if (!isRecord(value)) return false;
+  return (
+    (value.category === null || (typeof value.category === "string" && STYLE_POST_CATEGORIES.has(value.category))) &&
+    typeof value.sort === "string" &&
+    STYLE_POST_SORTS.has(value.sort) &&
+    typeof value.sortValue === "number" &&
+    Number.isFinite(value.sortValue) &&
+    typeof value.createdAt === "string" &&
+    !Number.isNaN(Date.parse(value.createdAt)) &&
+    typeof value.snapshotAt === "string" &&
+    !Number.isNaN(Date.parse(value.snapshotAt)) &&
+    typeof value.stylePostId === "string" &&
+    UUID_PATTERN.test(value.stylePostId)
+  );
+};
+
+const signCursor = (payload: string, secret: string) =>
+  createHmac("sha256", secret).update(payload).digest("base64url");
+
+const encodeCursor = (cursor: StylePostCursor, secret: string) => {
+  const payload = Buffer.from(JSON.stringify(cursor)).toString("base64url");
+  return `${payload}.${signCursor(payload, secret)}`;
+};
+
+const decodeCursor = (value: string, secret: string): StylePostCursor => {
   try {
-    const cursor = JSON.parse(Buffer.from(value, "base64url").toString("utf8")) as StylePostCursor;
-    if (
-      !cursor.stylePostId ||
-      !UUID_PATTERN.test(cursor.stylePostId) ||
-      !cursor.createdAt ||
-      Number.isNaN(Date.parse(cursor.createdAt)) ||
-      !STYLE_POST_SORTS.includes(cursor.sort) ||
-      (cursor.category !== null && !STYLE_POST_CATEGORIES.includes(cursor.category)) ||
-      !Number.isFinite(cursor.sortValue)
-    ) {
-      throw new Error("invalid");
-    }
+    const [payload, signature, ...rest] = value.split(".");
+    if (!payload || !signature || rest.length) throw new Error("invalid");
+    const expected = Buffer.from(signCursor(payload, secret), "base64url");
+    const received = Buffer.from(signature, "base64url");
+    if (expected.length !== received.length || !timingSafeEqual(expected, received)) throw new Error("invalid");
+    const cursor: unknown = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+    if (!isStylePostCursor(cursor)) throw new Error("invalid");
     return cursor;
   } catch {
     throw new CustomBadRequestException(StylePostErrorMessage.InvalidCursor);
@@ -84,7 +108,12 @@ export class StylePostsService {
   constructor(
     @Inject(DRIZZLE) private readonly db: Database,
     private readonly mediaService: MediaService,
-  ) {}
+    configService: ConfigService,
+  ) {
+    this.cursorSecret = configService.getOrThrow<string>("JWT_ACCESS_TOKEN_SECRET");
+  }
+
+  private readonly cursorSecret: string;
 
   create = async (authorId: string, isPartner: boolean, input: CreateStylePostInput): Promise<StylePostType> => {
     const idempotencyKey = input.idempotencyKey.trim();
@@ -101,7 +130,7 @@ export class StylePostsService {
     const content = input.content.trim();
     if (!content) throw new CustomBadRequestException(StylePostErrorMessage.ContentRequired);
     if (content.length > 1000) throw new CustomBadRequestException(StylePostErrorMessage.ContentTooLong);
-    if (!STYLE_POST_CATEGORIES.includes(input.category))
+    if (!STYLE_POST_CATEGORIES.has(input.category))
       throw new CustomBadRequestException(StylePostErrorMessage.InvalidCategory);
 
     const productIds = unique(input.productIds);
@@ -111,7 +140,7 @@ export class StylePostsService {
     const imageKeys = unique(input.imageKeys);
     if (imageKeys.length < 1 || imageKeys.length > 5)
       throw new CustomBadRequestException(StylePostErrorMessage.ImageCount);
-    if (imageKeys.some((key) => !key.startsWith(`style-posts/${authorId}/`)))
+    if (imageKeys.some((key) => !this.mediaService.isStylePostImageKeyForUser(key, authorId)))
       throw new CustomBadRequestException(StylePostErrorMessage.InvalidImageKey);
 
     const hashtags = unique((input.hashtags ?? []).map((tag) => tag.trim().replace(/^#/, "")));
@@ -186,13 +215,16 @@ export class StylePostsService {
     const category = filter?.category ?? null;
     const sort = filter?.sort ?? StylePostSort.RECOMMENDED;
     const pageSize = Math.min(Math.max(first ?? 20, 1), MAX_PAGE_SIZE);
-    const cursor = after ? decodeCursor(after) : undefined;
+    const cursor = after ? decodeCursor(after, this.cursorSecret) : undefined;
     if (cursor && (cursor.category !== category || cursor.sort !== sort))
       throw new CustomBadRequestException(StylePostErrorMessage.InvalidCursor);
+    const snapshotAt = cursor ? new Date(cursor.snapshotAt) : new Date();
     const likeCount = sql<number>`(
       select count(*)::int
       from ${stylePostLikes}
       where ${stylePostLikes.stylePostId} = ${STYLE_POST_ID_REFERENCE}
+        and ${stylePostLikes.createdAt} <= ${snapshotAt}
+        and (${stylePostLikes.deletedAt} is null or ${stylePostLikes.deletedAt} > ${snapshotAt})
     )`;
     const createdAtEpoch = sql<number>`extract(epoch from ${stylePosts.createdAt})::double precision`;
     const sortValue =
@@ -202,12 +234,13 @@ export class StylePostsService {
           ? sql<number>`${createdAtEpoch} * 1000`
           : sql<number>`round((ln(${likeCount} + 1) + ${createdAtEpoch} / 259200) * 1000000000)::bigint`;
     const categoryCondition = category ? eq(stylePosts.category, category) : undefined;
+    const snapshotCondition = sql`${stylePosts.createdAt} <= ${snapshotAt}`;
     let cursorRow: { stylePostId: string; createdAt: Date } | undefined;
     if (cursor) {
       [cursorRow] = await this.db
         .select({ stylePostId: stylePosts.stylePostId, createdAt: stylePosts.createdAt })
         .from(stylePosts)
-        .where(and(eq(stylePosts.stylePostId, cursor.stylePostId), categoryCondition))
+        .where(and(eq(stylePosts.stylePostId, cursor.stylePostId), categoryCondition, snapshotCondition))
         .limit(1);
       if (!cursorRow || cursorRow.createdAt.toISOString() !== cursor.createdAt)
         throw new CustomBadRequestException(StylePostErrorMessage.InvalidCursor);
@@ -233,7 +266,7 @@ export class StylePostsService {
     const pageKeys = await this.db
       .select({ stylePostId: stylePosts.stylePostId, createdAt: stylePosts.createdAt, sortValue })
       .from(stylePosts)
-      .where(and(categoryCondition, cursorCondition))
+      .where(and(categoryCondition, snapshotCondition, cursorCondition))
       .orderBy(desc(sortValue), desc(stylePosts.createdAt), desc(stylePosts.stylePostId))
       .limit(pageSize + 1);
     const rowIds = pageKeys.map(({ stylePostId }) => stylePostId);
@@ -254,13 +287,17 @@ export class StylePostsService {
       hasNextPage,
       nextCursor:
         hasNextPage && tail
-          ? encodeCursor({
-              category,
-              sort,
-              sortValue: Number(tail.sortValue),
-              createdAt: tail.createdAt.toISOString(),
-              stylePostId: tail.stylePostId,
-            })
+          ? encodeCursor(
+              {
+                category,
+                sort,
+                sortValue: Number(tail.sortValue),
+                createdAt: tail.createdAt.toISOString(),
+                snapshotAt: snapshotAt.toISOString(),
+                stylePostId: tail.stylePostId,
+              },
+              this.cursorSecret,
+            )
           : null,
     };
   };
@@ -279,8 +316,15 @@ export class StylePostsService {
   unlike = async (stylePostId: string, userId: string) => {
     await this.get(stylePostId);
     await this.db
-      .delete(stylePostLikes)
-      .where(and(eq(stylePostLikes.stylePostId, stylePostId), eq(stylePostLikes.userId, userId)));
+      .update(stylePostLikes)
+      .set({ deletedAt: new Date() })
+      .where(
+        and(
+          eq(stylePostLikes.stylePostId, stylePostId),
+          eq(stylePostLikes.userId, userId),
+          isNull(stylePostLikes.deletedAt),
+        ),
+      );
     return this.get(stylePostId, userId);
   };
 
@@ -336,13 +380,19 @@ export class StylePostsService {
       this.db
         .select({ stylePostId: stylePostLikes.stylePostId, likeCount: sql<number>`count(*)` })
         .from(stylePostLikes)
-        .where(inArray(stylePostLikes.stylePostId, postIds))
+        .where(and(inArray(stylePostLikes.stylePostId, postIds), isNull(stylePostLikes.deletedAt)))
         .groupBy(stylePostLikes.stylePostId),
       viewerId
         ? this.db
             .select({ stylePostId: stylePostLikes.stylePostId })
             .from(stylePostLikes)
-            .where(and(inArray(stylePostLikes.stylePostId, postIds), eq(stylePostLikes.userId, viewerId)))
+            .where(
+              and(
+                inArray(stylePostLikes.stylePostId, postIds),
+                eq(stylePostLikes.userId, viewerId),
+                isNull(stylePostLikes.deletedAt),
+              ),
+            )
         : Promise.resolve([]),
       brandIds.length
         ? this.db

@@ -179,6 +179,28 @@ describe("PostgreSQL GraphQL integration", () => {
       });
     expect(invalidPurchase.body.errors).toHaveLength(1);
 
+    const invalidImage = await agent
+      .post("/graphql")
+      .set(auth)
+      .send({
+        query: createMutation,
+        variables: {
+          input: {
+            category: "CLOTHING",
+            productIds: [FIXTURE.productId],
+            imageKeys: [`style-posts/${FIXTURE.userId}/look.webp`],
+            content: "잘못된 이미지 키",
+            idempotencyKey: "invalid-style-image",
+          },
+        },
+      });
+    expect(invalidImage.body.errors[0].message).toBe("Style post image key is invalid");
+    const feedAfterInvalidImage = await request(app.getHttpServer())
+      .post("/graphql")
+      .send({ query: `{ stylePosts(filter: { sort: LATEST }) { nodes { stylePostId } } }` })
+      .expect(200);
+    expect(feedAfterInvalidImage.body.data.stylePosts.nodes).toEqual([]);
+
     const input = {
       category: "CLOTHING",
       productIds: [FIXTURE.productId],
@@ -244,6 +266,8 @@ describe("PostgreSQL GraphQL integration", () => {
     const repeatedUnlike = await agent.post("/graphql").set(auth).send({ query: unlikeMutation });
     expect(unliked.body.data.unlikeStylePost).toEqual({ likeCount: 0, isLiked: false });
     expect(repeatedUnlike.body.data.unlikeStylePost).toEqual({ likeCount: 0, isLiked: false });
+    const reliked = await agent.post("/graphql").set(auth).send({ query: likeMutation });
+    expect(reliked.body.data.likeStylePost).toEqual({ likeCount: 1, isLiked: true });
   });
 
   it("paginates style posts with category and sort-aware cursors", async () => {
@@ -308,6 +332,18 @@ describe("PostgreSQL GraphQL integration", () => {
       postIds[1],
     ]);
 
+    const [cursorPayload, cursorSignature] = popular.body.data.stylePosts.nextCursor.split(".");
+    const cursor = JSON.parse(Buffer.from(cursorPayload, "base64url").toString("utf8")) as { sortValue: number };
+    const tamperedCursor = `${Buffer.from(JSON.stringify({ ...cursor, sortValue: cursor.sortValue + 99 })).toString("base64url")}.${cursorSignature}`;
+    const rejectedTamperedCursor = await request(app.getHttpServer())
+      .post("/graphql")
+      .send({
+        query: feedQuery,
+        variables: { filter: { sort: "POPULAR" }, first: 2, after: tamperedCursor },
+      })
+      .expect(200);
+    expect(rejectedTamperedCursor.body.errors[0].message).toBe("Invalid style post cursor");
+
     const accessToken = await signin(request.agent(app.getHttpServer()));
     const likedCursor = await request(app.getHttpServer())
       .post("/graphql")
@@ -326,6 +362,60 @@ describe("PostgreSQL GraphQL integration", () => {
     expect(
       popularNext.body.data.stylePosts.nodes.map(({ stylePostId }: { stylePostId: string }) => stylePostId),
     ).toEqual([postIds[2]]);
+
+    const popularBeforeUnlike = await request(app.getHttpServer())
+      .post("/graphql")
+      .send({ query: feedQuery, variables: { filter: { sort: "POPULAR" }, first: 1 } })
+      .expect(200);
+    expect(popularBeforeUnlike.body.data.stylePosts.nodes[0].stylePostId).toBe(postIds[1]);
+    const unlikedCursor = await request(app.getHttpServer())
+      .post("/graphql")
+      .set("Authorization", `Bearer ${accessToken}`)
+      .send({ query: `mutation { unlikeStylePost(stylePostId: "${postIds[1]}") { likeCount } }` })
+      .expect(200);
+    expect(unlikedCursor.body.data.unlikeStylePost.likeCount).toBe(1);
+    const popularAfterUnlike = await request(app.getHttpServer())
+      .post("/graphql")
+      .send({
+        query: feedQuery,
+        variables: {
+          filter: { sort: "POPULAR" },
+          first: 2,
+          after: popularBeforeUnlike.body.data.stylePosts.nextCursor,
+        },
+      })
+      .expect(200);
+    expect(popularAfterUnlike.body.errors).toBeUndefined();
+    expect(
+      popularAfterUnlike.body.data.stylePosts.nodes.map(({ stylePostId }: { stylePostId: string }) => stylePostId),
+    ).toEqual([postIds[0], postIds[2]]);
+
+    const recommendedBeforeUnlike = await request(app.getHttpServer())
+      .post("/graphql")
+      .send({ query: feedQuery, variables: { filter: { sort: "RECOMMENDED" }, first: 1 } })
+      .expect(200);
+    expect(recommendedBeforeUnlike.body.data.stylePosts.nodes[0].stylePostId).toBe(postIds[0]);
+    const unlikedRecommendedCursor = await request(app.getHttpServer())
+      .post("/graphql")
+      .set("Authorization", `Bearer ${accessToken}`)
+      .send({ query: `mutation { unlikeStylePost(stylePostId: "${postIds[0]}") { likeCount } }` })
+      .expect(200);
+    expect(unlikedRecommendedCursor.body.data.unlikeStylePost.likeCount).toBe(1);
+    const recommendedAfterUnlike = await request(app.getHttpServer())
+      .post("/graphql")
+      .send({
+        query: feedQuery,
+        variables: {
+          filter: { sort: "RECOMMENDED" },
+          first: 2,
+          after: recommendedBeforeUnlike.body.data.stylePosts.nextCursor,
+        },
+      })
+      .expect(200);
+    expect(recommendedAfterUnlike.body.errors).toBeUndefined();
+    expect(
+      recommendedAfterUnlike.body.data.stylePosts.nodes.map(({ stylePostId }: { stylePostId: string }) => stylePostId),
+    ).toEqual([postIds[1], postIds[2]]);
 
     const clothing = await request(app.getHttpServer())
       .post("/graphql")
@@ -348,6 +438,15 @@ describe("PostgreSQL GraphQL integration", () => {
     expect(output).not.toContain("stacktrace");
     expect(output).not.toContain("Failed query");
     expect(output).not.toContain("/Volumes/");
+
+    const accessToken = await signin(request.agent(app.getHttpServer()));
+    const mutation = await request(app.getHttpServer())
+      .post("/graphql")
+      .set("Authorization", `Bearer ${accessToken}`)
+      .send({ query: `mutation { likeStylePost(stylePostId: "not-a-uuid") { stylePostId } }` })
+      .expect(200);
+    expect(mutation.body.errors[0].message).toBe("Invalid style post ID");
+    expect(JSON.stringify(mutation.body)).not.toContain("stacktrace");
   });
 
   it("adds and removes an authenticated wish idempotently", async () => {

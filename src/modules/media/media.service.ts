@@ -99,6 +99,9 @@ export class MediaService {
     return this.transformedUrl(key, width);
   };
 
+  isStylePostImageKeyForUser = (key: string, userId: string) =>
+    key.startsWith(`style-posts/${userId}/`) && STYLE_POST_IMAGE_KEY_PATTERN.test(key);
+
   private originalUrl = (key: string) => `${this.publicBaseUrl}/${key}`;
 
   private transformedUrl = (key: string, width?: number) => {
