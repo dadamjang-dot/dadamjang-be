@@ -4,6 +4,7 @@ import { UserRole } from "src/auth/role";
 import { Roles } from "src/auth/roles.decorator";
 import { CustomUnauthorizedException } from "src/common/errors/custom-exceptions";
 import { JwtAccessTokenGuard } from "src/guards/accessToken.guard";
+import { OptionalJwtAccessTokenGuard } from "src/guards/optionalAccessToken.guard";
 import { RolesGuard } from "src/guards/roles.guard";
 import { StylePostErrorMessage } from "./style-posts.error";
 import { StylePostsService } from "./style-posts.service";
@@ -28,6 +29,7 @@ export class StylePostsResolver {
   constructor(private readonly stylePostsService: StylePostsService) {}
 
   @Query(() => StylePostConnectionType)
+  @UseGuards(OptionalJwtAccessTokenGuard)
   stylePosts(
     @Args("filter", { type: () => StylePostFilterInput, nullable: true }) filter: StylePostFilterInput | undefined,
     @Args("first", { type: () => Int, nullable: true }) first: number | undefined,
@@ -38,6 +40,7 @@ export class StylePostsResolver {
   }
 
   @Query(() => StylePostType)
+  @UseGuards(OptionalJwtAccessTokenGuard)
   stylePost(@Args("stylePostId") stylePostId: string, @Context() context: { req?: { user?: { userId?: string } } }) {
     return this.stylePostsService.get(stylePostId, optionalUserId(context));
   }

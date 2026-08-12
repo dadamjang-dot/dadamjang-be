@@ -7,6 +7,8 @@ import { CustomBadRequestException } from "src/common/errors/custom-exceptions";
 import { MediaErrorMessage } from "./media.error";
 import {
   STYLE_POST_MAX_FILE_SIZE,
+  STYLE_POST_IMAGE_EXTENSIONS,
+  STYLE_POST_IMAGE_KEY_PATTERN,
   STYLE_POST_SUPPORTED_CONTENT_TYPES,
   SUPPORTED_CONTENT_TYPES,
 } from "./media.constant";
@@ -70,8 +72,8 @@ export class MediaService {
       throw new CustomBadRequestException(MediaErrorMessage.FileTooLarge);
     }
 
-    const extension = input.filename.split(".").pop()?.toLowerCase();
-    const key = `style-posts/${userId}/${randomUUID()}${extension ? `.${extension}` : ""}`;
+    const extension = STYLE_POST_IMAGE_EXTENSIONS[input.contentType.toLowerCase()];
+    const key = `style-posts/${userId}/${randomUUID()}.${extension}`;
     const uploadUrl = await getSignedUrl(
       this.client,
       new PutObjectCommand({
@@ -93,7 +95,7 @@ export class MediaService {
   };
 
   getStylePostImageUrl = (key: string, width?: number) => {
-    if (!key.startsWith("style-posts/")) throw new CustomBadRequestException(MediaErrorMessage.InvalidKey);
+    if (!STYLE_POST_IMAGE_KEY_PATTERN.test(key)) throw new CustomBadRequestException(MediaErrorMessage.InvalidKey);
     return this.transformedUrl(key, width);
   };
 

@@ -1,5 +1,5 @@
 import { Inject, Injectable } from "@nestjs/common";
-import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, or, sql } from "drizzle-orm";
 import { CustomBadRequestException, CustomNotFoundException } from "src/common/errors/custom-exceptions";
 import { Database, DRIZZLE } from "src/modules/database/database.module";
 import {
@@ -185,33 +185,88 @@ export class StylePostsService {
     const cursor = after ? decodeCursor(after) : undefined;
     if (cursor && (cursor.category !== category || cursor.sort !== sort))
       throw new CustomBadRequestException(StylePostErrorMessage.InvalidCursor);
-
-    const rows = category
-      ? await this.db.select().from(stylePosts).where(eq(stylePosts.category, category))
-      : await this.db.select().from(stylePosts);
-    const posts = await this.hydrate(rows, viewerId);
-    const sorted = posts
-      .map((post) => ({ post, sortValue: this.sortValue(post, sort) }))
-      .sort((left, right) => {
-        if (left.sortValue !== right.sortValue) return right.sortValue - left.sortValue;
-        const createdAt = right.post.createdAt.getTime() - left.post.createdAt.getTime();
-        return createdAt || right.post.stylePostId.localeCompare(left.post.stylePostId);
-      });
-    const start = cursor ? sorted.findIndex(({ post }) => post.stylePostId === cursor.stylePostId) + 1 : 0;
-    const page = sorted.slice(start, start + pageSize);
-    const hasNextPage = start + pageSize < sorted.length;
-    const tail = page[page.length - 1];
+    const likeCount = sql<number>`(
+      select count(*)::int
+      from ${stylePostLikes}
+      where ${stylePostLikes.stylePostId} = ${stylePosts.stylePostId}
+    )`;
+    const createdAtEpoch = sql<number>`extract(epoch from ${stylePosts.createdAt})::double precision`;
+    const sortValue =
+      sort === StylePostSort.POPULAR
+        ? likeCount
+        : sort === StylePostSort.LATEST
+          ? sql<number>`${createdAtEpoch} * 1000`
+          : sql<number>`ln(${likeCount} + 1) + ${createdAtEpoch} / 259200`;
+    const categoryCondition = category ? eq(stylePosts.category, category) : undefined;
+    if (cursor) {
+      const [cursorRow] = await this.db
+        .select({ stylePostId: stylePosts.stylePostId, createdAt: stylePosts.createdAt, sortValue })
+        .from(stylePosts)
+        .where(and(eq(stylePosts.stylePostId, cursor.stylePostId), categoryCondition))
+        .limit(1);
+      if (
+        !cursorRow ||
+        Number(cursorRow.sortValue) !== cursor.sortValue ||
+        cursorRow.createdAt.toISOString() !== cursor.createdAt
+      )
+        throw new CustomBadRequestException(StylePostErrorMessage.InvalidCursor);
+    }
+    let cursorCondition;
+    if (cursor) {
+      const cursorLikeCount = sql<number>`(
+        select count(*)::int
+        from ${stylePostLikes}
+        where ${stylePostLikes.stylePostId} = ${cursor.stylePostId}
+      )`;
+      const cursorCreatedAt = sql`(
+        select ${stylePosts.createdAt}
+        from ${stylePosts}
+        where ${stylePosts.stylePostId} = ${cursor.stylePostId}
+      )`;
+      const cursorSortValue =
+        sort === StylePostSort.POPULAR
+          ? cursorLikeCount
+          : sort === StylePostSort.LATEST
+            ? sql<number>`extract(epoch from ${cursorCreatedAt})::double precision * 1000`
+            : sql<number>`ln(${cursorLikeCount} + 1) + extract(epoch from ${cursorCreatedAt})::double precision / 259200`;
+      const sameSortValue = sql`${sortValue} = ${cursorSortValue}`;
+      const sameCreatedAt = sql`${stylePosts.createdAt} = ${cursorCreatedAt}`;
+      cursorCondition = or(
+        sql`${sortValue} < ${cursorSortValue}`,
+        and(sameSortValue, sql`${stylePosts.createdAt} < ${cursorCreatedAt}`),
+        and(sameSortValue, sameCreatedAt, sql`${stylePosts.stylePostId} < ${cursor.stylePostId}`),
+      );
+    }
+    const pageKeys = await this.db
+      .select({ stylePostId: stylePosts.stylePostId, createdAt: stylePosts.createdAt, sortValue })
+      .from(stylePosts)
+      .where(and(categoryCondition, cursorCondition))
+      .orderBy(desc(sortValue), desc(stylePosts.createdAt), desc(stylePosts.stylePostId))
+      .limit(pageSize + 1);
+    const rowIds = pageKeys.map(({ stylePostId }) => stylePostId);
+    const rows = rowIds.length
+      ? await this.db.select().from(stylePosts).where(inArray(stylePosts.stylePostId, rowIds))
+      : [];
+    const rowsById = new Map(rows.map((row) => [row.stylePostId, row]));
+    const visibleKeys = pageKeys.filter(({ stylePostId }) => rowsById.has(stylePostId));
+    const pageKeysForPage = visibleKeys.slice(0, pageSize);
+    const pageRows = pageKeysForPage
+      .map(({ stylePostId }) => rowsById.get(stylePostId))
+      .filter((row): row is typeof stylePosts.$inferSelect => Boolean(row));
+    const posts = await this.hydrate(pageRows, viewerId);
+    const hasNextPage = visibleKeys.length > pageSize;
+    const tail = pageKeysForPage[pageKeysForPage.length - 1];
     return {
-      nodes: page.map(({ post }) => post),
+      nodes: posts,
       hasNextPage,
       nextCursor:
         hasNextPage && tail
           ? encodeCursor({
               category,
               sort,
-              sortValue: tail.sortValue,
-              createdAt: tail.post.createdAt.toISOString(),
-              stylePostId: tail.post.stylePostId,
+              sortValue: Number(tail.sortValue),
+              createdAt: tail.createdAt.toISOString(),
+              stylePostId: tail.stylePostId,
             })
           : null,
     };
@@ -342,11 +397,5 @@ export class StylePostsService {
         updatedAt: row.updatedAt,
       };
     });
-  };
-
-  private sortValue = (post: StylePostType, sort: StylePostSort) => {
-    if (sort === StylePostSort.POPULAR) return post.likeCount;
-    if (sort === StylePostSort.LATEST) return post.createdAt.getTime();
-    return Math.log(post.likeCount + 1) + post.createdAt.getTime() / 1000 / 259200;
   };
 }
