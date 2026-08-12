@@ -31,6 +31,8 @@ import {
 const PURCHASED_ORDER_STATUSES = ["PAID", "FULFILLING", "COMPLETED"] as const;
 const STYLE_POST_CATEGORIES = Object.values(StylePostCategory);
 const STYLE_POST_SORTS = Object.values(StylePostSort);
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const STYLE_POST_ID_REFERENCE = sql.raw('"stylePosts"."stylePostId"');
 
 type StylePostCursor = {
   category: StylePostCategory | null;
@@ -57,6 +59,7 @@ const decodeCursor = (value: string): StylePostCursor => {
     const cursor = JSON.parse(Buffer.from(value, "base64url").toString("utf8")) as StylePostCursor;
     if (
       !cursor.stylePostId ||
+      !UUID_PATTERN.test(cursor.stylePostId) ||
       !cursor.createdAt ||
       Number.isNaN(Date.parse(cursor.createdAt)) ||
       !STYLE_POST_SORTS.includes(cursor.sort) ||
@@ -167,6 +170,7 @@ export class StylePostsService {
   };
 
   get = async (stylePostId: string, viewerId?: string): Promise<StylePostType> => {
+    if (!UUID_PATTERN.test(stylePostId)) throw new CustomBadRequestException(StylePostErrorMessage.InvalidStylePostId);
     const [post] = await this.db.select().from(stylePosts).where(eq(stylePosts.stylePostId, stylePostId)).limit(1);
     if (!post) throw new CustomNotFoundException(StylePostErrorMessage.NotFound);
     const [result] = await this.hydrate([post], viewerId);
@@ -188,7 +192,7 @@ export class StylePostsService {
     const likeCount = sql<number>`(
       select count(*)::int
       from ${stylePostLikes}
-      where ${stylePostLikes.stylePostId} = ${stylePosts.stylePostId}
+      where ${stylePostLikes.stylePostId} = ${STYLE_POST_ID_REFERENCE}
     )`;
     const createdAtEpoch = sql<number>`extract(epoch from ${stylePosts.createdAt})::double precision`;
     const sortValue =
@@ -196,47 +200,36 @@ export class StylePostsService {
         ? likeCount
         : sort === StylePostSort.LATEST
           ? sql<number>`${createdAtEpoch} * 1000`
-          : sql<number>`ln(${likeCount} + 1) + ${createdAtEpoch} / 259200`;
+          : sql<number>`round((ln(${likeCount} + 1) + ${createdAtEpoch} / 259200) * 1000000000)::bigint`;
     const categoryCondition = category ? eq(stylePosts.category, category) : undefined;
+    let cursorRow: { stylePostId: string; createdAt: Date } | undefined;
     if (cursor) {
-      const [cursorRow] = await this.db
-        .select({ stylePostId: stylePosts.stylePostId, createdAt: stylePosts.createdAt, sortValue })
+      [cursorRow] = await this.db
+        .select({ stylePostId: stylePosts.stylePostId, createdAt: stylePosts.createdAt })
         .from(stylePosts)
         .where(and(eq(stylePosts.stylePostId, cursor.stylePostId), categoryCondition))
         .limit(1);
-      if (
-        !cursorRow ||
-        Number(cursorRow.sortValue) !== cursor.sortValue ||
-        cursorRow.createdAt.toISOString() !== cursor.createdAt
-      )
+      if (!cursorRow || cursorRow.createdAt.toISOString() !== cursor.createdAt)
         throw new CustomBadRequestException(StylePostErrorMessage.InvalidCursor);
     }
-    let cursorCondition;
-    if (cursor) {
-      const cursorLikeCount = sql<number>`(
-        select count(*)::int
-        from ${stylePostLikes}
-        where ${stylePostLikes.stylePostId} = ${cursor.stylePostId}
-      )`;
-      const cursorCreatedAt = sql`(
-        select ${stylePosts.createdAt}
-        from ${stylePosts}
-        where ${stylePosts.stylePostId} = ${cursor.stylePostId}
-      )`;
-      const cursorSortValue =
-        sort === StylePostSort.POPULAR
-          ? cursorLikeCount
-          : sort === StylePostSort.LATEST
-            ? sql<number>`extract(epoch from ${cursorCreatedAt})::double precision * 1000`
-            : sql<number>`ln(${cursorLikeCount} + 1) + extract(epoch from ${cursorCreatedAt})::double precision / 259200`;
-      const sameSortValue = sql`${sortValue} = ${cursorSortValue}`;
-      const sameCreatedAt = sql`${stylePosts.createdAt} = ${cursorCreatedAt}`;
-      cursorCondition = or(
-        sql`${sortValue} < ${cursorSortValue}`,
-        and(sameSortValue, sql`${stylePosts.createdAt} < ${cursorCreatedAt}`),
-        and(sameSortValue, sameCreatedAt, sql`${stylePosts.stylePostId} < ${cursor.stylePostId}`),
-      );
-    }
+    const sameCreatedAt = cursorRow ? sql`${stylePosts.createdAt} = ${cursorRow.createdAt}` : undefined;
+    const cursorCondition =
+      cursor && cursorRow
+        ? sort === StylePostSort.LATEST
+          ? or(
+              sql`${stylePosts.createdAt} < ${cursorRow.createdAt}`,
+              and(sameCreatedAt, sql`${stylePosts.stylePostId} < ${cursor.stylePostId}`),
+            )
+          : or(
+              sql`${sortValue} < ${cursor.sortValue}`,
+              and(sql`${sortValue} = ${cursor.sortValue}`, sql`${stylePosts.createdAt} < ${cursorRow.createdAt}`),
+              and(
+                sql`${sortValue} = ${cursor.sortValue}`,
+                sameCreatedAt,
+                sql`${stylePosts.stylePostId} < ${cursor.stylePostId}`,
+              ),
+            )
+        : undefined;
     const pageKeys = await this.db
       .select({ stylePostId: stylePosts.stylePostId, createdAt: stylePosts.createdAt, sortValue })
       .from(stylePosts)

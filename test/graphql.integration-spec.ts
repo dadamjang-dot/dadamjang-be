@@ -308,6 +308,25 @@ describe("PostgreSQL GraphQL integration", () => {
       postIds[1],
     ]);
 
+    const accessToken = await signin(request.agent(app.getHttpServer()));
+    const likedCursor = await request(app.getHttpServer())
+      .post("/graphql")
+      .set("Authorization", `Bearer ${accessToken}`)
+      .send({ query: `mutation { likeStylePost(stylePostId: "${postIds[1]}") { likeCount } }` })
+      .expect(200);
+    expect(likedCursor.body.data.likeStylePost.likeCount).toBe(2);
+    const popularNext = await request(app.getHttpServer())
+      .post("/graphql")
+      .send({
+        query: feedQuery,
+        variables: { filter: { sort: "POPULAR" }, first: 2, after: popular.body.data.stylePosts.nextCursor },
+      })
+      .expect(200);
+    expect(popularNext.body.errors).toBeUndefined();
+    expect(
+      popularNext.body.data.stylePosts.nodes.map(({ stylePostId }: { stylePostId: string }) => stylePostId),
+    ).toEqual([postIds[2]]);
+
     const clothing = await request(app.getHttpServer())
       .post("/graphql")
       .send({ query: feedQuery, variables: { filter: { category: "CLOTHING", sort: "RECOMMENDED" }, first: 5 } })
@@ -316,6 +335,19 @@ describe("PostgreSQL GraphQL integration", () => {
     expect(
       clothing.body.data.stylePosts.nodes.every(({ category }: { category: string }) => category === "CLOTHING"),
     ).toBe(true);
+  });
+
+  it("rejects invalid style post IDs without exposing internals", async () => {
+    const response = await request(app.getHttpServer())
+      .post("/graphql")
+      .send({ query: `{ stylePost(stylePostId: "not-a-uuid") { stylePostId } }` })
+      .expect(200);
+    expect(response.body.data).toBeNull();
+    expect(response.body.errors[0].message).toBe("Invalid style post ID");
+    const output = JSON.stringify(response.body);
+    expect(output).not.toContain("stacktrace");
+    expect(output).not.toContain("Failed query");
+    expect(output).not.toContain("/Volumes/");
   });
 
   it("adds and removes an authenticated wish idempotently", async () => {

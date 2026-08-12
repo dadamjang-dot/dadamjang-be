@@ -1,5 +1,6 @@
 export enum StylePostErrorMessage {
   InvalidCursor = "Invalid style post cursor",
+  InvalidStylePostId = "Invalid style post ID",
   NotFound = "Style post not found",
   AuthenticationRequired = "Authentication required",
   InvalidCategory = "Invalid style post category",
