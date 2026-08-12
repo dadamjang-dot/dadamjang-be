@@ -136,6 +136,10 @@ export class ProductPriceSummaryType {
   name!: string;
   @Field(() => String, { nullable: true })
   thumbnail!: string | null;
+  @Field()
+  isOnSale!: boolean;
+  @Field()
+  isExpressDelivery!: boolean;
   @Field(() => Int)
   basePrice!: number;
   @Field(() => Int)

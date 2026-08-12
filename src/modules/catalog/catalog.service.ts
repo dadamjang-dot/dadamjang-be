@@ -380,6 +380,8 @@ export class CatalogService {
       productId: product.productId,
       name: product.title,
       thumbnail: product.imageUrls[0] ?? null,
+      isOnSale: product.isOnSale,
+      isExpressDelivery: product.isExpressDelivery,
       basePrice,
       finalPrice,
       priceRevision: `${product.productId}:${product.createdAt.getTime()}:${finalPrice}`,
