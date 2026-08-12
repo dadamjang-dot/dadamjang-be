@@ -161,7 +161,8 @@ export class CatalogService {
 
   private productConditions = (filter: ProductFilterInput) => {
     const conditions = [eq(products.status, "PUBLISHED")];
-    if (filter.categoryId) conditions.push(eq(products.categoryId, filter.categoryId));
+    if (filter.categoryIds?.length) conditions.push(inArray(products.categoryId, filter.categoryIds));
+    else if (filter.categoryId) conditions.push(eq(products.categoryId, filter.categoryId));
     if (filter.query?.trim()) conditions.push(ilike(products.title, `%${filter.query.trim()}%`));
     if (filter.brandIds?.length) conditions.push(inArray(products.brandId, filter.brandIds));
     if (filter.saleOnly !== undefined) conditions.push(eq(products.isOnSale, filter.saleOnly));
@@ -285,6 +286,8 @@ export class CatalogService {
   };
 
   private matchesFilter = (product: ProductType, filter: ProductFilterInput) => {
+    if (filter.categoryIds?.length && !filter.categoryIds.includes(product.categoryId)) return false;
+    if (!filter.categoryIds?.length && filter.categoryId && product.categoryId !== filter.categoryId) return false;
     if (filter.brandIds?.length && (!product.brandId || !filter.brandIds.includes(product.brandId))) return false;
     if (
       (filter.colorIds?.length || filter.sizeIds?.length) &&

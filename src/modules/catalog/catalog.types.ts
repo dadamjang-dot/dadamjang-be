@@ -210,6 +210,8 @@ export class ProductPriceEvidenceType {
 export class ProductFilterInput {
   @Field(() => String, { nullable: true })
   categoryId?: string;
+  @Field(() => [String], { nullable: true })
+  categoryIds?: string[];
   @Field(() => String, { nullable: true })
   query?: string;
   @Field(() => [String], { nullable: true })

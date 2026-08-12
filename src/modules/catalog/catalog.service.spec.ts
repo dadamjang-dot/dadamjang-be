@@ -30,11 +30,17 @@ const createDatabase = (productRows: Product[], skuRows: ProductSku[], count = p
   } as unknown as Database;
 };
 
-const product = (productId: string, createdAt: string, brandId = "brand-1", isOnSale = true): Product => ({
+const product = (
+  productId: string,
+  createdAt: string,
+  brandId = "brand-1",
+  isOnSale = true,
+  categoryId = "category-1",
+): Product => ({
   productId,
   partnerId: "partner-1",
   brandId,
-  categoryId: "category-1",
+  categoryId,
   title: productId,
   description: productId,
   imageUrls: [],
@@ -113,5 +119,21 @@ describe("catalog cursor", () => {
     expect(secondPage.nodes.map(({ productId }) => productId)).toEqual(["product-2"]);
     expect(secondPage.hasNextPage).toBe(false);
     expect(secondPage.nextCursor).toBeNull();
+  });
+
+  it("matches products from any selected category", async () => {
+    const productRows = [
+      product("product-1", "2026-07-11T00:00:00.000Z", "brand-1", true, "category-1"),
+      product("product-2", "2026-07-10T00:00:00.000Z", "brand-1", true, "category-2"),
+      product("product-3", "2026-07-09T00:00:00.000Z", "brand-1", true, "category-3"),
+    ];
+    const skuRows = [sku("product-1", "sku-1", 100), sku("product-2", "sku-2", 200), sku("product-3", "sku-3", 300)];
+
+    const page = await new CatalogService(createDatabase(productRows, skuRows, 2)).listProducts({
+      categoryIds: ["category-1", "category-2"],
+    });
+
+    expect(page.totalCount).toBe(2);
+    expect(page.nodes.map(({ productId }) => productId)).toEqual(["product-1", "product-2"]);
   });
 });
