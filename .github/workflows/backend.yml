@@ -1,0 +1,58 @@
+name: Backend CI
+
+on:
+  pull_request:
+  push:
+    branches: [develop]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: dadamjang_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d dadamjang_test"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: 5432
+      POSTGRES_USERNAME: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DATABASE: dadamjang_test
+      CLIENT_URL: http://localhost:3000
+      JWT_ACCESS_TOKEN_SECRET: integration-access-secret
+      JWT_ACCESS_TOKEN_EXP: 15m
+      JWT_REFRESH_TOKEN_SECRET: integration-refresh-secret
+      JWT_REFRESH_TOKEN_EXP: 7d
+      KAKAO_CLIENT_ID: integration-kakao-client
+      KAKAO_CALLBACK_URL: http://localhost/auth/kakao/callback
+      EMAIL_CODE_PEPPER: integration-email-pepper
+      CLOUDFLARE_R2_BUCKET: integration-bucket
+      CLOUDFLARE_R2_PUBLIC_BASE_URL: http://localhost/r2
+      CLOUDFLARE_IMAGES_TRANSFORM_BASE_URL: http://localhost/images
+      CLOUDFLARE_R2_ENDPOINT: http://localhost/r2-api
+      CLOUDFLARE_R2_ACCESS_KEY_ID: integration-r2-access
+      CLOUDFLARE_R2_SECRET_ACCESS_KEY: integration-r2-secret
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.13.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm lint
+      - run: pnpm build
+      - run: pnpm test:unit
+      - run: pnpm test:integration

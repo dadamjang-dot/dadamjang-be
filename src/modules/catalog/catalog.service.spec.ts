@@ -143,9 +143,7 @@ describe("catalog cursor", () => {
       after: firstPage.nextCursor ?? undefined,
     });
 
-    expect(secondPage.nodes.map(({ productId }) => productId)).toEqual([
-      "discounted",
-    ]);
+    expect(secondPage.nodes.map(({ productId }) => productId)).toEqual(["discounted"]);
   });
 
   it("matches products from any selected category", async () => {
