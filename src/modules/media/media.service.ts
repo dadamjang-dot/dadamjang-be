@@ -5,8 +5,18 @@ import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { randomUUID } from "crypto";
 import { CustomBadRequestException } from "src/common/errors/custom-exceptions";
 import { MediaErrorMessage } from "./media.error";
-import { SUPPORTED_CONTENT_TYPES } from "./media.constant";
-import type { CreateProductImageUploadInput, ProductImageUploadTarget } from "./media.types";
+import {
+  STYLE_POST_MAX_FILE_SIZE,
+  STYLE_POST_IMAGE_EXTENSIONS,
+  STYLE_POST_IMAGE_KEY_PATTERN,
+  STYLE_POST_SUPPORTED_CONTENT_TYPES,
+  SUPPORTED_CONTENT_TYPES,
+} from "./media.constant";
+import type {
+  CreateProductImageUploadInput,
+  CreateStylePostImageUploadInput,
+  ProductImageUploadTarget,
+} from "./media.types";
 
 @Injectable()
 export class MediaService {
@@ -48,10 +58,49 @@ export class MediaService {
     return { key, uploadUrl, originalUrl, imageUrl: this.transformedUrl(key) };
   };
 
+  createStylePostUpload = async (
+    userId: string,
+    input: CreateStylePostImageUploadInput,
+  ): Promise<ProductImageUploadTarget> => {
+    if (!STYLE_POST_SUPPORTED_CONTENT_TYPES.has(input.contentType.toLowerCase())) {
+      throw new CustomBadRequestException(MediaErrorMessage.UnsupportedType);
+    }
+    if (!Number.isInteger(input.fileSize) || input.fileSize <= 0) {
+      throw new CustomBadRequestException(MediaErrorMessage.InvalidFileSize);
+    }
+    if (input.fileSize > STYLE_POST_MAX_FILE_SIZE) {
+      throw new CustomBadRequestException(MediaErrorMessage.FileTooLarge);
+    }
+
+    const extension = STYLE_POST_IMAGE_EXTENSIONS[input.contentType.toLowerCase()];
+    const key = `style-posts/${userId}/${randomUUID()}.${extension}`;
+    const uploadUrl = await getSignedUrl(
+      this.client,
+      new PutObjectCommand({
+        Bucket: this.bucket,
+        Key: key,
+        ContentType: input.contentType.toLowerCase(),
+        ContentLength: input.fileSize,
+      }),
+      { expiresIn: 10 * 60 },
+    );
+    const originalUrl = this.originalUrl(key);
+
+    return { key, uploadUrl, originalUrl, imageUrl: this.transformedUrl(key) };
+  };
+
   getProductImageUrl = async (key: string, width?: number): Promise<string> => {
     if (!key.startsWith("products/")) throw new CustomBadRequestException(MediaErrorMessage.InvalidKey);
     return this.transformedUrl(key, width);
   };
+
+  getStylePostImageUrl = (key: string, width?: number) => {
+    if (!STYLE_POST_IMAGE_KEY_PATTERN.test(key)) throw new CustomBadRequestException(MediaErrorMessage.InvalidKey);
+    return this.transformedUrl(key, width);
+  };
+
+  isStylePostImageKeyForUser = (key: string, userId: string) =>
+    key.startsWith(`style-posts/${userId}/`) && STYLE_POST_IMAGE_KEY_PATTERN.test(key);
 
   private originalUrl = (key: string) => `${this.publicBaseUrl}/${key}`;
 

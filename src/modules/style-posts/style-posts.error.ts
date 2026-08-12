@@ -1,5 +1,17 @@
 export enum StylePostErrorMessage {
   InvalidCursor = "Invalid style post cursor",
+  InvalidStylePostId = "Invalid style post ID",
   NotFound = "Style post not found",
   AuthenticationRequired = "Authentication required",
+  InvalidCategory = "Invalid style post category",
+  ContentRequired = "Style post content is required",
+  ContentTooLong = "Style post content must be 1000 characters or fewer",
+  ProductCount = "Style post must contain 1 to 5 purchased products",
+  ImageCount = "Style post must contain 1 to 5 images",
+  InvalidImageKey = "Style post image key is invalid",
+  HashtagCount = "Style post must contain 0 to 10 hashtags",
+  InvalidHashtag = "Style post hashtag is invalid",
+  BrandTagNotPurchased = "Style post brand tag must belong to a purchased product",
+  IdempotencyKeyRequired = "Style post idempotency key is required",
+  ProductNotPurchased = "Style post product was not purchased by this user",
 }

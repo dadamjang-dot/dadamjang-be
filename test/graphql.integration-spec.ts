@@ -110,6 +110,345 @@ describe("PostgreSQL GraphQL integration", () => {
     expect(product.body.data.product.productId).toBe(FIXTURE.productId);
   });
 
+  it("validates purchased style products, persists posts idempotently, and toggles likes", async () => {
+    const publicFeed = await request(app.getHttpServer())
+      .post("/graphql")
+      .send({ query: `query { stylePosts(filter: { sort: LATEST }) { nodes { stylePostId } } }` })
+      .expect(200);
+    expect(publicFeed.body.data.stylePosts.nodes).toEqual([]);
+
+    const unauthenticatedCreate = await request(app.getHttpServer())
+      .post("/graphql")
+      .send({
+        query: `mutation Create($input: CreateStylePostInput!) { createStylePost(input: $input) { stylePostId } }`,
+        variables: {
+          input: {
+            category: "CLOTHING",
+            productIds: [FIXTURE.productId],
+            imageKeys: [`style-posts/${FIXTURE.userId}/00000000-0000-4000-8000-000000000001.jpg`],
+            content: "로그인 필요",
+            idempotencyKey: "unauthenticated-style",
+          },
+        },
+      });
+    expect(unauthenticatedCreate.body.errors).toHaveLength(1);
+
+    await pool.query(
+      `INSERT INTO "orders" ("orderId", "orderNumber", "userId", "status", "paymentStatus", "totalAmount") VALUES ($1, $2, $3, 'PAID', 'APPROVED', 15000)`,
+      ["90000000-0000-4000-8000-000000000001", "DJ-STYLE-001", FIXTURE.userId],
+    );
+    await pool.query(
+      `INSERT INTO "orderItems" ("orderItemId", "orderId", "productId", "skuId", "productTitle", "skuOptionName", "unitPrice", "quantity") VALUES ($1, $2, $3, $4, $5, 'Black / M', 15000, 1)`,
+      [
+        "91000000-0000-4000-8000-000000000001",
+        "90000000-0000-4000-8000-000000000001",
+        FIXTURE.productId,
+        FIXTURE.skuId,
+        "Integration Sale Tee",
+      ],
+    );
+
+    const agent = request.agent(app.getHttpServer());
+    const accessToken = await signin(agent);
+    const auth = { Authorization: `Bearer ${accessToken}` };
+    const purchased = await agent
+      .post("/graphql")
+      .set(auth)
+      .send({ query: `{ purchasedStyleProducts { productId brandId brandName lastPurchasedAt } }` })
+      .expect(200);
+    expect(purchased.body.data.purchasedStyleProducts).toHaveLength(1);
+    expect(purchased.body.data.purchasedStyleProducts[0].productId).toBe(FIXTURE.productId);
+
+    const createMutation = `mutation Create($input: CreateStylePostInput!) {
+      createStylePost(input: $input) { stylePostId category content hashtags brandTags { brandId name } products { productId } likeCount isLiked }
+    }`;
+    const invalidPurchase = await agent
+      .post("/graphql")
+      .set(auth)
+      .send({
+        query: createMutation,
+        variables: {
+          input: {
+            category: "CLOTHING",
+            productIds: [FIXTURE.secondProductId],
+            imageKeys: [`style-posts/${FIXTURE.userId}/00000000-0000-4000-8000-000000000002.jpg`],
+            content: "구매하지 않은 상품",
+            idempotencyKey: "invalid-style",
+          },
+        },
+      });
+    expect(invalidPurchase.body.errors).toHaveLength(1);
+
+    const invalidImage = await agent
+      .post("/graphql")
+      .set(auth)
+      .send({
+        query: createMutation,
+        variables: {
+          input: {
+            category: "CLOTHING",
+            productIds: [FIXTURE.productId],
+            imageKeys: [`style-posts/${FIXTURE.userId}/look.webp`],
+            content: "잘못된 이미지 키",
+            idempotencyKey: "invalid-style-image",
+          },
+        },
+      });
+    expect(invalidImage.body.errors[0].message).toBe("Style post image key is invalid");
+    const feedAfterInvalidImage = await request(app.getHttpServer())
+      .post("/graphql")
+      .send({ query: `{ stylePosts(filter: { sort: LATEST }) { nodes { stylePostId } } }` })
+      .expect(200);
+    expect(feedAfterInvalidImage.body.data.stylePosts.nodes).toEqual([]);
+
+    const input = {
+      category: "CLOTHING",
+      productIds: [FIXTURE.productId],
+      imageKeys: [`style-posts/${FIXTURE.userId}/00000000-0000-4000-8000-000000000001.jpg`],
+      content: "오늘의 스타일",
+      hashtags: ["daily_look"],
+      brandTagIds: [FIXTURE.brandId],
+      idempotencyKey: "style-create-1",
+    };
+    const first = await agent.post("/graphql").set(auth).send({ query: createMutation, variables: { input } });
+    const repeated = await agent.post("/graphql").set(auth).send({ query: createMutation, variables: { input } });
+    expect(first.body.errors).toBeUndefined();
+    expect(repeated.body.data.createStylePost.stylePostId).toBe(first.body.data.createStylePost.stylePostId);
+    expect(first.body.data.createStylePost).toMatchObject({
+      category: "CLOTHING",
+      content: "오늘의 스타일",
+      hashtags: ["daily_look"],
+      likeCount: 0,
+      isLiked: false,
+    });
+
+    const invalidCursor = Buffer.from(
+      JSON.stringify({
+        category: null,
+        sort: "LATEST",
+        sortValue: 0,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        stylePostId: "ffffffff-ffff-4fff-8fff-ffffffffffff",
+      }),
+    ).toString("base64url");
+    const rejectedCursor = await request(app.getHttpServer())
+      .post("/graphql")
+      .send({
+        query: `query StylePosts($filter: StylePostFilterInput, $first: Int, $after: String) {
+          stylePosts(filter: $filter, first: $first, after: $after) { nodes { stylePostId } }
+        }`,
+        variables: { filter: { sort: "LATEST" }, first: 1, after: invalidCursor },
+      })
+      .expect(200);
+    expect(rejectedCursor.body.errors[0].message).toBe("Invalid style post cursor");
+
+    const stylePostId = first.body.data.createStylePost.stylePostId;
+    const viewerPost = await agent
+      .post("/graphql")
+      .set(auth)
+      .send({ query: `{ stylePost(stylePostId: "${stylePostId}") { isLiked likeCount } }` })
+      .expect(200);
+    expect(viewerPost.body.data.stylePost).toEqual({ isLiked: false, likeCount: 0 });
+    const likeMutation = `mutation { likeStylePost(stylePostId: "${stylePostId}") { likeCount isLiked } }`;
+    const liked = await agent.post("/graphql").set(auth).send({ query: likeMutation });
+    const repeatedLike = await agent.post("/graphql").set(auth).send({ query: likeMutation });
+    expect(liked.body.data.likeStylePost).toEqual({ likeCount: 1, isLiked: true });
+    expect(repeatedLike.body.data.likeStylePost).toEqual({ likeCount: 1, isLiked: true });
+    const likedViewerPost = await agent
+      .post("/graphql")
+      .set(auth)
+      .send({ query: `{ stylePost(stylePostId: "${stylePostId}") { isLiked likeCount } }` })
+      .expect(200);
+    expect(likedViewerPost.body.data.stylePost).toEqual({ isLiked: true, likeCount: 1 });
+
+    const unlikeMutation = `mutation { unlikeStylePost(stylePostId: "${stylePostId}") { likeCount isLiked } }`;
+    const unliked = await agent.post("/graphql").set(auth).send({ query: unlikeMutation });
+    const repeatedUnlike = await agent.post("/graphql").set(auth).send({ query: unlikeMutation });
+    expect(unliked.body.data.unlikeStylePost).toEqual({ likeCount: 0, isLiked: false });
+    expect(repeatedUnlike.body.data.unlikeStylePost).toEqual({ likeCount: 0, isLiked: false });
+    const reliked = await agent.post("/graphql").set(auth).send({ query: likeMutation });
+    expect(reliked.body.data.likeStylePost).toEqual({ likeCount: 1, isLiked: true });
+  });
+
+  it("paginates style posts with category and sort-aware cursors", async () => {
+    const postIds = [
+      "82000000-0000-4000-8000-000000000001",
+      "82000000-0000-4000-8000-000000000002",
+      "82000000-0000-4000-8000-000000000003",
+    ];
+    await pool.query(
+      `INSERT INTO "stylePosts" ("stylePostId", "authorId", "title", "content", "category", "createdAt", "updatedAt") VALUES
+        ($1, $4, 'Older', 'Older style', 'CLOTHING', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'),
+        ($2, $4, 'Middle', 'Middle style', 'CLOTHING', '2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z'),
+        ($3, $4, 'Newest', 'Newest style', 'CLOTHING', '2026-01-03T00:00:00Z', '2026-01-03T00:00:00Z')`,
+      [...postIds, FIXTURE.userId],
+    );
+    await pool.query(
+      `INSERT INTO "users" ("userId", "userid", "email", "password") VALUES
+        ('10000000-0000-4000-8000-000000000002', 'style-liker-2', 'style-liker-2@example.test', 'x'),
+        ('10000000-0000-4000-8000-000000000003', 'style-liker-3', 'style-liker-3@example.test', 'x')`,
+    );
+    await pool.query(
+      `INSERT INTO "stylePostLikes" ("stylePostId", "userId") VALUES
+        ($1, $2), ($1, '10000000-0000-4000-8000-000000000002'), ($3, '10000000-0000-4000-8000-000000000003')`,
+      [postIds[0], FIXTURE.userId, postIds[1]],
+    );
+
+    const feedQuery = `query StylePosts($filter: StylePostFilterInput, $first: Int, $after: String) {
+      stylePosts(filter: $filter, first: $first, after: $after) { nodes { stylePostId category likeCount } nextCursor hasNextPage }
+    }`;
+    const latestFirst = await request(app.getHttpServer())
+      .post("/graphql")
+      .send({ query: feedQuery, variables: { filter: { sort: "LATEST" }, first: 2 } })
+      .expect(200);
+    expect(latestFirst.body.errors).toBeUndefined();
+    expect(
+      latestFirst.body.data.stylePosts.nodes.map(({ stylePostId }: { stylePostId: string }) => stylePostId),
+    ).toEqual([postIds[2], postIds[1]]);
+    expect(latestFirst.body.data.stylePosts.hasNextPage).toBe(true);
+
+    const latestSecond = await request(app.getHttpServer())
+      .post("/graphql")
+      .send({
+        query: feedQuery,
+        variables: {
+          filter: { sort: "LATEST" },
+          first: 2,
+          after: latestFirst.body.data.stylePosts.nextCursor,
+        },
+      })
+      .expect(200);
+    expect(
+      latestSecond.body.data.stylePosts.nodes.map(({ stylePostId }: { stylePostId: string }) => stylePostId),
+    ).toEqual([postIds[0]]);
+    expect(latestSecond.body.data.stylePosts.hasNextPage).toBe(false);
+
+    const popular = await request(app.getHttpServer())
+      .post("/graphql")
+      .send({ query: feedQuery, variables: { filter: { sort: "POPULAR" }, first: 2 } })
+      .expect(200);
+    expect(popular.body.data.stylePosts.nodes.map(({ stylePostId }: { stylePostId: string }) => stylePostId)).toEqual([
+      postIds[0],
+      postIds[1],
+    ]);
+
+    const [cursorPayload, cursorSignature] = popular.body.data.stylePosts.nextCursor.split(".");
+    const cursor = JSON.parse(Buffer.from(cursorPayload, "base64url").toString("utf8")) as { sortValue: number };
+    const tamperedCursor = `${Buffer.from(JSON.stringify({ ...cursor, sortValue: cursor.sortValue + 99 })).toString("base64url")}.${cursorSignature}`;
+    const rejectedTamperedCursor = await request(app.getHttpServer())
+      .post("/graphql")
+      .send({
+        query: feedQuery,
+        variables: { filter: { sort: "POPULAR" }, first: 2, after: tamperedCursor },
+      })
+      .expect(200);
+    expect(rejectedTamperedCursor.body.errors[0].message).toBe("Invalid style post cursor");
+
+    const accessToken = await signin(request.agent(app.getHttpServer()));
+    const likedCursor = await request(app.getHttpServer())
+      .post("/graphql")
+      .set("Authorization", `Bearer ${accessToken}`)
+      .send({ query: `mutation { likeStylePost(stylePostId: "${postIds[1]}") { likeCount } }` })
+      .expect(200);
+    expect(likedCursor.body.data.likeStylePost.likeCount).toBe(2);
+    const popularNext = await request(app.getHttpServer())
+      .post("/graphql")
+      .send({
+        query: feedQuery,
+        variables: { filter: { sort: "POPULAR" }, first: 2, after: popular.body.data.stylePosts.nextCursor },
+      })
+      .expect(200);
+    expect(popularNext.body.errors).toBeUndefined();
+    expect(
+      popularNext.body.data.stylePosts.nodes.map(({ stylePostId }: { stylePostId: string }) => stylePostId),
+    ).toEqual([postIds[2]]);
+
+    const popularBeforeUnlike = await request(app.getHttpServer())
+      .post("/graphql")
+      .send({ query: feedQuery, variables: { filter: { sort: "POPULAR" }, first: 1 } })
+      .expect(200);
+    expect(popularBeforeUnlike.body.data.stylePosts.nodes[0].stylePostId).toBe(postIds[1]);
+    const unlikedCursor = await request(app.getHttpServer())
+      .post("/graphql")
+      .set("Authorization", `Bearer ${accessToken}`)
+      .send({ query: `mutation { unlikeStylePost(stylePostId: "${postIds[1]}") { likeCount } }` })
+      .expect(200);
+    expect(unlikedCursor.body.data.unlikeStylePost.likeCount).toBe(1);
+    const popularAfterUnlike = await request(app.getHttpServer())
+      .post("/graphql")
+      .send({
+        query: feedQuery,
+        variables: {
+          filter: { sort: "POPULAR" },
+          first: 2,
+          after: popularBeforeUnlike.body.data.stylePosts.nextCursor,
+        },
+      })
+      .expect(200);
+    expect(popularAfterUnlike.body.errors).toBeUndefined();
+    expect(
+      popularAfterUnlike.body.data.stylePosts.nodes.map(({ stylePostId }: { stylePostId: string }) => stylePostId),
+    ).toEqual([postIds[0], postIds[2]]);
+
+    const recommendedBeforeUnlike = await request(app.getHttpServer())
+      .post("/graphql")
+      .send({ query: feedQuery, variables: { filter: { sort: "RECOMMENDED" }, first: 1 } })
+      .expect(200);
+    expect(recommendedBeforeUnlike.body.data.stylePosts.nodes[0].stylePostId).toBe(postIds[0]);
+    const unlikedRecommendedCursor = await request(app.getHttpServer())
+      .post("/graphql")
+      .set("Authorization", `Bearer ${accessToken}`)
+      .send({ query: `mutation { unlikeStylePost(stylePostId: "${postIds[0]}") { likeCount } }` })
+      .expect(200);
+    expect(unlikedRecommendedCursor.body.data.unlikeStylePost.likeCount).toBe(1);
+    const recommendedAfterUnlike = await request(app.getHttpServer())
+      .post("/graphql")
+      .send({
+        query: feedQuery,
+        variables: {
+          filter: { sort: "RECOMMENDED" },
+          first: 2,
+          after: recommendedBeforeUnlike.body.data.stylePosts.nextCursor,
+        },
+      })
+      .expect(200);
+    expect(recommendedAfterUnlike.body.errors).toBeUndefined();
+    expect(
+      recommendedAfterUnlike.body.data.stylePosts.nodes.map(({ stylePostId }: { stylePostId: string }) => stylePostId),
+    ).toEqual([postIds[1], postIds[2]]);
+
+    const clothing = await request(app.getHttpServer())
+      .post("/graphql")
+      .send({ query: feedQuery, variables: { filter: { category: "CLOTHING", sort: "RECOMMENDED" }, first: 5 } })
+      .expect(200);
+    expect(clothing.body.data.stylePosts.nodes).toHaveLength(3);
+    expect(
+      clothing.body.data.stylePosts.nodes.every(({ category }: { category: string }) => category === "CLOTHING"),
+    ).toBe(true);
+  });
+
+  it("rejects invalid style post IDs without exposing internals", async () => {
+    const response = await request(app.getHttpServer())
+      .post("/graphql")
+      .send({ query: `{ stylePost(stylePostId: "not-a-uuid") { stylePostId } }` })
+      .expect(200);
+    expect(response.body.data).toBeNull();
+    expect(response.body.errors[0].message).toBe("Invalid style post ID");
+    const output = JSON.stringify(response.body);
+    expect(output).not.toContain("stacktrace");
+    expect(output).not.toContain("Failed query");
+    expect(output).not.toContain("/Volumes/");
+
+    const accessToken = await signin(request.agent(app.getHttpServer()));
+    const mutation = await request(app.getHttpServer())
+      .post("/graphql")
+      .set("Authorization", `Bearer ${accessToken}`)
+      .send({ query: `mutation { likeStylePost(stylePostId: "not-a-uuid") { stylePostId } }` })
+      .expect(200);
+    expect(mutation.body.errors[0].message).toBe("Invalid style post ID");
+    expect(JSON.stringify(mutation.body)).not.toContain("stacktrace");
+  });
+
   it("adds and removes an authenticated wish idempotently", async () => {
     const agent = request.agent(app.getHttpServer());
     const accessToken = await signin(agent);

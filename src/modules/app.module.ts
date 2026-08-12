@@ -1,7 +1,8 @@
-import { Module } from "@nestjs/common";
+import { HttpException, Module } from "@nestjs/common";
 import { ConfigModule } from "@nestjs/config";
 import { GraphQLModule } from "@nestjs/graphql";
 import { ApolloDriver, ApolloDriverConfig } from "@nestjs/apollo";
+import { GraphQLError } from "graphql";
 import { AuthModule } from "./auth/auth.module";
 import { DatabaseModule } from "./database/database.module";
 import { EmailModule } from "./email/email.module";
@@ -27,6 +28,14 @@ import { StylePostsModule } from "./style-posts/style-posts.module";
       driver: ApolloDriver,
       autoSchemaFile: true,
       context: ({ req, res }) => ({ req, res }),
+      formatError: (formattedError, error) => {
+        const originalError = error instanceof GraphQLError ? error.originalError : undefined;
+        const extensions = Object.fromEntries(
+          Object.entries(formattedError.extensions ?? {}).filter(([key]) => key !== "stacktrace"),
+        );
+        if (originalError instanceof HttpException) return { ...formattedError, extensions };
+        return { message: "Internal server error", extensions: { code: "INTERNAL_SERVER_ERROR" } };
+      },
     }),
     DatabaseModule,
     AuthModule,
