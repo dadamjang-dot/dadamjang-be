@@ -21,7 +21,7 @@
     "lint:fix": "pnpm lint --fix",
     "test": "pnpm test:unit && pnpm test:integration",
     "test:unit": "jest --config ./jest-unit.config.ts --runInBand",
-    "test:integration": "NODE_ENV=test POSTGRES_DATABASE=dadamjang_test jest --config ./test/jest-integration.config.ts --runInBand",
+    "test:integration": "NODE_ENV=test POSTGRES_HOST=127.0.0.1 POSTGRES_PORT=55432 POSTGRES_USERNAME=postgres POSTGRES_PASSWORD=postgres POSTGRES_DATABASE=dadamjang_test jest --config ./test/jest-integration.config.ts --runInBand",
     "test:watch": "jest --config ./jest-unit.config.ts --watch",
     "test:cov": "jest --config ./jest-unit.config.ts --coverage --runInBand",
     "test:debug": "node --inspect-brk -r tsconfig-paths/register -r ts-node/register node_modules/.bin/jest --runInBand",
