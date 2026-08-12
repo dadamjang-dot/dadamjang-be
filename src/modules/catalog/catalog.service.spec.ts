@@ -121,6 +121,33 @@ describe("catalog cursor", () => {
     expect(secondPage.nextCursor).toBeNull();
   });
 
+  it("sorts high price pages by the displayed final price", async () => {
+    const productRows = [
+      product("discounted", "2026-07-11T00:00:00.000Z"),
+      product("regular", "2026-07-10T00:00:00.000Z"),
+    ];
+    const skuRows = [
+      sku("discounted", "sale", 17_900),
+      sku("discounted", "base", 34_900),
+      sku("regular", "default", 24_900),
+    ];
+    const filter = { sort: ProductSort.HIGH_PRICE, first: 1 };
+
+    const firstPage = await new CatalogService(createDatabase(productRows, skuRows)).listProductPriceSummaries(filter);
+
+    expect(firstPage.nodes.map(({ productId }) => productId)).toEqual(["regular"]);
+    expect(firstPage.nextCursor).toBeTruthy();
+
+    const secondPage = await new CatalogService(createDatabase(productRows, skuRows)).listProductPriceSummaries({
+      ...filter,
+      after: firstPage.nextCursor ?? undefined,
+    });
+
+    expect(secondPage.nodes.map(({ productId }) => productId)).toEqual([
+      "discounted",
+    ]);
+  });
+
   it("matches products from any selected category", async () => {
     const productRows = [
       product("product-1", "2026-07-11T00:00:00.000Z", "brand-1", true, "category-1"),

@@ -315,7 +315,7 @@ export class CatalogService {
       selectedSort === ProductSort.LOW_PRICE
         ? this.lowestSkuPrice(left) - this.lowestSkuPrice(right)
         : selectedSort === ProductSort.HIGH_PRICE
-          ? this.highestSkuPrice(right) - this.highestSkuPrice(left)
+          ? this.lowestSkuPrice(right) - this.lowestSkuPrice(left)
           : selectedSort === ProductSort.POPULAR
             ? this.stockTotal(right) - this.stockTotal(left)
             : right.createdAt.getTime() - left.createdAt.getTime();
@@ -360,7 +360,7 @@ export class CatalogService {
 
   private sortValue = (product: ProductType, sort: ProductSort) => {
     if (sort === ProductSort.LOW_PRICE) return this.lowestSkuPrice(product);
-    if (sort === ProductSort.HIGH_PRICE) return this.highestSkuPrice(product);
+    if (sort === ProductSort.HIGH_PRICE) return this.lowestSkuPrice(product);
     return this.stockTotal(product);
   };
 
