@@ -4,6 +4,7 @@ import { JwtRefreshTokenGuard } from "src/guards/refreshToken.guard";
 import { KakaoGuard } from "src/guards/kakao.guard";
 import { KakaoStrategy } from "src/strategys/kakao.strategy";
 import { JwtRefreshTokenStrategy } from "src/strategys/refreshToken.strategy";
+import { JwtAccessTokenStrategy } from "src/strategys/accessToken.strategy";
 import { EmailModule } from "src/modules/email/email.module";
 import { AuthController } from "./auth.controller";
 import { AuthRepository } from "./auth.repository";
@@ -19,6 +20,7 @@ import { AuthService } from "./auth.service";
     AuthRepository,
     JwtRefreshTokenGuard,
     JwtRefreshTokenStrategy,
+    JwtAccessTokenStrategy,
     KakaoGuard,
     KakaoStrategy,
   ],

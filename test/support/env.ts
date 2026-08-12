@@ -1,0 +1,14 @@
+process.env.CLIENT_URL ??= "http://localhost:3000";
+process.env.JWT_ACCESS_TOKEN_SECRET ??= "integration-access-secret";
+process.env.JWT_ACCESS_TOKEN_EXP ??= "15m";
+process.env.JWT_REFRESH_TOKEN_SECRET ??= "integration-refresh-secret";
+process.env.JWT_REFRESH_TOKEN_EXP ??= "7d";
+process.env.KAKAO_CLIENT_ID ??= "integration-kakao-client";
+process.env.KAKAO_CALLBACK_URL ??= "http://localhost/auth/kakao/callback";
+process.env.EMAIL_CODE_PEPPER ??= "integration-email-pepper";
+process.env.CLOUDFLARE_R2_BUCKET ??= "integration-bucket";
+process.env.CLOUDFLARE_R2_PUBLIC_BASE_URL ??= "http://localhost/r2";
+process.env.CLOUDFLARE_IMAGES_TRANSFORM_BASE_URL ??= "http://localhost/images";
+process.env.CLOUDFLARE_R2_ENDPOINT ??= "http://localhost/r2-api";
+process.env.CLOUDFLARE_R2_ACCESS_KEY_ID ??= "integration-r2-access";
+process.env.CLOUDFLARE_R2_SECRET_ACCESS_KEY ??= "integration-r2-secret";

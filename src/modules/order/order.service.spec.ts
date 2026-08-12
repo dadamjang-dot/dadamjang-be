@@ -65,4 +65,60 @@ describe("OrderService", () => {
       items: [],
     });
   });
+
+  it("records a payment failure without decrementing stock", async () => {
+    let selectCount = 0;
+    const skuUpdate = jest.fn();
+    const row = {
+      cartItems: { quantity: 1 },
+      productSkus: { skuId: "sku-1", code: "SKU-1", price: 1000, stock: 1, isActive: true },
+      products: { productId: "product-1", title: "Product", status: "PUBLISHED" },
+    };
+    const db = {
+      transaction: async (callback: (tx: unknown) => Promise<unknown>) =>
+        callback({
+          select: () => ({
+            from: () => ({
+              innerJoin: () => ({ innerJoin: () => ({ where: async () => [row] }) }),
+              where: () => ({
+                limit: async () => {
+                  selectCount += 1;
+                  return selectCount === 1 ? [] : [{ cartId: "cart-1" }];
+                },
+              }),
+            }),
+          }),
+          insert: () => ({
+            values: () => ({
+              returning: async () =>
+                selectCount === 1
+                  ? [{ checkoutIdempotencyKeyId: "key-1" }]
+                  : [{ orderId: "order-1", status: "PAYMENT_PENDING" }],
+            }),
+          }),
+          update: (table: unknown) => {
+            if (String(table).includes("productSkus")) skuUpdate();
+            return {
+              set: () => ({
+                where: () => ({
+                  returning: async () => [
+                    {
+                      orderId: "order-1",
+                      status: "FAILED",
+                      paymentStatus: "FAILED",
+                      paymentFailureReason: "Mock payment rejected",
+                    },
+                  ],
+                }),
+              }),
+            };
+          },
+        }),
+    };
+    const service = new OrderService(db as never);
+    await expect(
+      service.checkoutCart("user-1", { idempotencyKey: "checkout-failure", forcePaymentFailure: true }),
+    ).resolves.toMatchObject({ status: "FAILED", paymentStatus: "FAILED" });
+    expect(skuUpdate).not.toHaveBeenCalled();
+  });
 });

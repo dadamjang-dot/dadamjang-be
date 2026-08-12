@@ -1,4 +1,14 @@
-import { Field, InputType, Int, ObjectType } from "@nestjs/graphql";
+import { Field, InputType, Int, ObjectType, registerEnumType } from "@nestjs/graphql";
+
+export enum ProductSort {
+  RECOMMENDED = "RECOMMENDED",
+  LATEST = "LATEST",
+  LOW_PRICE = "LOW_PRICE",
+  HIGH_PRICE = "HIGH_PRICE",
+  POPULAR = "POPULAR",
+}
+
+registerEnumType(ProductSort, { name: "ProductSort" });
 
 @ObjectType()
 export class CategoryType {
@@ -15,11 +25,61 @@ export class CategoryType {
 }
 
 @ObjectType()
+export class BrandType {
+  @Field()
+  brandId!: string;
+  @Field()
+  name!: string;
+  @Field()
+  slug!: string;
+}
+
+@ObjectType()
+export class ColorType {
+  @Field()
+  colorId!: string;
+  @Field()
+  name!: string;
+  @Field()
+  slug!: string;
+  @Field(() => String, { nullable: true })
+  hexCode!: string | null;
+}
+
+@ObjectType()
+export class SizeType {
+  @Field()
+  sizeId!: string;
+  @Field()
+  name!: string;
+  @Field()
+  slug!: string;
+  @Field(() => Int)
+  sortOrder!: number;
+}
+
+@ObjectType()
+export class CatalogFilterOptionsType {
+  @Field(() => [CategoryType])
+  categories!: CategoryType[];
+  @Field(() => [BrandType])
+  brands!: BrandType[];
+  @Field(() => [ColorType])
+  colors!: ColorType[];
+  @Field(() => [SizeType])
+  sizes!: SizeType[];
+}
+
+@ObjectType()
 export class ProductSkuType {
   @Field()
   skuId!: string;
   @Field()
   code!: string;
+  @Field(() => String, { nullable: true })
+  colorId!: string | null;
+  @Field(() => String, { nullable: true })
+  sizeId!: string | null;
   @Field()
   optionName!: string;
   @Field(() => Int)
@@ -34,6 +94,8 @@ export class ProductType {
   productId!: string;
   @Field()
   partnerId!: string;
+  @Field(() => String, { nullable: true })
+  brandId!: string | null;
   @Field()
   categoryId!: string;
   @Field()
@@ -44,6 +106,10 @@ export class ProductType {
   imageUrls!: string[];
   @Field()
   status!: string;
+  @Field()
+  isOnSale!: boolean;
+  @Field()
+  isExpressDelivery!: boolean;
   @Field(() => [ProductSkuType])
   skus!: ProductSkuType[];
   @Field()
@@ -58,6 +124,8 @@ export class ProductConnectionType {
   nextCursor!: string | null;
   @Field()
   hasNextPage!: boolean;
+  @Field(() => Int)
+  totalCount!: number;
 }
 
 @ObjectType()
@@ -68,6 +136,10 @@ export class ProductPriceSummaryType {
   name!: string;
   @Field(() => String, { nullable: true })
   thumbnail!: string | null;
+  @Field()
+  isOnSale!: boolean;
+  @Field()
+  isExpressDelivery!: boolean;
   @Field(() => Int)
   basePrice!: number;
   @Field(() => Int)
@@ -86,6 +158,8 @@ export class ProductPriceSummaryConnectionType {
   nextCursor!: string | null;
   @Field()
   hasNextPage!: boolean;
+  @Field(() => Int)
+  totalCount!: number;
 }
 
 @ObjectType()
@@ -140,10 +214,26 @@ export class ProductPriceEvidenceType {
 export class ProductFilterInput {
   @Field(() => String, { nullable: true })
   categoryId?: string;
+  @Field(() => [String], { nullable: true })
+  categoryIds?: string[];
   @Field(() => String, { nullable: true })
   query?: string;
-  @Field(() => String, { nullable: true })
-  sort?: "LATEST" | "LOW_PRICE" | "POPULAR";
+  @Field(() => [String], { nullable: true })
+  brandIds?: string[];
+  @Field(() => [String], { nullable: true })
+  colorIds?: string[];
+  @Field(() => [String], { nullable: true })
+  sizeIds?: string[];
+  @Field(() => Int, { nullable: true })
+  minPrice?: number;
+  @Field(() => Int, { nullable: true })
+  maxPrice?: number;
+  @Field(() => Boolean, { nullable: true })
+  saleOnly?: boolean;
+  @Field(() => Boolean, { nullable: true })
+  expressOnly?: boolean;
+  @Field(() => ProductSort, { nullable: true })
+  sort?: ProductSort;
   @Field(() => String, { nullable: true })
   after?: string;
   @Field(() => Int, { nullable: true })
@@ -166,6 +256,10 @@ export class CreateCategoryInput {
 export class ProductSkuInput {
   @Field()
   code!: string;
+  @Field(() => String, { nullable: true })
+  colorId?: string;
+  @Field(() => String, { nullable: true })
+  sizeId?: string;
   @Field()
   optionName!: string;
   @Field(() => Int)
@@ -178,6 +272,8 @@ export class ProductSkuInput {
 export class CreateProductDraftInput {
   @Field()
   categoryId!: string;
+  @Field(() => String, { nullable: true })
+  brandId?: string;
   @Field()
   title!: string;
   @Field()
@@ -186,4 +282,8 @@ export class CreateProductDraftInput {
   imageUrls!: string[];
   @Field(() => [ProductSkuInput])
   skus!: ProductSkuInput[];
+  @Field(() => Boolean, { nullable: true })
+  isOnSale?: boolean;
+  @Field(() => Boolean, { nullable: true })
+  isExpressDelivery?: boolean;
 }
