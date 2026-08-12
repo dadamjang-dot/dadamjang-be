@@ -199,11 +199,57 @@ export const stylePosts = pgTable(
     title: varchar("title", { length: 200 }).notNull(),
     content: text("content").notNull(),
     imageUrls: jsonb("imageUrls").$type<string[]>().notNull().default([]),
+    category: varchar("category", { length: 20 }).notNull().default("CLOTHING"),
+    hashtags: jsonb("hashtags").$type<string[]>().notNull().default([]),
+    brandTagIds: jsonb("brandTagIds").$type<string[]>().notNull().default([]),
+    imageKeys: jsonb("imageKeys").$type<string[]>().notNull().default([]),
+    idempotencyKey: varchar("idempotencyKey", { length: 120 }),
     isPartner: boolean("isPartner").notNull().default(false),
     createdAt: timestamp("createdAt").defaultNow().notNull(),
     updatedAt: timestamp("updatedAt").defaultNow().notNull(),
   },
-  (table) => [index("style_posts_author_created_idx").on(table.authorId, table.createdAt)],
+  (table) => [
+    unique("style_posts_author_idempotency_unique").on(table.authorId, table.idempotencyKey),
+    index("style_posts_author_created_idx").on(table.authorId, table.createdAt),
+    index("style_posts_category_created_idx").on(table.category, table.createdAt),
+  ],
+);
+
+export const stylePostProducts = pgTable(
+  "stylePostProducts",
+  {
+    stylePostProductId: uuid("stylePostProductId").primaryKey().defaultRandom(),
+    stylePostId: uuid("stylePostId")
+      .notNull()
+      .references(() => stylePosts.stylePostId, { onDelete: "cascade" }),
+    productId: uuid("productId")
+      .notNull()
+      .references(() => products.productId),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+  },
+  (table) => [
+    unique("style_post_products_post_product_unique").on(table.stylePostId, table.productId),
+    index("style_post_products_post_idx").on(table.stylePostId, table.createdAt),
+  ],
+);
+
+export const stylePostLikes = pgTable(
+  "stylePostLikes",
+  {
+    stylePostLikeId: uuid("stylePostLikeId").primaryKey().defaultRandom(),
+    stylePostId: uuid("stylePostId")
+      .notNull()
+      .references(() => stylePosts.stylePostId, { onDelete: "cascade" }),
+    userId: uuid("userId")
+      .notNull()
+      .references(() => users.userId, { onDelete: "cascade" }),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+  },
+  (table) => [
+    unique("style_post_likes_post_user_unique").on(table.stylePostId, table.userId),
+    index("style_post_likes_post_created_idx").on(table.stylePostId, table.createdAt),
+    index("style_post_likes_user_created_idx").on(table.userId, table.createdAt),
+  ],
 );
 
 export const productSkus = pgTable(
@@ -414,3 +460,5 @@ export type Product = typeof products.$inferSelect;
 export type ProductSku = typeof productSkus.$inferSelect;
 export type Order = typeof orders.$inferSelect;
 export type StylePost = typeof stylePosts.$inferSelect;
+export type StylePostProduct = typeof stylePostProducts.$inferSelect;
+export type StylePostLike = typeof stylePostLikes.$inferSelect;

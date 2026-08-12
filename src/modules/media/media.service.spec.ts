@@ -31,4 +31,17 @@ describe("MediaService", () => {
 
     await expect(service.getProductImageUrl("private/product.jpg")).rejects.toThrow(MediaErrorMessage.InvalidKey);
   });
+
+  it("scopes style post image URLs and enforces the 10MB boundary", async () => {
+    const service = createService();
+
+    expect(service.getStylePostImageUrl("style-posts/user-1/look.webp")).toContain("style-posts/user-1/look.webp");
+    await expect(
+      service.createStylePostUpload("user-1", {
+        filename: "look.jpg",
+        contentType: "image/jpeg",
+        fileSize: 10 * 1024 * 1024 + 1,
+      }),
+    ).rejects.toThrow(MediaErrorMessage.FileTooLarge);
+  });
 });
