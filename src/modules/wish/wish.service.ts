@@ -14,21 +14,18 @@ export class WishService {
   ) {}
 
   list = async (userId: string) => {
-    const rows = await this.db
-      .select()
-      .from(wishes)
-      .innerJoin(products, eq(wishes.productId, products.productId))
-      .where(eq(wishes.userId, userId))
-      .orderBy(desc(wishes.createdAt));
+    const rows = await this.db.select().from(wishes).where(eq(wishes.userId, userId)).orderBy(desc(wishes.createdAt));
     const productById = new Map(
-      (await Promise.all(rows.map(({ products: product }) => this.catalogService.getProduct(product.productId)))).map(
-        (product) => [product.productId, product],
-      ),
+      (await this.catalogService.getProductsByIds(rows.map((wish) => wish.productId))).map((product) => [
+        product.productId,
+        product,
+      ]),
     );
-    return rows.map(({ wishes: wish }) => ({
-      ...wish,
-      product: productById.get(wish.productId)!,
-    }));
+    return rows.map((wish) => {
+      const product = productById.get(wish.productId);
+      if (!product) throw new CustomNotFoundException(WishErrorMessage.ProductNotFound);
+      return { ...wish, product };
+    });
   };
 
   add = async (userId: string, productId: string) => {

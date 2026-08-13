@@ -45,6 +45,17 @@ export class StylePostsResolver {
     return this.stylePostsService.get(stylePostId, optionalUserId(context));
   }
 
+  @Query(() => StylePostConnectionType)
+  @UseGuards(JwtAccessTokenGuard, RolesGuard)
+  @Roles(UserRole.User, UserRole.Partner)
+  likedStylePosts(
+    @Args("first", { type: () => Int, nullable: true }) first: number | undefined,
+    @Args("after", { type: () => String, nullable: true }) after: string | undefined,
+    @Context() context: { req?: { user?: { userId?: string; role?: string } } },
+  ) {
+    return this.stylePostsService.listLiked(currentUser(context).userId, after, first);
+  }
+
   @Mutation(() => StylePostType)
   @UseGuards(JwtAccessTokenGuard, RolesGuard)
   @Roles(UserRole.User, UserRole.Partner)

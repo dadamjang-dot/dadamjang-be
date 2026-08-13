@@ -199,6 +199,15 @@ export class CatalogService {
     return (await this.withSkus([product]))[0];
   };
 
+  getProductsByIds = async (productIds: string[]): Promise<ProductType[]> => {
+    if (!productIds.length) return [];
+    const rows = await this.db
+      .select()
+      .from(products)
+      .where(and(inArray(products.productId, productIds), eq(products.status, "PUBLISHED")));
+    return this.withSkus(rows);
+  };
+
   createDraft = async (partnerId: string, input: CreateProductDraftInput) => {
     if (input.skus.length === 0) throw new CustomBadRequestException("At least one SKU is required");
     if (input.skus.some((sku) => sku.price < 0 || sku.stock < 0))
@@ -264,23 +273,27 @@ export class CatalogService {
 
   private withSkus = async (productRows: (typeof products.$inferSelect)[]): Promise<ProductType[]> => {
     if (productRows.length === 0) return [];
-    const skus = await this.db
-      .select()
-      .from(productSkus)
-      .where(
-        and(
-          inArray(
-            productSkus.productId,
-            productRows.map((product) => product.productId),
-          ),
-          eq(productSkus.isActive, true),
-        ),
-      )
-      .orderBy(productSkus.createdAt);
+    const productIds = productRows.map((product) => product.productId);
+    const brandIds = productRows.flatMap((product) => (product.brandId ? [product.brandId] : []));
+    const [skus, brandRows] = await Promise.all([
+      this.db
+        .select()
+        .from(productSkus)
+        .where(and(inArray(productSkus.productId, productIds), eq(productSkus.isActive, true)))
+        .orderBy(productSkus.createdAt),
+      brandIds.length
+        ? this.db
+            .select({ brandId: brands.brandId, name: brands.name, slug: brands.slug })
+            .from(brands)
+            .where(inArray(brands.brandId, brandIds))
+        : Promise.resolve<{ brandId: string; name: string; slug: string }[]>([]),
+    ]);
     const skuMap = new Map<string, (typeof productSkus.$inferSelect)[]>();
     skus.forEach((sku) => skuMap.set(sku.productId, [...(skuMap.get(sku.productId) ?? []), sku]));
+    const brandById = new Map(brandRows.map((brand) => [brand.brandId, brand]));
     return productRows.map((product) => ({
       ...product,
+      brand: product.brandId ? (brandById.get(product.brandId) ?? null) : null,
       skus: skuMap.get(product.productId) ?? [],
     }));
   };

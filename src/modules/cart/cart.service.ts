@@ -2,7 +2,7 @@ import { Inject, Injectable } from "@nestjs/common";
 import { and, eq } from "drizzle-orm";
 import { CustomBadRequestException, CustomNotFoundException } from "src/common/errors/custom-exceptions";
 import { Database, DRIZZLE } from "src/modules/database/database.module";
-import { activityEvents, cartItems, carts, productSkus, products } from "src/modules/database/schema";
+import { activityEvents, brands, cartItems, carts, productSkus, products } from "src/modules/database/schema";
 import { CartErrorMessage, getInsufficientStockMessage } from "./cart.error";
 import { CartType, UpsertCartItemInput } from "./cart.types";
 
@@ -17,11 +17,16 @@ export class CartService {
       .from(cartItems)
       .innerJoin(productSkus, eq(cartItems.skuId, productSkus.skuId))
       .innerJoin(products, eq(productSkus.productId, products.productId))
+      .leftJoin(brands, eq(products.brandId, brands.brandId))
       .where(eq(cartItems.cartId, cart.cartId));
-    const items = rows.map(({ cartItems: item, productSkus: sku, products: product }) => ({
+    const items = rows.map(({ brands: brand, cartItems: item, productSkus: sku, products: product }) => ({
       ...item,
       sku,
-      product: { ...product, skus: [sku] },
+      product: {
+        ...product,
+        brand: brand ? { brandId: brand.brandId, name: brand.name, slug: brand.slug } : null,
+        skus: [sku],
+      },
     }));
     return {
       cartId: cart.cartId,

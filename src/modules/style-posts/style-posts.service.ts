@@ -45,6 +45,11 @@ type StylePostCursor = {
   stylePostId: string;
 };
 
+type LikedStylePostCursor = {
+  createdAt: string;
+  stylePostId: string;
+};
+
 type PurchasedStyleProductRow = {
   productId: string;
   title: string;
@@ -75,6 +80,16 @@ const isStylePostCursor = (value: unknown): value is StylePostCursor => {
   );
 };
 
+const isLikedStylePostCursor = (value: unknown): value is LikedStylePostCursor => {
+  if (!isRecord(value)) return false;
+  return (
+    typeof value.createdAt === "string" &&
+    !Number.isNaN(Date.parse(value.createdAt)) &&
+    typeof value.stylePostId === "string" &&
+    UUID_PATTERN.test(value.stylePostId)
+  );
+};
+
 const signCursor = (payload: string, secret: string) =>
   createHmac("sha256", secret).update(payload).digest("base64url");
 
@@ -92,6 +107,26 @@ const decodeCursor = (value: string, secret: string): StylePostCursor => {
     if (expected.length !== received.length || !timingSafeEqual(expected, received)) throw new Error("invalid");
     const cursor: unknown = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
     if (!isStylePostCursor(cursor)) throw new Error("invalid");
+    return cursor;
+  } catch {
+    throw new CustomBadRequestException(StylePostErrorMessage.InvalidCursor);
+  }
+};
+
+const encodeLikedStylePostCursor = (cursor: LikedStylePostCursor, secret: string) => {
+  const payload = Buffer.from(JSON.stringify(cursor)).toString("base64url");
+  return `${payload}.${signCursor(payload, secret)}`;
+};
+
+const decodeLikedStylePostCursor = (value: string, secret: string): LikedStylePostCursor => {
+  try {
+    const [payload, signature, ...rest] = value.split(".");
+    if (!payload || !signature || rest.length) throw new Error("invalid");
+    const expected = Buffer.from(signCursor(payload, secret), "base64url");
+    const received = Buffer.from(signature, "base64url");
+    if (expected.length !== received.length || !timingSafeEqual(expected, received)) throw new Error("invalid");
+    const cursor: unknown = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+    if (!isLikedStylePostCursor(cursor)) throw new Error("invalid");
     return cursor;
   } catch {
     throw new CustomBadRequestException(StylePostErrorMessage.InvalidCursor);
@@ -219,12 +254,14 @@ export class StylePostsService {
     if (cursor && (cursor.category !== category || cursor.sort !== sort))
       throw new CustomBadRequestException(StylePostErrorMessage.InvalidCursor);
     const snapshotAt = cursor ? new Date(cursor.snapshotAt) : new Date();
+    const stylePostSnapshotAt = sql.param(snapshotAt, stylePosts.createdAt);
+    const likeSnapshotAt = sql.param(snapshotAt, stylePostLikes.createdAt);
     const likeCount = sql<number>`(
       select count(*)::int
       from ${stylePostLikes}
       where ${stylePostLikes.stylePostId} = ${STYLE_POST_ID_REFERENCE}
-        and ${stylePostLikes.createdAt} <= ${snapshotAt}
-        and (${stylePostLikes.deletedAt} is null or ${stylePostLikes.deletedAt} > ${snapshotAt})
+        and ${stylePostLikes.createdAt} <= ${likeSnapshotAt}
+        and (${stylePostLikes.deletedAt} is null or ${stylePostLikes.deletedAt} > ${likeSnapshotAt})
     )`;
     const createdAtEpoch = sql<number>`extract(epoch from ${stylePosts.createdAt})::double precision`;
     const sortValue =
@@ -234,7 +271,7 @@ export class StylePostsService {
           ? sql<number>`${createdAtEpoch} * 1000`
           : sql<number>`round((ln(${likeCount} + 1) + ${createdAtEpoch} / 259200) * 1000000000)::bigint`;
     const categoryCondition = category ? eq(stylePosts.category, category) : undefined;
-    const snapshotCondition = sql`${stylePosts.createdAt} <= ${snapshotAt}`;
+    const snapshotCondition = sql`${stylePosts.createdAt} <= ${stylePostSnapshotAt}`;
     let cursorRow: { stylePostId: string; createdAt: Date } | undefined;
     if (cursor) {
       [cursorRow] = await this.db
@@ -245,17 +282,23 @@ export class StylePostsService {
       if (!cursorRow || cursorRow.createdAt.toISOString() !== cursor.createdAt)
         throw new CustomBadRequestException(StylePostErrorMessage.InvalidCursor);
     }
-    const sameCreatedAt = cursorRow ? sql`${stylePosts.createdAt} = ${cursorRow.createdAt}` : undefined;
+    const cursorCreatedAt = cursorRow?.createdAt;
+    const sameCreatedAt = cursorCreatedAt
+      ? sql`${stylePosts.createdAt} = ${sql.param(cursorCreatedAt, stylePosts.createdAt)}`
+      : undefined;
     const cursorCondition =
-      cursor && cursorRow
+      cursor && cursorCreatedAt
         ? sort === StylePostSort.LATEST
           ? or(
-              sql`${stylePosts.createdAt} < ${cursorRow.createdAt}`,
+              sql`${stylePosts.createdAt} < ${sql.param(cursorCreatedAt, stylePosts.createdAt)}`,
               and(sameCreatedAt, sql`${stylePosts.stylePostId} < ${cursor.stylePostId}`),
             )
           : or(
               sql`${sortValue} < ${cursor.sortValue}`,
-              and(sql`${sortValue} = ${cursor.sortValue}`, sql`${stylePosts.createdAt} < ${cursorRow.createdAt}`),
+              and(
+                sql`${sortValue} = ${cursor.sortValue}`,
+                sql`${stylePosts.createdAt} < ${sql.param(cursorCreatedAt, stylePosts.createdAt)}`,
+              ),
               and(
                 sql`${sortValue} = ${cursor.sortValue}`,
                 sameCreatedAt,
@@ -296,6 +339,74 @@ export class StylePostsService {
                 snapshotAt: snapshotAt.toISOString(),
                 stylePostId: tail.stylePostId,
               },
+              this.cursorSecret,
+            )
+          : null,
+    };
+  };
+
+  listLiked = async (userId: string, after?: string, first?: number): Promise<StylePostConnectionType> => {
+    const pageSize = Math.min(Math.max(first ?? 20, 1), MAX_PAGE_SIZE);
+    const cursor = after ? decodeLikedStylePostCursor(after, this.cursorSecret) : undefined;
+    let cursorRow: { stylePostId: string; createdAt: Date } | undefined;
+    if (cursor) {
+      [cursorRow] = await this.db
+        .select({ stylePostId: stylePostLikes.stylePostId, createdAt: stylePostLikes.createdAt })
+        .from(stylePostLikes)
+        .where(
+          and(
+            eq(stylePostLikes.userId, userId),
+            eq(stylePostLikes.stylePostId, cursor.stylePostId),
+            eq(stylePostLikes.createdAt, new Date(cursor.createdAt)),
+            isNull(stylePostLikes.deletedAt),
+          ),
+        )
+        .limit(1);
+      if (!cursorRow) throw new CustomBadRequestException(StylePostErrorMessage.InvalidCursor);
+    }
+    const cursorCreatedAt = cursorRow?.createdAt;
+    const cursorCondition =
+      cursor && cursorCreatedAt
+        ? or(
+            sql`${stylePostLikes.createdAt} < ${sql.param(cursorCreatedAt, stylePostLikes.createdAt)}`,
+            and(
+              eq(stylePostLikes.createdAt, cursorCreatedAt),
+              sql`${stylePostLikes.stylePostId} < ${cursor.stylePostId}`,
+            ),
+          )
+        : undefined;
+    const pageKeys = await this.db
+      .select({ stylePostId: stylePostLikes.stylePostId, createdAt: stylePostLikes.createdAt })
+      .from(stylePostLikes)
+      .where(and(eq(stylePostLikes.userId, userId), isNull(stylePostLikes.deletedAt), cursorCondition))
+      .orderBy(desc(stylePostLikes.createdAt), desc(stylePostLikes.stylePostId))
+      .limit(pageSize + 1);
+    const visibleKeys = pageKeys.slice(0, pageSize);
+    const rows = visibleKeys.length
+      ? await this.db
+          .select()
+          .from(stylePosts)
+          .where(
+            inArray(
+              stylePosts.stylePostId,
+              visibleKeys.map((row) => row.stylePostId),
+            ),
+          )
+      : [];
+    const rowsById = new Map(rows.map((row) => [row.stylePostId, row]));
+    const pageRows = visibleKeys.flatMap((key) => {
+      const row = rowsById.get(key.stylePostId);
+      return row ? [row] : [];
+    });
+    const tail = visibleKeys[visibleKeys.length - 1];
+    const hasNextPage = pageKeys.length > pageSize;
+    return {
+      nodes: await this.hydrate(pageRows, userId),
+      hasNextPage,
+      nextCursor:
+        hasNextPage && tail
+          ? encodeLikedStylePostCursor(
+              { createdAt: tail.createdAt.toISOString(), stylePostId: tail.stylePostId },
               this.cursorSecret,
             )
           : null,
