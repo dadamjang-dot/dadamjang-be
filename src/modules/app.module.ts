@@ -1,4 +1,4 @@
-import { HttpException, Module } from "@nestjs/common";
+import { HttpException, HttpStatus, Module } from "@nestjs/common";
 import { ConfigModule } from "@nestjs/config";
 import { GraphQLModule } from "@nestjs/graphql";
 import { ApolloDriver, ApolloDriverConfig } from "@nestjs/apollo";
@@ -22,6 +22,17 @@ import { IdentityVerificationModule } from "./identity-verification/identity-ver
 import { FoAuthModule } from "./fo-auth/fo-auth.module";
 import { KakaoFlowModule } from "./fo-auth/kakao-flow.module";
 
+const graphQlErrorCode = (status: number) => {
+  if (status === HttpStatus.BAD_REQUEST) return "BAD_USER_INPUT";
+  if (status === HttpStatus.UNAUTHORIZED) return "UNAUTHENTICATED";
+  if (status === HttpStatus.FORBIDDEN) return "FORBIDDEN";
+  if (status === HttpStatus.NOT_FOUND) return "NOT_FOUND";
+  if (status === HttpStatus.CONFLICT) return "CONFLICT";
+  if (status === HttpStatus.TOO_MANY_REQUESTS) return "TOO_MANY_REQUESTS";
+  if (status === HttpStatus.SERVICE_UNAVAILABLE) return "SERVICE_UNAVAILABLE";
+  return "INTERNAL_SERVER_ERROR";
+};
+
 @Module({
   imports: [
     ConfigModule.forRoot({
@@ -37,7 +48,11 @@ import { KakaoFlowModule } from "./fo-auth/kakao-flow.module";
         const extensions = Object.fromEntries(
           Object.entries(formattedError.extensions ?? {}).filter(([key]) => key !== "stacktrace"),
         );
-        if (originalError instanceof HttpException) return { ...formattedError, extensions };
+        if (originalError instanceof HttpException)
+          return {
+            ...formattedError,
+            extensions: { ...extensions, code: graphQlErrorCode(originalError.getStatus()) },
+          };
         return { message: "Internal server error", extensions: { code: "INTERNAL_SERVER_ERROR" } };
       },
     }),

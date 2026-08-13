@@ -1,14 +1,8 @@
-import { Args, Mutation, Query, Resolver } from "@nestjs/graphql";
-import { UseGuards } from "@nestjs/common";
-import { UserRole } from "src/auth/role";
-import { Roles } from "src/auth/roles.decorator";
-import { JwtAccessTokenGuard } from "src/guards/accessToken.guard";
-import { RolesGuard } from "src/guards/roles.guard";
+import { Args, Query, Resolver } from "@nestjs/graphql";
 import { CatalogService } from "./catalog.service";
 import {
   CategoryType,
   CatalogFilterOptionsType,
-  CreateCategoryInput,
   ProductConnectionType,
   ProductFilterInput,
   ProductPriceEvidenceType,
@@ -54,12 +48,5 @@ export class CatalogResolver {
     @Args("priceRevision", { nullable: true }) priceRevision?: string,
   ) {
     return this.catalogService.getProductPriceEvidence(productId, priceRevision);
-  }
-
-  @Mutation(() => CategoryType)
-  @UseGuards(JwtAccessTokenGuard, RolesGuard)
-  @Roles(UserRole.Admin)
-  createCategory(@Args("input") input: CreateCategoryInput) {
-    return this.catalogService.createCategory(input);
   }
 }

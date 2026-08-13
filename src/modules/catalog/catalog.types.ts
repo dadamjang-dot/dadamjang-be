@@ -252,6 +252,8 @@ export class CreateCategoryInput {
   parentId?: string;
   @Field(() => Int, { nullable: true })
   sortOrder?: number;
+  @Field(() => Boolean, { nullable: true })
+  isActive?: boolean;
 }
 
 @InputType()

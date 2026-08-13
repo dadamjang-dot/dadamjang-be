@@ -136,6 +136,10 @@ export class EmailService {
     if (password.length < 8 || Buffer.byteLength(password, "utf8") > 72)
       throw new CustomBadRequestException(EmailErrorMessage.InvalidPassword);
   };
+  sendAdminInvite = (email: string, token: string) => {
+    const boUrl = this.configService.getOrThrow<string>("DADAMJANG_BO_URL").replace(/\/$/, "");
+    return this.sender.sendLink(email, "다담장 관리자 초대", `${boUrl}/invite/accept#token=${token}`);
+  };
   private requestPasswordResetForUser = async (user: { userId: string; email: string }, ip?: string) => {
     const token = this.createOpaqueToken();
     await this.repository.createPasswordResetToken(
@@ -144,7 +148,8 @@ export class EmailService {
       new Date(Date.now() + 15 * 60 * 1000),
       this.sha256(ip ?? "unknown"),
     );
-    await this.sender.sendLink(user.email, "비밀번호 재설정", `/account-recovery/password#token=${token}`);
+    const clientUrl = this.configService.getOrThrow<string>("CLIENT_URL").replace(/\/$/, "");
+    await this.sender.sendLink(user.email, "비밀번호 재설정", `${clientUrl}/account-recovery/password#token=${token}`);
   };
   private pepperedCode = (email: string, code: string, purpose: EmailVerificationPurposeValue) =>
     `${email}:${code}:${purpose}:${this.configService.getOrThrow<string>("EMAIL_CODE_PEPPER")}`;

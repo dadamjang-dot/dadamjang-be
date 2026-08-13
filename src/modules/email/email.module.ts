@@ -14,7 +14,7 @@ import { EmailService } from "./email.service";
       provide: "EmailSender",
       inject: [ConfigService],
       useFactory: (config: ConfigService) =>
-        config.get<string>("RESEND_API_KEY") ? new ResendEmailSender(config) : new DevEmailSender(),
+        config.get<string>("RESEND_API_KEY") ? new ResendEmailSender(config) : new DevEmailSender(config),
     },
   ],
   exports: [EmailService],

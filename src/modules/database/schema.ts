@@ -284,7 +284,10 @@ export const partners = pgTable(
     createdAt: timestamp("createdAt").defaultNow().notNull(),
     updatedAt: timestamp("updatedAt").defaultNow().notNull(),
   },
-  (table) => [index("partners_status_idx").on(table.status)],
+  (table) => [
+    index("partners_status_idx").on(table.status),
+    index("partners_status_created_idx").on(table.status, table.createdAt),
+  ],
 );
 
 export const products = pgTable(
@@ -315,6 +318,7 @@ export const products = pgTable(
     index("products_brand_idx").on(table.brandId, table.status),
     index("products_catalog_flags_idx").on(table.status, table.isOnSale, table.isExpressDelivery),
     index("products_partner_idx").on(table.partnerId, table.status),
+    index("products_approval_created_idx").on(table.approvalStatus, table.createdAt),
   ],
 );
 
@@ -505,7 +509,10 @@ export const orders = pgTable(
     createdAt: timestamp("createdAt").defaultNow().notNull(),
     updatedAt: timestamp("updatedAt").defaultNow().notNull(),
   },
-  (table) => [index("orders_user_created_idx").on(table.userId, table.createdAt)],
+  (table) => [
+    index("orders_user_created_idx").on(table.userId, table.createdAt),
+    index("orders_status_created_idx").on(table.status, table.createdAt),
+  ],
 );
 
 export const orderItems = pgTable("orderItems", {
@@ -557,9 +564,13 @@ export const adminInvites = pgTable(
     expiresAt: timestamp("expiresAt").notNull(),
     acceptedByUserId: uuid("acceptedByUserId").references(() => users.userId),
     acceptedAt: timestamp("acceptedAt"),
+    revokedAt: timestamp("revokedAt"),
     createdAt: timestamp("createdAt").defaultNow().notNull(),
   },
-  (table) => [index("admin_invites_expiry_idx").on(table.expiresAt)],
+  (table) => [
+    index("admin_invites_expiry_idx").on(table.expiresAt),
+    index("admin_invites_status_idx").on(table.acceptedAt, table.revokedAt, table.expiresAt),
+  ],
 );
 
 export const activityEvents = pgTable(
@@ -593,6 +604,7 @@ export const auditLogs = pgTable(
   (table) => [
     index("audit_logs_entity_idx").on(table.entityType, table.entityId),
     index("audit_logs_actor_created_idx").on(table.actorUserId, table.createdAt),
+    index("audit_logs_created_idx").on(table.createdAt),
   ],
 );
 
