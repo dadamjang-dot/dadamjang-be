@@ -28,9 +28,11 @@ export class KakaoStrategy extends PassportStrategy(Strategy, "kakao") {
    * @returns 내부 카카오 프로필
    */
   validate(_accessToken: string, _refreshToken: string, profile: KakaoRawProfile): KakaoProfile {
+    const account = profile._json?.kakao_account;
     return {
       providerUserId: String(profile.id),
-      email: profile._json?.kakao_account?.email,
+      email: account?.email,
+      emailVerified: account?.is_email_valid === true && account.is_email_verified === true,
     };
   }
 }

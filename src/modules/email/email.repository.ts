@@ -10,18 +10,27 @@ import {
   users,
   type EmailVerification,
 } from "src/modules/database/schema";
+import type { EmailVerificationPurposeValue } from "./email.types";
 
 @Injectable()
 export class EmailRepository {
   constructor(@Inject(DRIZZLE) private readonly db: Database) {}
-  createVerification = async (input: { email: string; codeHash: string; expiresAt: Date; requestIpHash: string }) =>
-    (await this.db.insert(emailVerifications).values(input).returning())[0];
+  createVerification = async (input: {
+    email: string;
+    purpose: EmailVerificationPurposeValue;
+    codeHash: string;
+    expiresAt: Date;
+    requestIpHash: string;
+  }) => (await this.db.insert(emailVerifications).values(input).returning())[0];
   deleteVerification = async (id: string) => {
     await this.db.delete(emailVerifications).where(eq(emailVerifications.id, id));
   };
-  latestVerification = (email: string): Promise<EmailVerification | undefined> =>
+  latestVerification = (
+    email: string,
+    purpose: EmailVerificationPurposeValue,
+  ): Promise<EmailVerification | undefined> =>
     this.db.query.emailVerifications.findFirst({
-      where: eq(emailVerifications.email, email),
+      where: and(eq(emailVerifications.email, email), eq(emailVerifications.purpose, purpose)),
       orderBy: desc(emailVerifications.createdAt),
     });
   verificationsSince = (email: string, since: Date) =>
@@ -50,10 +59,16 @@ export class EmailRepository {
         .where(and(eq(emailVerifications.id, id), isNull(emailVerifications.verifiedAt)))
         .returning()
     )[0];
-  createSignupToken = async (token: string, email: string, verificationId: string, expiresAt: Date) => {
+  createVerificationToken = async (
+    token: string,
+    email: string,
+    purpose: EmailVerificationPurposeValue,
+    verificationId: string,
+    expiresAt: Date,
+  ) => {
     await this.db
       .insert(emailVerificationTokens)
-      .values({ tokenHash: hashToken(token), email, verificationId, expiresAt });
+      .values({ tokenHash: hashToken(token), email, purpose, verificationId, expiresAt });
   };
   consumeSignupTokenAndCreateUser = async (
     token: string,
@@ -67,6 +82,7 @@ export class EmailRepository {
           and(
             eq(emailVerificationTokens.tokenHash, hashToken(token)),
             eq(emailVerificationTokens.email, input.email),
+            eq(emailVerificationTokens.purpose, "SIGNUP"),
             isNull(emailVerificationTokens.usedAt),
             gt(emailVerificationTokens.expiresAt, new Date()),
           ),
@@ -84,6 +100,22 @@ export class EmailRepository {
           and(
             eq(emailVerificationTokens.tokenHash, hashToken(token)),
             eq(emailVerificationTokens.email, email),
+            eq(emailVerificationTokens.purpose, "SIGNUP"),
+            isNull(emailVerificationTokens.usedAt),
+            gt(emailVerificationTokens.expiresAt, new Date()),
+          ),
+        )
+        .returning()
+    )[0];
+  consumePasswordResetEmailToken = async (token: string) =>
+    (
+      await this.db
+        .update(emailVerificationTokens)
+        .set({ usedAt: new Date() })
+        .where(
+          and(
+            eq(emailVerificationTokens.tokenHash, hashToken(token)),
+            eq(emailVerificationTokens.purpose, "PASSWORD_RESET"),
             isNull(emailVerificationTokens.usedAt),
             gt(emailVerificationTokens.expiresAt, new Date()),
           ),

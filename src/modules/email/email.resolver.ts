@@ -22,6 +22,15 @@ export class EmailResolver {
   @Mutation(() => EmailVerificationPayload) verifySignupEmailCode(@Args("input") input: VerifyEmailCodeInput) {
     return this.emailService.verifySignupCode(input.email, input.code);
   }
+  @Mutation(() => OkPayload) requestPasswordResetCode(
+    @Args("input") input: RequestEmailCodeInput,
+    @Context("req") req: Request,
+  ) {
+    return this.emailService.requestPasswordResetCode(input.email, req.ip);
+  }
+  @Mutation(() => EmailVerificationPayload) verifyPasswordResetCode(@Args("input") input: VerifyEmailCodeInput) {
+    return this.emailService.verifyPasswordResetCode(input.email, input.code);
+  }
   @Mutation(() => OkPayload) requestPasswordReset(
     @Args("input") input: RequestPasswordResetInput,
     @Context("req") req: Request,

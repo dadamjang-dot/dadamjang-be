@@ -39,7 +39,7 @@ export const createApp = async () => {
   app.enableCors({
     origin: process.env.CLIENT_URL,
     methods: "GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS",
-    allowedHeaders: "Content-Type, Authorization, sentry-trace, baggage",
+    allowedHeaders: "Content-Type, Authorization, x-device-id, sentry-trace, baggage",
     credentials: true,
   });
   return app;

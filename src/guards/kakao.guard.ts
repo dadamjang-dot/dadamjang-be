@@ -30,7 +30,11 @@ export class KakaoGuard extends AuthGuard("kakao") {
     }
 
     const state = randomBytes(32).toString("hex");
+    const flowId = request.query.flowId;
+    if (typeof flowId !== "string" || !/^[0-9a-f-]{36}$/iu.test(flowId))
+      throw new CustomUnauthorizedException(AuthErrorMessage.InvalidOauthState);
     response.cookie("kakao_oauth_state", state, { ...authCookieOptions, maxAge: 5 * 60 * 1000 });
+    response.cookie("kakao_oauth_flow", flowId, { ...authCookieOptions, maxAge: 5 * 60 * 1000 });
     return { state };
   }
 }

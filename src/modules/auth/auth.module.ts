@@ -6,14 +6,12 @@ import { KakaoStrategy } from "src/strategys/kakao.strategy";
 import { JwtRefreshTokenStrategy } from "src/strategys/refreshToken.strategy";
 import { JwtAccessTokenStrategy } from "src/strategys/accessToken.strategy";
 import { EmailModule } from "src/modules/email/email.module";
-import { AuthController } from "./auth.controller";
 import { AuthRepository } from "./auth.repository";
 import { AuthResolver } from "./auth.resolver";
 import { AuthService } from "./auth.service";
 
 @Module({
   imports: [JwtModule.register({ global: true }), EmailModule],
-  controllers: [AuthController],
   providers: [
     AuthResolver,
     AuthService,
@@ -24,6 +22,6 @@ import { AuthService } from "./auth.service";
     KakaoGuard,
     KakaoStrategy,
   ],
-  exports: [AuthService],
+  exports: [AuthService, KakaoGuard],
 })
 export class AuthModule {}

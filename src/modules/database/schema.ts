@@ -56,6 +56,7 @@ export const authIdentities = pgTable(
 export const emailVerifications = pgTable("emailVerification", {
   id: uuid("id").primaryKey().defaultRandom(),
   email: varchar("email", { length: 255 }).notNull(),
+  purpose: varchar("purpose", { length: 30 }).notNull().default("SIGNUP"),
   codeHash: text("codeHash").notNull(),
   expiresAt: timestamp("expiresAt").notNull(),
   verifiedAt: timestamp("verifiedAt"),
@@ -67,6 +68,7 @@ export const emailVerifications = pgTable("emailVerification", {
 export const emailVerificationTokens = pgTable("emailVerificationToken", {
   tokenHash: text("tokenHash").primaryKey(),
   email: varchar("email", { length: 255 }).notNull(),
+  purpose: varchar("purpose", { length: 30 }).notNull().default("SIGNUP"),
   verificationId: uuid("verificationId")
     .notNull()
     .references(() => emailVerifications.id),
@@ -90,10 +92,106 @@ export const kakaoSignupTokens = pgTable("kakaoSignupToken", {
   tokenHash: text("tokenHash").primaryKey(),
   providerUserId: varchar("providerUserId", { length: 255 }).notNull(),
   email: varchar("email", { length: 255 }),
+  deviceIdHash: text("deviceIdHash"),
+  emailVerified: boolean("emailVerified").notNull().default(false),
   expiresAt: timestamp("expiresAt").notNull(),
   usedAt: timestamp("usedAt"),
   createdAt: timestamp("createdAt").defaultNow().notNull(),
 });
+
+export const consentDocuments = pgTable(
+  "consentDocuments",
+  {
+    documentId: uuid("documentId").primaryKey().defaultRandom(),
+    type: varchar("type", { length: 40 }).notNull(),
+    title: varchar("title", { length: 160 }).notNull(),
+    body: text("body").notNull(),
+    version: varchar("version", { length: 40 }).notNull(),
+    required: boolean("required").notNull(),
+    activeFrom: timestamp("activeFrom").notNull(),
+    activeUntil: timestamp("activeUntil"),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+  },
+  (table) => [
+    unique("consent_documents_type_version_unique").on(table.type, table.version),
+    index("consent_documents_active_idx").on(table.activeFrom, table.activeUntil, table.type),
+  ],
+);
+
+export const userConsentAcceptances = pgTable(
+  "userConsentAcceptances",
+  {
+    acceptanceId: uuid("acceptanceId").primaryKey().defaultRandom(),
+    userId: uuid("userId")
+      .notNull()
+      .references(() => users.userId, { onDelete: "cascade" }),
+    documentId: uuid("documentId")
+      .notNull()
+      .references(() => consentDocuments.documentId),
+    agreed: boolean("agreed").notNull(),
+    agreedAt: timestamp("agreedAt"),
+    recordedAt: timestamp("recordedAt").defaultNow().notNull(),
+  },
+  (table) => [
+    unique("user_consent_acceptances_user_document_unique").on(table.userId, table.documentId),
+    index("user_consent_acceptances_user_recorded_idx").on(table.userId, table.recordedAt),
+  ],
+);
+
+export const identityVerificationSessions = pgTable(
+  "identityVerificationSessions",
+  {
+    sessionId: uuid("sessionId").primaryKey().defaultRandom(),
+    purpose: varchar("purpose", { length: 30 }).notNull(),
+    provider: varchar("provider", { length: 20 }).notNull(),
+    deviceIdHash: text("deviceIdHash").notNull(),
+    merchantTransactionId: varchar("merchantTransactionId", { length: 20 }).notNull().unique(),
+    providerTransactionId: varchar("providerTransactionId", { length: 40 }),
+    status: varchar("status", { length: 20 }).notNull().default("PENDING"),
+    failureCode: varchar("failureCode", { length: 80 }),
+    ciHash: text("ciHash"),
+    certificateProvider: varchar("certificateProvider", { length: 20 }),
+    isFourteenOrOlder: boolean("isFourteenOrOlder"),
+    proofTokenHash: text("proofTokenHash").unique(),
+    expiresAt: timestamp("expiresAt").notNull(),
+    verifiedAt: timestamp("verifiedAt"),
+    completedAt: timestamp("completedAt"),
+    consumedAt: timestamp("consumedAt"),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().notNull(),
+  },
+  (table) => [index("identity_verification_device_status_idx").on(table.deviceIdHash, table.status, table.expiresAt)],
+);
+
+export const verifiedIdentities = pgTable("verifiedIdentities", {
+  verifiedIdentityId: uuid("verifiedIdentityId").primaryKey().defaultRandom(),
+  userId: uuid("userId")
+    .notNull()
+    .unique()
+    .references(() => users.userId, { onDelete: "cascade" }),
+  ciHash: text("ciHash").notNull().unique(),
+  certificateProvider: varchar("certificateProvider", { length: 20 }).notNull(),
+  verifiedAt: timestamp("verifiedAt").notNull(),
+});
+
+export const kakaoLoginFlows = pgTable(
+  "kakaoLoginFlows",
+  {
+    flowId: uuid("flowId").primaryKey().defaultRandom(),
+    deviceIdHash: text("deviceIdHash").notNull(),
+    providerUserId: varchar("providerUserId", { length: 255 }),
+    email: varchar("email", { length: 255 }),
+    emailVerified: boolean("emailVerified").notNull().default(false),
+    userId: uuid("userId").references(() => users.userId, { onDelete: "cascade" }),
+    status: varchar("status", { length: 30 }).notNull().default("PENDING"),
+    expiresAt: timestamp("expiresAt").notNull(),
+    callbackAt: timestamp("callbackAt"),
+    consumedAt: timestamp("consumedAt"),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().notNull(),
+  },
+  (table) => [index("kakao_login_flows_device_status_idx").on(table.deviceIdHash, table.status, table.expiresAt)],
+);
 
 export const categories = pgTable(
   "categories",
