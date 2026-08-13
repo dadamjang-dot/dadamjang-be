@@ -1,11 +1,10 @@
 import { Module } from "@nestjs/common";
-import { CatalogModule } from "src/modules/catalog/catalog.module";
-import { OrderModule } from "src/modules/order/order.module";
+import { EmailModule } from "src/modules/email/email.module";
 import { AdminResolver } from "./admin.resolver";
 import { AdminService } from "./admin.service";
 
 @Module({
-  imports: [CatalogModule, OrderModule],
+  imports: [EmailModule],
   providers: [AdminService, AdminResolver],
   exports: [AdminService],
 })

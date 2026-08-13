@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ForbiddenException,
   HttpException,
   HttpStatus,
   NotFoundException,
@@ -39,6 +40,12 @@ export class CustomNotFoundException extends NotFoundException {
   }
 }
 
+export class CustomForbiddenException extends ForbiddenException {
+  constructor(message: string) {
+    super(message);
+  }
+}
+
 export class CustomTooManyRequestsException extends HttpException {
   /**
    * 요청 제한 초과 응답을 생성한다.
@@ -53,5 +60,11 @@ export class CustomTooManyRequestsException extends HttpException {
 export class CustomServiceUnavailableException extends HttpException {
   constructor(message: string) {
     super(message, HttpStatus.SERVICE_UNAVAILABLE);
+  }
+}
+
+export class CustomConflictException extends HttpException {
+  constructor(message: string) {
+    super(message, HttpStatus.CONFLICT);
   }
 }

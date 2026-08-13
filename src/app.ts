@@ -37,7 +37,7 @@ export const createApp = async () => {
     next();
   });
   app.enableCors({
-    origin: process.env.CLIENT_URL,
+    origin: [process.env.CLIENT_URL, process.env.DADAMJANG_BO_URL].filter((origin): origin is string => !!origin),
     methods: "GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS",
     allowedHeaders: "Content-Type, Authorization, x-device-id, sentry-trace, baggage",
     credentials: true,
