@@ -17,6 +17,7 @@ import { OrderModule } from "./order/order.module";
 import { PartnerModule } from "./partner/partner.module";
 import { WishModule } from "./wish/wish.module";
 import { StylePostsModule } from "./style-posts/style-posts.module";
+import { WishLibraryModule } from "./wish-library/wish-library.module";
 
 @Module({
   imports: [
@@ -50,6 +51,7 @@ import { StylePostsModule } from "./style-posts/style-posts.module";
     OrderModule,
     PartnerModule,
     WishModule,
+    WishLibraryModule,
     StylePostsModule,
   ],
 })

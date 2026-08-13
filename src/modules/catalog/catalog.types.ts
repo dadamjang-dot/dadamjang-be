@@ -96,6 +96,8 @@ export class ProductType {
   partnerId!: string;
   @Field(() => String, { nullable: true })
   brandId!: string | null;
+  @Field(() => BrandType, { nullable: true })
+  brand!: BrandType | null;
   @Field()
   categoryId!: string;
   @Field()

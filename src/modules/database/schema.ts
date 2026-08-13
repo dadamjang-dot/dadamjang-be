@@ -123,6 +123,24 @@ export const brands = pgTable(
   (table) => [index("brands_active_name_idx").on(table.isActive, table.name)],
 );
 
+export const brandFollows = pgTable(
+  "brandFollows",
+  {
+    brandFollowId: uuid("brandFollowId").primaryKey().defaultRandom(),
+    userId: uuid("userId")
+      .notNull()
+      .references(() => users.userId, { onDelete: "cascade" }),
+    brandId: uuid("brandId")
+      .notNull()
+      .references(() => brands.brandId, { onDelete: "cascade" }),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+  },
+  (table) => [
+    unique("brand_follows_user_brand_unique").on(table.userId, table.brandId),
+    index("brand_follows_user_created_idx").on(table.userId, table.createdAt),
+  ],
+);
+
 export const colors = pgTable(
   "colors",
   {
@@ -311,6 +329,24 @@ export const wishes = pgTable(
   ],
 );
 
+export const recentProductViews = pgTable(
+  "recentProductViews",
+  {
+    recentProductViewId: uuid("recentProductViewId").primaryKey().defaultRandom(),
+    userId: uuid("userId")
+      .notNull()
+      .references(() => users.userId, { onDelete: "cascade" }),
+    productId: uuid("productId")
+      .notNull()
+      .references(() => products.productId, { onDelete: "cascade" }),
+    viewedAt: timestamp("viewedAt").defaultNow().notNull(),
+  },
+  (table) => [
+    unique("recent_product_views_user_product_unique").on(table.userId, table.productId),
+    index("recent_product_views_user_viewed_idx").on(table.userId, table.viewedAt),
+  ],
+);
+
 export const comparisonItems = pgTable(
   "comparisonItems",
   {
@@ -470,11 +506,13 @@ export type PasswordResetToken = typeof passwordResetTokens.$inferSelect;
 export type KakaoSignupToken = typeof kakaoSignupTokens.$inferSelect;
 export type Category = typeof categories.$inferSelect;
 export type Brand = typeof brands.$inferSelect;
+export type BrandFollow = typeof brandFollows.$inferSelect;
 export type Color = typeof colors.$inferSelect;
 export type Size = typeof sizes.$inferSelect;
 export type Partner = typeof partners.$inferSelect;
 export type Product = typeof products.$inferSelect;
 export type ProductSku = typeof productSkus.$inferSelect;
+export type RecentProductView = typeof recentProductViews.$inferSelect;
 export type Order = typeof orders.$inferSelect;
 export type StylePost = typeof stylePosts.$inferSelect;
 export type StylePostProduct = typeof stylePostProducts.$inferSelect;
