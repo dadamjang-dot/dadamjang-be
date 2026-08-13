@@ -17,11 +17,6 @@ export const FIXTURE = {
   secondSkuId: "80000000-0000-4000-8000-000000000002",
 } as const;
 
-type FixtureOptions = {
-  password?: string;
-  userid?: string;
-};
-
 export const seedMigrationPrerequisite = async (pool: Pool) => {
   const password = await bcrypt.hash(FIXTURE.password, 4);
   await pool.query(`INSERT INTO "users" ("userId", "userid", "email", "password") VALUES ($1, $2, $3, $4)`, [
@@ -45,10 +40,7 @@ export const seedMigrationPrerequisite = async (pool: Pool) => {
   );
 };
 
-export const resetFixtures = async (
-  pool: Pool,
-  { password = FIXTURE.password, userid = FIXTURE.userid }: FixtureOptions = {},
-) => {
+export const resetFixtures = async (pool: Pool) => {
   const tables = await pool.query<{ tablename: string }>(
     `SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tablename <> '_migrations'`,
   );
@@ -56,10 +48,10 @@ export const resetFixtures = async (
     const names = tables.rows.map(({ tablename }) => `"${tablename.replaceAll('"', '""')}"`).join(", ");
     await pool.query(`TRUNCATE ${names} RESTART IDENTITY CASCADE`);
   }
-  const passwordHash = await bcrypt.hash(password, 4);
+  const password = await bcrypt.hash(FIXTURE.password, 4);
   await pool.query(
     `INSERT INTO "users" ("userId", "userid", "email", "password", "role") VALUES ($1, $2, $3, $4, 'USER')`,
-    [FIXTURE.userId, userid, "integration@example.test", passwordHash],
+    [FIXTURE.userId, FIXTURE.userid, "integration@example.test", password],
   );
   await pool.query(
     `INSERT INTO "categories" ("categoryId", "name", "slug", "sortOrder") VALUES ($1, 'Tops', 'integration-tops', 1), ($2, 'Shoes', 'integration-shoes', 2)`,

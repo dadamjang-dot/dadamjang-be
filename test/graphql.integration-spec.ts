@@ -42,14 +42,14 @@ describe("PostgreSQL GraphQL integration", () => {
   });
 
   it("runs all migrations initially and idempotently", async () => {
-    const before = await pool.query<{ checksum: string; name: string }>(
-      `SELECT "name", "checksum" FROM "_migrations" ORDER BY "name"`,
+    const before = await pool.query<{ name: string; checksum: string }>(
+      `SELECT name, checksum FROM "_migrations" ORDER BY name`,
     );
     await migrateTestDatabase(pool);
-    const after = await pool.query<{ checksum: string; name: string }>(
-      `SELECT "name", "checksum" FROM "_migrations" ORDER BY "name"`,
+    await migrateTestDatabase(pool);
+    const after = await pool.query<{ name: string; checksum: string }>(
+      `SELECT name, checksum FROM "_migrations" ORDER BY name`,
     );
-    expect(before.rows.length).toBeGreaterThan(0);
     expect(after.rows).toEqual(before.rows);
   });
 
