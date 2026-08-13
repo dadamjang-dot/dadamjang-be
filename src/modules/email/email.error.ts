@@ -7,6 +7,6 @@ export enum EmailErrorMessage {
   CodeAttemptLimitExceeded = "인증 실패 횟수를 초과했습니다.",
   EmailSendFailed = "이메일 발송에 실패했습니다.",
   InvalidSignupToken = "이메일 인증이 유효하지 않습니다.",
-  InvalidRecoveryToken = "복구 링크가 유효하지 않습니다.",
-  InvalidPassword = "비밀번호는 8자 이상이어야 합니다.",
+  InvalidRecoveryToken = "비밀번호 재설정 인증이 유효하지 않습니다.",
+  InvalidPassword = "비밀번호는 8자 이상, 72바이트 이하여야 합니다.",
 }

@@ -5,6 +5,7 @@ import { JwtRefreshTokenGuard } from "src/guards/refreshToken.guard";
 import { CustomUnauthorizedException } from "src/common/errors/custom-exceptions";
 import { authCookieOptions } from "./cookie-options";
 import { AuthErrorMessage } from "./auth.error";
+import { deviceIdFromRequest, setTokenCookies } from "./auth-http";
 import { AuthService } from "./auth.service";
 import {
   AuthRequest,
@@ -16,18 +17,6 @@ import {
   TokenPayload,
 } from "./auth.types";
 import { JwtAccessTokenGuard } from "src/guards/accessToken.guard";
-
-const deviceIdFromRequest = (req: Request) => {
-  const value = req.headers["x-device-id"];
-  const deviceId = (Array.isArray(value) ? value[0] : value)?.trim();
-  if (!deviceId) throw new CustomUnauthorizedException(AuthErrorMessage.AuthRequired);
-  return deviceId;
-};
-const setTokenCookies = (res: Response, tokenData: TokenPayload) => {
-  res.setHeader("Authorization", `Bearer ${tokenData.accessToken}`);
-  res.cookie("access_token", tokenData.accessToken, authCookieOptions);
-  res.cookie("refresh_token", tokenData.refreshToken, authCookieOptions);
-};
 
 @Resolver()
 export class AuthResolver {

@@ -35,18 +35,18 @@ export class AuthService {
       }),
     );
     if (!user) throw new CustomUnauthorizedException(AuthErrorMessage.InvalidEmailVerificationToken);
-    return this.issueTokens(user, deviceId);
+    return this.issueTokensForUser(user, deviceId);
   };
   signin = async (input: SigninAuthInput, deviceId: string) => {
     const user = await this.repository.findByUserid(this.emailService.normalizeUserid(input.userid));
     if (!user || !(await bcrypt.compare(input.password, user.password)))
       throw new CustomUnauthorizedException(AuthErrorMessage.AuthRequired);
     this.assertPortalRole((user as User & { role?: UserRoleValue }).role ?? UserRole.User, input.portal);
-    return this.issueTokens(user, deviceId);
+    return this.issueTokensForUser(user, deviceId);
   };
   beginKakao = async (profile: KakaoProfile, deviceId: string): Promise<KakaoBeginResult> => {
     const user = await this.repository.findKakaoUser(profile.providerUserId);
-    if (user) return { existingUser: true, tokenPayload: await this.issueTokens(user, deviceId) };
+    if (user) return { existingUser: true, tokenPayload: await this.issueTokensForUser(user, deviceId) };
     if (!profile.email) throw new CustomBadRequestException("카카오 계정 이메일 제공 동의가 필요합니다.");
     const kakaoSignupToken = randomBytes(32).toString("base64url");
     await this.repository.createKakaoSignupToken(
@@ -65,7 +65,7 @@ export class AuthService {
       }),
     );
     if (!user) throw new CustomUnauthorizedException("카카오 가입 토큰이 유효하지 않습니다.");
-    return this.issueTokens(user, deviceId);
+    return this.issueTokensForUser(user, deviceId);
   };
   refresh = async (userId: string, deviceId: string, refreshToken: string) => {
     const saved = await this.repository.findRefreshToken(userId, deviceId);
@@ -77,7 +77,7 @@ export class AuthService {
       throw new CustomUnauthorizedException(AuthErrorMessage.AuthRequired);
     const user = await this.repository.findUser(userId);
     if (!user) throw new CustomUnauthorizedException(AuthErrorMessage.AuthRequired);
-    return this.issueTokens(user, deviceId);
+    return this.issueTokensForUser(user, deviceId);
   };
   logout = async (userId: string, deviceId: string) => {
     await this.repository.deleteRefreshToken(userId, deviceId);
@@ -88,7 +88,7 @@ export class AuthService {
     return !!saved && saved.refreshTokenExp.getTime() > Date.now() && bcrypt.compare(token, saved.refreshToken);
   };
   getViewer = async (userId: string) => this.repository.findUser(userId);
-  private issueTokens = async (user: User, deviceId: string) => {
+  issueTokensForUser = async (user: User, deviceId: string) => {
     const role = (user as User & { role?: UserRoleValue }).role ?? UserRole.User;
     const accessToken = await this.jwtService.signAsync(
       { userId: user.userId, role },

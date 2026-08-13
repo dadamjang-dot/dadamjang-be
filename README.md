@@ -73,10 +73,14 @@ pnpm test
 
 ## 인증 계약
 
-- FO 로그인은 `portal: FO`를 사용합니다.
+- FO 이메일 로그인은 `signinFo(email, password)`를 사용합니다. Partner/BO와 구버전용 `signin(userid, password, portal)`은 유지합니다.
 - access token은 `Authorization: Bearer <accessToken>` 또는 cookie를 지원합니다.
 - refresh token은 native 앱을 위해 `Authorization: Bearer <refreshToken>`도 지원합니다.
-- Kakao callback은 `DADAMJANG_FO_AUTH_REDIRECT_URL`이 있으면 앱 deep link로 redirect합니다.
+- Kakao callback deep link에는 token 대신 10분 만료 일회용 `flowId`만 포함합니다.
+- 가입 본인확인 proof는 purpose와 device에 귀속되며 10분 만료·1회 소비됩니다.
+- KG이니시스 결과는 허용된 결과 URL에서 서버 간 조회한 뒤 CI와 생년월일을 복호화합니다. CI는 `IDENTITY_CI_PEPPER`로 HMAC 처리하고 원문 개인정보는 저장하지 않습니다.
+- `IDENTITY_VERIFICATION_MOCK_ENABLED=true`는 production 외 로컬 환경에서만 사용할 수 있습니다.
+- 승인된 약관 원문은 `consentDocuments`에 별도로 등록합니다. migration에는 임시 약관 문안을 넣지 않습니다.
 
 ## 환경 변수
 
@@ -88,6 +92,14 @@ pnpm test
 - `KAKAO_CLIENT_ID`
 - `KAKAO_CALLBACK_URL`
 - `DADAMJANG_FO_AUTH_REDIRECT_URL`
+- `DADAMJANG_FO_IDENTITY_REDIRECT_URL`
+- `API_PUBLIC_BASE_URL`
+- `IDENTITY_CI_PEPPER`
+- `IDENTITY_INICIS_MID`
+- `IDENTITY_INICIS_API_KEY`
+- `IDENTITY_INICIS_SEED_IV`
+- `IDENTITY_INICIS_CALLBACK_BASE_URL`
+- `IDENTITY_VERIFICATION_MOCK_ENABLED`
 - `RESEND_API_KEY`
 - `CLOUDFLARE_R2_*`
 - `SENTRY_DSN`

@@ -18,6 +18,9 @@ import { PartnerModule } from "./partner/partner.module";
 import { WishModule } from "./wish/wish.module";
 import { StylePostsModule } from "./style-posts/style-posts.module";
 import { WishLibraryModule } from "./wish-library/wish-library.module";
+import { IdentityVerificationModule } from "./identity-verification/identity-verification.module";
+import { FoAuthModule } from "./fo-auth/fo-auth.module";
+import { KakaoFlowModule } from "./fo-auth/kakao-flow.module";
 
 @Module({
   imports: [
@@ -53,6 +56,9 @@ import { WishLibraryModule } from "./wish-library/wish-library.module";
     WishModule,
     WishLibraryModule,
     StylePostsModule,
+    IdentityVerificationModule,
+    FoAuthModule,
+    KakaoFlowModule,
   ],
 })
 export class AppModule {}

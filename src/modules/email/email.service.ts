@@ -11,6 +11,7 @@ import {
 import { EmailSender } from "./email.sender";
 import { EmailErrorMessage } from "./email.error";
 import { EmailRepository } from "./email.repository";
+import { EmailVerificationPurpose, type EmailVerificationPurposeValue } from "./email.types";
 
 @Injectable()
 export class EmailService {
@@ -20,10 +21,22 @@ export class EmailService {
     private readonly configService: ConfigService,
     @Inject("EmailSender") private readonly sender: EmailSender,
   ) {}
-  requestSignupCode = async (email: string, ip?: string) => {
+  requestSignupCode = (email: string, ip?: string) => this.requestCode(email, EmailVerificationPurpose.Signup, ip);
+  requestPasswordResetCode = (email: string, ip?: string) => this.requestRecoveryCode(email, ip);
+  verifySignupCode = (email: string, code: string) => this.verifyCode(email, code, EmailVerificationPurpose.Signup);
+  verifyPasswordResetCode = (email: string, code: string) =>
+    this.verifyCode(email, code, EmailVerificationPurpose.PasswordReset);
+  private requestRecoveryCode = async (email: string, ip?: string) => {
+    const normalizedEmail = this.normalizeEmail(email);
+    const user = await this.repository.findUserByEmail(normalizedEmail);
+    if (user) return this.requestCode(normalizedEmail, EmailVerificationPurpose.PasswordReset, ip);
+    await bcrypt.hash(this.pepperedCode(normalizedEmail, "000000", EmailVerificationPurpose.PasswordReset), 10);
+    return { ok: true };
+  };
+  private requestCode = async (email: string, purpose: EmailVerificationPurposeValue, ip?: string) => {
     const normalizedEmail = this.normalizeEmail(email);
     const now = new Date();
-    const latest = await this.repository.latestVerification(normalizedEmail);
+    const latest = await this.repository.latestVerification(normalizedEmail, purpose);
     if (latest && now.getTime() - latest.createdAt.getTime() < 60_000)
       throw new CustomTooManyRequestsException(EmailErrorMessage.CodeRetryTooSoon);
     const since = new Date(now.getTime() - 60 * 60 * 1000);
@@ -37,7 +50,8 @@ export class EmailService {
     const code = String(randomInt(1_000_000)).padStart(6, "0");
     const verification = await this.repository.createVerification({
       email: normalizedEmail,
-      codeHash: await bcrypt.hash(this.pepperedCode(normalizedEmail, code), 10),
+      purpose,
+      codeHash: await bcrypt.hash(this.pepperedCode(normalizedEmail, code, purpose), 10),
       expiresAt: new Date(now.getTime() + 5 * 60 * 1000),
       requestIpHash: ipHash,
     });
@@ -49,22 +63,28 @@ export class EmailService {
     }
     return { ok: true };
   };
-  verifySignupCode = async (email: string, code: string) => {
+  private verifyCode = async (email: string, code: string, purpose: EmailVerificationPurposeValue) => {
     const normalizedEmail = this.normalizeEmail(email);
-    const verification = await this.repository.latestVerification(normalizedEmail);
+    const verification = await this.repository.latestVerification(normalizedEmail, purpose);
     if (!verification || verification.verifiedAt) throw new CustomUnauthorizedException(EmailErrorMessage.InvalidCode);
     if (verification.expiresAt.getTime() <= Date.now())
       throw new CustomUnauthorizedException(EmailErrorMessage.ExpiredCode);
     if (verification.attemptCount >= 5)
       throw new CustomTooManyRequestsException(EmailErrorMessage.CodeAttemptLimitExceeded);
-    if (!(await bcrypt.compare(this.pepperedCode(normalizedEmail, code), verification.codeHash))) {
+    if (!(await bcrypt.compare(this.pepperedCode(normalizedEmail, code, purpose), verification.codeHash))) {
       await this.repository.incrementAttempt(verification.id);
       throw new CustomUnauthorizedException(EmailErrorMessage.InvalidCode);
     }
     const verified = await this.repository.markVerified(verification.id);
     if (!verified) throw new CustomUnauthorizedException(EmailErrorMessage.InvalidCode);
     const token = this.createOpaqueToken();
-    await this.repository.createSignupToken(token, normalizedEmail, verified.id, new Date(Date.now() + 15 * 60 * 1000));
+    await this.repository.createVerificationToken(
+      token,
+      normalizedEmail,
+      purpose,
+      verified.id,
+      new Date(Date.now() + 15 * 60 * 1000),
+    );
     return { emailVerificationToken: token };
   };
   requestPasswordReset = async (email: string, ip?: string) => {
@@ -73,10 +93,16 @@ export class EmailService {
     return { ok: true };
   };
   resetPassword = async (token: string, password: string) => {
-    if (password.length < 8) throw new CustomBadRequestException(EmailErrorMessage.InvalidPassword);
+    this.assertPassword(password);
     const recovery = await this.repository.consumePasswordResetToken(token);
-    if (!recovery) throw new CustomUnauthorizedException(EmailErrorMessage.InvalidRecoveryToken);
-    await this.repository.resetPassword(recovery.userId, await bcrypt.hash(password, 10));
+    if (recovery) {
+      await this.repository.resetPassword(recovery.userId, await bcrypt.hash(password, 10));
+      return { ok: true };
+    }
+    const verification = await this.repository.consumePasswordResetEmailToken(token);
+    if (!verification) throw new CustomUnauthorizedException(EmailErrorMessage.InvalidRecoveryToken);
+    const user = await this.repository.findUserByEmail(verification.email);
+    if (user) await this.repository.resetPassword(user.userId, await bcrypt.hash(password, 10));
     return { ok: true };
   };
   consumeSignupToken = async (
@@ -106,6 +132,10 @@ export class EmailService {
       throw new CustomBadRequestException("아이디는 3~40자의 영문, 숫자, ., _, -만 사용할 수 있습니다.");
     return normalized;
   };
+  assertPassword = (password: string) => {
+    if (password.length < 8 || Buffer.byteLength(password, "utf8") > 72)
+      throw new CustomBadRequestException(EmailErrorMessage.InvalidPassword);
+  };
   private requestPasswordResetForUser = async (user: { userId: string; email: string }, ip?: string) => {
     const token = this.createOpaqueToken();
     await this.repository.createPasswordResetToken(
@@ -116,8 +146,8 @@ export class EmailService {
     );
     await this.sender.sendLink(user.email, "비밀번호 재설정", `/account-recovery/password#token=${token}`);
   };
-  private pepperedCode = (email: string, code: string) =>
-    `${email}:${code}:${this.configService.getOrThrow<string>("EMAIL_CODE_PEPPER")}`;
+  private pepperedCode = (email: string, code: string, purpose: EmailVerificationPurposeValue) =>
+    `${email}:${code}:${purpose}:${this.configService.getOrThrow<string>("EMAIL_CODE_PEPPER")}`;
   private sha256 = (value: string) => createHash("sha256").update(value).digest("hex");
   private createOpaqueToken = () => randomBytes(32).toString("base64url");
 }

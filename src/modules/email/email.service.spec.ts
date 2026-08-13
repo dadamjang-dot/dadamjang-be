@@ -8,7 +8,7 @@ describe("EmailService", () => {
   const config = { getOrThrow: jest.fn().mockReturnValue("pepper") } as unknown as ConfigService;
 
   it("issues a signup token only after a valid email code", async () => {
-    const codeHash = await bcrypt.hash("user@example.com:123456:pepper", 10);
+    const codeHash = await bcrypt.hash("user@example.com:123456:SIGNUP:pepper", 10);
     const repository = {
       latestVerification: jest.fn().mockResolvedValue({
         id: "verification",
@@ -18,16 +18,17 @@ describe("EmailService", () => {
         attemptCount: 0,
       }),
       markVerified: jest.fn().mockResolvedValue({ id: "verification" }),
-      createSignupToken: jest.fn().mockResolvedValue(undefined),
+      createVerificationToken: jest.fn().mockResolvedValue(undefined),
     } as unknown as EmailRepository;
     const service = new EmailService(repository, config, {} as EmailSender);
 
     await expect(service.verifySignupCode("USER@example.com", "123456")).resolves.toEqual({
       emailVerificationToken: expect.any(String),
     });
-    expect(repository.createSignupToken).toHaveBeenCalledWith(
+    expect(repository.createVerificationToken).toHaveBeenCalledWith(
       expect.any(String),
       "user@example.com",
+      "SIGNUP",
       "verification",
       expect.any(Date),
     );

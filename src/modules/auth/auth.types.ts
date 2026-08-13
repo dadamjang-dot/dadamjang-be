@@ -13,9 +13,21 @@ export type RefreshAuthRequest = Request & {
   cookies: { refresh_token?: string };
   refreshToken: string;
 };
-export type KakaoProfile = { providerUserId: string; email?: string };
-export type KakaoRawProfile = { id: string; _json?: { kakao_account?: { email?: string } } };
-export type KakaoRequest = Request & { user: KakaoProfile };
+export type KakaoProfile = { providerUserId: string; email?: string; emailVerified: boolean };
+export type KakaoRawProfile = {
+  id: string;
+  _json?: {
+    kakao_account?: {
+      email?: string;
+      is_email_valid?: boolean;
+      is_email_verified?: boolean;
+    };
+  };
+};
+export type KakaoRequest = Request & {
+  user: KakaoProfile;
+  cookies: { kakao_oauth_flow?: string };
+};
 export type KakaoBeginResult =
   { existingUser: true; tokenPayload: TokenPayload } | { existingUser: false; kakaoSignupToken: string };
 

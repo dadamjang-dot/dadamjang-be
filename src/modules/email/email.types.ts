@@ -1,5 +1,12 @@
 import { Field, InputType, ObjectType } from "@nestjs/graphql";
 
+export const EmailVerificationPurpose = {
+  Signup: "SIGNUP",
+  PasswordReset: "PASSWORD_RESET",
+} as const;
+
+export type EmailVerificationPurposeValue = (typeof EmailVerificationPurpose)[keyof typeof EmailVerificationPurpose];
+
 @InputType()
 export class RequestEmailCodeInput {
   @Field() email!: string;

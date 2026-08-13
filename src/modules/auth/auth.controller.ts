@@ -1,14 +1,17 @@
 import { Controller, Get, Req, Res, UseGuards } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { Response } from "express";
+import { CustomUnauthorizedException } from "src/common/errors/custom-exceptions";
 import { KakaoGuard } from "src/guards/kakao.guard";
-import { AuthService } from "./auth.service";
+import { KakaoFlowService } from "src/modules/fo-auth/kakao-flow.service";
+import { AuthErrorMessage } from "./auth.error";
+import { authCookieOptions } from "./cookie-options";
 import { KakaoRequest } from "./auth.types";
 
 @Controller("api/auth")
 export class AuthController {
   constructor(
-    private readonly authService: AuthService,
+    private readonly kakaoFlowService: KakaoFlowService,
     private readonly configService: ConfigService,
   ) {}
   @UseGuards(KakaoGuard)
@@ -19,24 +22,15 @@ export class AuthController {
   @UseGuards(KakaoGuard)
   @Get("kakao/callback")
   async kakaoCallback(@Req() req: KakaoRequest, @Res({ passthrough: true }) res: Response) {
-    const deviceId = String(req.headers["x-device-id"] ?? "kakao-browser");
-    const result = await this.authService.beginKakao(req.user, deviceId);
-    const redirectBaseUrl = this.configService.get<string>("DADAMJANG_FO_AUTH_REDIRECT_URL");
-
-    if (redirectBaseUrl) {
-      const redirectUrl = new URL(redirectBaseUrl);
-
-      if (result.existingUser) {
-        redirectUrl.searchParams.set("accessToken", result.tokenPayload.accessToken);
-        redirectUrl.searchParams.set("refreshToken", result.tokenPayload.refreshToken);
-        redirectUrl.searchParams.set("role", result.tokenPayload.role);
-      } else {
-        redirectUrl.searchParams.set("kakaoSignupToken", result.kakaoSignupToken);
-      }
-
-      return res.redirect(redirectUrl.toString());
-    }
-
-    return result;
+    const flowId = req.cookies.kakao_oauth_flow;
+    if (!flowId) throw new CustomUnauthorizedException(AuthErrorMessage.InvalidOauthState);
+    await this.kakaoFlowService.acceptCallback(flowId, req.user);
+    const redirectUrl = new URL(
+      this.configService.get<string>("DADAMJANG_FO_AUTH_REDIRECT_URL") ?? "dadamjang://auth/kakao-callback",
+    );
+    redirectUrl.searchParams.set("flowId", flowId);
+    res.clearCookie("kakao_oauth_state", authCookieOptions);
+    res.clearCookie("kakao_oauth_flow", authCookieOptions);
+    return res.redirect(redirectUrl.toString());
   }
 }
