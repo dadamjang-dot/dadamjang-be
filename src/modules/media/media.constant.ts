@@ -16,3 +16,6 @@ export const STYLE_POST_IMAGE_EXTENSIONS: Record<string, string> = {
 export const STYLE_POST_IMAGE_KEY_PATTERN =
   /^style-posts\/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.(jpg|png|webp|heic|heif)$/;
 export const STYLE_POST_MAX_FILE_SIZE = 10 * 1024 * 1024;
+export const PRODUCT_IMAGE_MAX_FILE_SIZE = 10 * 1024 * 1024;
+export const PRODUCT_IMAGE_KEY_PATTERN =
+  /^products\/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.(jpg|png|webp)$/;

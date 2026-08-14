@@ -1,20 +1,45 @@
 import { Inject, Injectable } from "@nestjs/common";
-import { eq } from "drizzle-orm";
-import { CatalogService } from "src/modules/catalog/catalog.service";
-import { CreateProductDraftInput } from "src/modules/catalog/catalog.types";
+import { SQL, and, desc, eq, ilike, inArray, or, sql } from "drizzle-orm";
 import { CustomBadRequestException, CustomNotFoundException } from "src/common/errors/custom-exceptions";
 import { Database, DRIZZLE } from "src/modules/database/database.module";
+import {
+  activityEvents,
+  brands,
+  categories,
+  colors,
+  partners,
+  productSkus,
+  products,
+  sizes,
+} from "src/modules/database/schema";
 import { EmailService } from "src/modules/email/email.service";
-import { activityEvents, partners } from "src/modules/database/schema";
+import { MediaService } from "src/modules/media/media.service";
 import { PartnerErrorMessage } from "./partner.error";
-import { ApplyPartnerInput } from "./partner.types";
+import {
+  ApplyPartnerInput,
+  PartnerProductFilterInput,
+  PartnerProductInput,
+  PartnerProductState,
+} from "./partner.types";
+
+type Cursor = { updatedAt: string; productId: string };
+const encodeCursor = (value: Cursor) => Buffer.from(JSON.stringify(value)).toString("base64url");
+const decodeCursor = (value: string): Cursor => {
+  try {
+    const cursor = JSON.parse(Buffer.from(value, "base64url").toString()) as Cursor;
+    if (!cursor.productId || Number.isNaN(Date.parse(cursor.updatedAt))) throw new Error();
+    return cursor;
+  } catch {
+    throw new CustomBadRequestException("Invalid cursor");
+  }
+};
 
 @Injectable()
 export class PartnerService {
   constructor(
     @Inject(DRIZZLE) private readonly db: Database,
-    private readonly catalogService: CatalogService,
     private readonly emailService: EmailService,
+    private readonly mediaService: MediaService,
   ) {}
 
   apply = async (ownerUserId: string, input: ApplyPartnerInput) => {
@@ -24,12 +49,7 @@ export class PartnerService {
     await this.emailService.consumeVerifiedEmailToken(input.businessEmailVerificationToken, businessEmail);
     const [partner] = await this.db
       .insert(partners)
-      .values({
-        ownerUserId,
-        businessEmail,
-        businessRegistrationNumber: input.businessRegistrationNumber,
-        tradeName: input.tradeName,
-      })
+      .values({ ...input, businessEmail, ownerUserId })
       .returning();
     await this.db.insert(activityEvents).values({
       actorUserId: ownerUserId,
@@ -43,20 +63,251 @@ export class PartnerService {
   getMine = async (ownerUserId: string) => {
     const [partner] = await this.db.select().from(partners).where(eq(partners.ownerUserId, ownerUserId)).limit(1);
     if (!partner) throw new CustomNotFoundException(PartnerErrorMessage.NotFound);
-    return partner;
+    const [brand] = partner.brandId
+      ? await this.db.select().from(brands).where(eq(brands.brandId, partner.brandId)).limit(1)
+      : [];
+    return { ...partner, brand: brand ?? null };
   };
 
-  createDraft = async (ownerUserId: string, input: CreateProductDraftInput) => {
-    const partner = await this.getMine(ownerUserId);
-    if (partner.status !== "APPROVED")
-      throw new CustomBadRequestException(PartnerErrorMessage.ApprovalRequiredForProduct);
-    return this.catalogService.createDraft(partner.partnerId, input);
+  dashboard = async (ownerUserId: string) => {
+    const partner = await this.approvedPartner(ownerUserId);
+    const rows = await this.db
+      .select({ status: products.status, approvalStatus: products.approvalStatus, count: sql<number>`count(*)` })
+      .from(products)
+      .where(eq(products.partnerId, partner.partnerId))
+      .groupBy(products.status, products.approvalStatus);
+    const result = { draftCount: 0, pendingCount: 0, rejectedCount: 0, approvedCount: 0, publishedCount: 0 };
+    rows.forEach((row) => {
+      const key = `${this.state(row)}Count` as keyof typeof result;
+      result[key] += Number(row.count);
+    });
+    return result;
   };
+
+  listProducts = async (ownerUserId: string, filter: PartnerProductFilterInput) => {
+    const partner = await this.approvedPartner(ownerUserId);
+    const first = Math.min(Math.max(filter.first ?? 20, 1), 100);
+    const conditions: (SQL | undefined)[] = [eq(products.partnerId, partner.partnerId)];
+    if (filter.query?.trim()) conditions.push(ilike(products.title, `%${filter.query.trim()}%`));
+    if (filter.categoryId) conditions.push(eq(products.categoryId, filter.categoryId));
+    if (filter.state === PartnerProductState.Published) conditions.push(eq(products.status, "PUBLISHED"));
+    else if (filter.state)
+      conditions.push(and(eq(products.status, "DRAFT"), eq(products.approvalStatus, filter.state)));
+    if (filter.after) {
+      const cursor = decodeCursor(filter.after);
+      conditions.push(
+        or(
+          sql`${products.updatedAt} < ${new Date(cursor.updatedAt)}`,
+          and(eq(products.updatedAt, new Date(cursor.updatedAt)), sql`${products.productId} < ${cursor.productId}`),
+        ),
+      );
+    }
+    const [rows, count] = await Promise.all([
+      this.db
+        .select()
+        .from(products)
+        .where(and(...conditions))
+        .orderBy(desc(products.updatedAt), desc(products.productId))
+        .limit(first + 1),
+      this.db
+        .select({ count: sql<number>`count(*)` })
+        .from(products)
+        .where(and(...conditions.slice(0, filter.after ? -1 : undefined))),
+    ]);
+    const nodes = await this.hydrate(ownerUserId, rows.slice(0, first));
+    const tail = nodes[nodes.length - 1];
+    return {
+      nodes,
+      hasNextPage: rows.length > first,
+      nextCursor:
+        rows.length > first && tail
+          ? encodeCursor({ updatedAt: tail.updatedAt.toISOString(), productId: tail.productId })
+          : null,
+      totalCount: Number(count[0]?.count ?? 0),
+    };
+  };
+
+  getProduct = async (ownerUserId: string, productId: string) => {
+    const partner = await this.approvedPartner(ownerUserId);
+    const [product] = await this.db
+      .select()
+      .from(products)
+      .where(and(eq(products.productId, productId), eq(products.partnerId, partner.partnerId)))
+      .limit(1);
+    if (!product) throw new CustomNotFoundException("Product not found");
+    return (await this.hydrate(ownerUserId, [product]))[0];
+  };
+
+  createDraft = async (ownerUserId: string, input: PartnerProductInput) => {
+    const partner = await this.approvedPartner(ownerUserId);
+    await this.validate(ownerUserId, input);
+    const imageUrls = await Promise.all(input.imageKeys.map((key) => this.mediaService.getProductImageUrl(key)));
+    const [created] = await this.db.transaction(async (tx) => {
+      const [product] = await tx
+        .insert(products)
+        .values({
+          partnerId: partner.partnerId,
+          brandId: partner.brandId,
+          categoryId: input.categoryId,
+          title: input.title.trim(),
+          description: input.description.trim(),
+          imageKeys: input.imageKeys,
+          imageUrls,
+          approvalStatus: "DRAFT",
+          isOnSale: input.isOnSale,
+          isExpressDelivery: input.isExpressDelivery,
+        })
+        .returning();
+      await tx.insert(productSkus).values(input.skus.map((sku) => ({ ...sku, productId: product.productId })));
+      return [product];
+    });
+    return this.getProduct(ownerUserId, created.productId);
+  };
+
+  updateDraft = async (ownerUserId: string, productId: string, input: PartnerProductInput) => {
+    const partner = await this.approvedPartner(ownerUserId);
+    await this.validate(ownerUserId, input);
+    const imageUrls = await Promise.all(input.imageKeys.map((key) => this.mediaService.getProductImageUrl(key)));
+    await this.db.transaction(async (tx) => {
+      const [updated] = await tx
+        .update(products)
+        .set({
+          categoryId: input.categoryId,
+          title: input.title.trim(),
+          description: input.description.trim(),
+          imageKeys: input.imageKeys,
+          imageUrls,
+          isOnSale: input.isOnSale,
+          isExpressDelivery: input.isExpressDelivery,
+          approvalStatus: "DRAFT",
+          rejectionReason: null,
+          updatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(products.productId, productId),
+            eq(products.partnerId, partner.partnerId),
+            eq(products.status, "DRAFT"),
+            inArray(products.approvalStatus, ["DRAFT", "REJECTED"]),
+          ),
+        )
+        .returning();
+      if (!updated) throw new CustomBadRequestException(PartnerErrorMessage.InvalidTransition);
+      await tx.delete(productSkus).where(eq(productSkus.productId, productId));
+      await tx.insert(productSkus).values(input.skus.map((sku) => ({ ...sku, productId })));
+    });
+    return this.getProduct(ownerUserId, productId);
+  };
+
+  submit = async (ownerUserId: string, productId: string) =>
+    this.transition(ownerUserId, productId, "DRAFT", "PENDING", false);
+  publish = async (ownerUserId: string, productId: string) =>
+    this.transition(ownerUserId, productId, "APPROVED", "APPROVED", true);
 
   publishProduct = async (ownerUserId: string, productId: string) => {
     const partner = await this.getMine(ownerUserId);
     if (partner.status !== "APPROVED")
       throw new CustomBadRequestException(PartnerErrorMessage.ApprovalRequiredForPublishing);
-    return this.catalogService.publishProduct(partner.partnerId, productId);
+    return this.publish(ownerUserId, productId);
   };
+
+  private transition = async (ownerUserId: string, productId: string, from: string, to: string, publish: boolean) => {
+    const partner = await this.approvedPartner(ownerUserId);
+    const [product] = await this.db
+      .update(products)
+      .set(
+        publish
+          ? { status: "PUBLISHED", publishedAt: new Date(), updatedAt: new Date() }
+          : { approvalStatus: to, updatedAt: new Date() },
+      )
+      .where(
+        and(
+          eq(products.productId, productId),
+          eq(products.partnerId, partner.partnerId),
+          eq(products.status, "DRAFT"),
+          eq(products.approvalStatus, from),
+        ),
+      )
+      .returning();
+    if (!product) throw new CustomBadRequestException(PartnerErrorMessage.InvalidTransition);
+    return this.getProduct(ownerUserId, productId);
+  };
+
+  private approvedPartner = async (ownerUserId: string) => {
+    const partner = await this.getMine(ownerUserId);
+    if (partner.status !== "APPROVED" || !partner.brandId)
+      throw new CustomBadRequestException(PartnerErrorMessage.ApprovalRequiredForProduct);
+    return partner;
+  };
+
+  private validate = async (ownerUserId: string, input: PartnerProductInput) => {
+    if (
+      input.title.trim().length < 1 ||
+      input.title.length > 200 ||
+      input.description.trim().length < 1 ||
+      input.description.length > 2000 ||
+      input.imageKeys.length < 1 ||
+      input.imageKeys.length > 10 ||
+      input.skus.length < 1 ||
+      input.skus.some(
+        (sku) => !Number.isInteger(sku.price) || sku.price < 0 || !Number.isInteger(sku.stock) || sku.stock < 0,
+      ) ||
+      new Set(input.skus.map((sku) => sku.code)).size !== input.skus.length
+    )
+      throw new CustomBadRequestException(PartnerErrorMessage.InvalidProductInput);
+    if (input.imageKeys.some((key) => !this.mediaService.isProductImageKeyForUser(key, ownerUserId)))
+      throw new CustomBadRequestException(PartnerErrorMessage.ImageOwnership);
+    const [category] = await this.db
+      .select()
+      .from(categories)
+      .where(and(eq(categories.categoryId, input.categoryId), eq(categories.isActive, true)))
+      .limit(1);
+    const colorIds = input.skus.flatMap((sku) => (sku.colorId ? [sku.colorId] : []));
+    const sizeIds = input.skus.flatMap((sku) => (sku.sizeId ? [sku.sizeId] : []));
+    const [validColors, validSizes] = await Promise.all([
+      colorIds.length
+        ? this.db
+            .select()
+            .from(colors)
+            .where(and(inArray(colors.colorId, colorIds), eq(colors.isActive, true)))
+        : [],
+      sizeIds.length
+        ? this.db
+            .select()
+            .from(sizes)
+            .where(and(inArray(sizes.sizeId, sizeIds), eq(sizes.isActive, true)))
+        : [],
+    ]);
+    if (
+      !category ||
+      new Set(validColors.map((v) => v.colorId)).size !== new Set(colorIds).size ||
+      new Set(validSizes.map((v) => v.sizeId)).size !== new Set(sizeIds).size
+    )
+      throw new CustomBadRequestException(PartnerErrorMessage.CatalogOptionInactive);
+  };
+
+  private hydrate = async (ownerUserId: string, rows: (typeof products.$inferSelect)[]) => {
+    if (!rows.length) return [];
+    const skus = await this.db
+      .select()
+      .from(productSkus)
+      .where(
+        inArray(
+          productSkus.productId,
+          rows.map((row) => row.productId),
+        ),
+      );
+    const partner = await this.getMine(ownerUserId);
+    return Promise.all(
+      rows.map(async (row) => ({
+        ...row,
+        brand: partner.brand,
+        skus: skus.filter((sku) => sku.productId === row.productId),
+        imageUrls: await Promise.all(row.imageKeys.map((key) => this.mediaService.getProductImageUrl(key))),
+      })),
+    );
+  };
+
+  private state = (row: { status: string; approvalStatus: string }) =>
+    row.status === "PUBLISHED" ? "published" : row.approvalStatus.toLowerCase();
 }

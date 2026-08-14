@@ -277,6 +277,7 @@ export const partners = pgTable(
     businessEmail: varchar("businessEmail", { length: 255 }).notNull().unique(),
     businessRegistrationNumber: varchar("businessRegistrationNumber", { length: 20 }).notNull().unique(),
     tradeName: varchar("tradeName", { length: 160 }).notNull(),
+    brandId: uuid("brandId").references(() => brands.brandId),
     status: varchar("status", { length: 20 }).notNull().default("PENDING"),
     rejectionReason: text("rejectionReason"),
     reviewedByUserId: uuid("reviewedByUserId").references(() => users.userId),
@@ -287,6 +288,7 @@ export const partners = pgTable(
   (table) => [
     index("partners_status_idx").on(table.status),
     index("partners_status_created_idx").on(table.status, table.createdAt),
+    unique("partners_brand_unique").on(table.brandId),
   ],
 );
 
@@ -304,8 +306,9 @@ export const products = pgTable(
     title: varchar("title", { length: 200 }).notNull(),
     description: text("description").notNull(),
     imageUrls: jsonb("imageUrls").$type<string[]>().notNull().default([]),
+    imageKeys: jsonb("imageKeys").$type<string[]>().notNull().default([]),
     status: varchar("status", { length: 20 }).notNull().default("DRAFT"),
-    approvalStatus: varchar("approvalStatus", { length: 20 }).notNull().default("PENDING"),
+    approvalStatus: varchar("approvalStatus", { length: 20 }).notNull().default("DRAFT"),
     rejectionReason: text("rejectionReason"),
     isOnSale: boolean("isOnSale").notNull().default(false),
     isExpressDelivery: boolean("isExpressDelivery").notNull().default(false),
@@ -319,6 +322,7 @@ export const products = pgTable(
     index("products_catalog_flags_idx").on(table.status, table.isOnSale, table.isExpressDelivery),
     index("products_partner_idx").on(table.partnerId, table.status),
     index("products_approval_created_idx").on(table.approvalStatus, table.createdAt),
+    index("products_partner_portal_idx").on(table.partnerId, table.approvalStatus, table.updatedAt, table.productId),
   ],
 );
 

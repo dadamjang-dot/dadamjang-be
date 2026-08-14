@@ -7,6 +7,9 @@ export class CreateProductImageUploadInput {
 
   @Field()
   contentType!: string;
+
+  @Field(() => Int)
+  fileSize!: number;
 }
 
 @InputType()

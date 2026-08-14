@@ -14,6 +14,7 @@ import { Database, DRIZZLE } from "src/modules/database/database.module";
 import {
   adminInvites,
   auditLogs,
+  brands,
   categories,
   orderItems,
   orders,
@@ -396,11 +397,25 @@ export class AdminService {
         .where(and(eq(partners.partnerId, input.partnerId), eq(partners.status, "PENDING")))
         .returning();
       if (!partner) await this.throwPartnerMutationError(input.partnerId);
-      if (input.approved)
+      if (input.approved) {
+        let brandId = partner.brandId;
+        if (!brandId) {
+          const [brand] = await tx
+            .insert(brands)
+            .values({ name: partner.tradeName, slug: `partner-${partner.partnerId}`, isActive: true })
+            .onConflictDoUpdate({ target: brands.slug, set: { name: partner.tradeName, isActive: true } })
+            .returning();
+          brandId = brand.brandId;
+          await tx
+            .update(partners)
+            .set({ brandId })
+            .where(and(eq(partners.partnerId, partner.partnerId), isNull(partners.brandId)));
+        }
         await tx
           .update(users)
           .set({ role: "PARTNER", updatedAt: new Date() })
           .where(eq(users.userId, partner.ownerUserId));
+      }
       await tx.insert(auditLogs).values({
         actorUserId: adminUserId,
         action: input.approved ? "PARTNER_APPROVED" : "PARTNER_REJECTED",
@@ -691,7 +706,7 @@ export class AdminService {
   };
 
   private productConditions = (filter: AdminProductFilterInput) => {
-    const conditions: SQL[] = [];
+    const conditions: SQL[] = [sql`not (${products.status} = 'DRAFT' and ${products.approvalStatus} = 'DRAFT')`];
     if (filter.approvalStatus) conditions.push(eq(products.approvalStatus, filter.approvalStatus));
     if (filter.partnerId) conditions.push(eq(products.partnerId, filter.partnerId));
     if (filter.categoryId) conditions.push(eq(products.categoryId, filter.categoryId));

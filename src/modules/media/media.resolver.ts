@@ -27,8 +27,11 @@ export class MediaResolver {
 
   @Mutation(() => ProductImageUploadTarget)
   @Roles(UserRole.Partner)
-  async createProductImageUpload(@Args("input") input: CreateProductImageUploadInput) {
-    return this.mediaService.createProductUpload(input);
+  async createProductImageUpload(
+    @Args("input") input: CreateProductImageUploadInput,
+    @Context() context: { req?: { user?: { userId?: string } } },
+  ) {
+    return this.mediaService.createProductUpload(currentUserId(context), input);
   }
 
   @Mutation(() => ProductImageUploadTarget)

@@ -11,6 +11,8 @@ import {
   STYLE_POST_IMAGE_KEY_PATTERN,
   STYLE_POST_SUPPORTED_CONTENT_TYPES,
   SUPPORTED_CONTENT_TYPES,
+  PRODUCT_IMAGE_KEY_PATTERN,
+  PRODUCT_IMAGE_MAX_FILE_SIZE,
 } from "./media.constant";
 import type {
   CreateProductImageUploadInput,
@@ -41,16 +43,23 @@ export class MediaService {
     });
   }
 
-  createProductUpload = async (input: CreateProductImageUploadInput): Promise<ProductImageUploadTarget> => {
-    if (!SUPPORTED_CONTENT_TYPES.has(input.contentType)) {
+  createProductUpload = async (
+    userId: string,
+    input: CreateProductImageUploadInput,
+  ): Promise<ProductImageUploadTarget> => {
+    const contentType = input.contentType.toLowerCase();
+    if (!SUPPORTED_CONTENT_TYPES.has(contentType)) {
       throw new CustomBadRequestException(MediaErrorMessage.UnsupportedType);
     }
-
-    const extension = input.filename.split(".").pop()?.toLowerCase();
-    const key = `products/${randomUUID()}${extension ? `.${extension}` : ""}`;
+    if (!Number.isInteger(input.fileSize) || input.fileSize <= 0)
+      throw new CustomBadRequestException(MediaErrorMessage.InvalidFileSize);
+    if (input.fileSize > PRODUCT_IMAGE_MAX_FILE_SIZE)
+      throw new CustomBadRequestException(MediaErrorMessage.FileTooLarge);
+    const extension = contentType === "image/jpeg" ? "jpg" : contentType.split("/")[1];
+    const key = `products/${userId}/${randomUUID()}.${extension}`;
     const uploadUrl = await getSignedUrl(
       this.client,
-      new PutObjectCommand({ Bucket: this.bucket, Key: key, ContentType: input.contentType }),
+      new PutObjectCommand({ Bucket: this.bucket, Key: key, ContentType: contentType, ContentLength: input.fileSize }),
       { expiresIn: 10 * 60 },
     );
     const originalUrl = this.originalUrl(key);
@@ -93,6 +102,9 @@ export class MediaService {
     if (!key.startsWith("products/")) throw new CustomBadRequestException(MediaErrorMessage.InvalidKey);
     return this.transformedUrl(key, width);
   };
+
+  isProductImageKeyForUser = (key: string, userId: string) =>
+    key.startsWith(`products/${userId}/`) && PRODUCT_IMAGE_KEY_PATTERN.test(key);
 
   getStylePostImageUrl = (key: string, width?: number) => {
     if (!STYLE_POST_IMAGE_KEY_PATTERN.test(key)) throw new CustomBadRequestException(MediaErrorMessage.InvalidKey);
