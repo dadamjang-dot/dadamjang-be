@@ -64,6 +64,7 @@ const sku = (productId: string, skuId: string, price: number, colorId = "color-1
   optionName: skuId,
   price,
   stock: price,
+  position: 0,
   isActive: true,
   createdAt: new Date("2026-07-01T00:00:00.000Z"),
   updatedAt: new Date("2026-07-01T00:00:00.000Z"),

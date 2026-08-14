@@ -90,8 +90,8 @@ export const resetFixtures = async (pool: Pool) => {
     [FIXTURE.sizeId],
   );
   await pool.query(
-    `INSERT INTO "partners" ("partnerId", "ownerUserId", "businessEmail", "businessRegistrationNumber", "tradeName", "status") VALUES ($1, $2, 'partner@example.test', '1000000000', 'Integration Partner', 'APPROVED')`,
-    [FIXTURE.partnerId, FIXTURE.userId],
+    `INSERT INTO "partners" ("partnerId", "ownerUserId", "businessEmail", "businessRegistrationNumber", "tradeName", "brandId", "status") VALUES ($1, $2, 'partner@example.test', '1000000000', 'Integration Partner', $3, 'APPROVED')`,
+    [FIXTURE.partnerId, FIXTURE.userId, FIXTURE.brandId],
   );
   await pool.query(
     `INSERT INTO "products" ("productId", "partnerId", "brandId", "categoryId", "title", "description", "imageUrls", "status", "approvalStatus", "isOnSale", "isExpressDelivery", "publishedAt", "createdAt") VALUES ($1, $3, $4, $5, 'Integration Sale Tee', 'Primary integration product', '[]', 'PUBLISHED', 'APPROVED', true, true, now(), '2026-01-02T00:00:00Z'), ($2, $3, $4, $6, 'Integration Shoes', 'Secondary integration product', '[]', 'PUBLISHED', 'APPROVED', false, false, now(), '2026-01-01T00:00:00Z')`,
@@ -105,7 +105,7 @@ export const resetFixtures = async (pool: Pool) => {
     ],
   );
   await pool.query(
-    `INSERT INTO "productSkus" ("skuId", "productId", "code", "colorId", "sizeId", "optionName", "price", "stock") VALUES ($1, $3, 'INTEGRATION-TEE-M', $5, $6, 'Black / M', 15000, 5), ($2, $4, 'INTEGRATION-SHOES-M', $5, $6, 'Black / M', 30000, 1)`,
+    `INSERT INTO "productSkus" ("skuId", "productId", "code", "colorId", "sizeId", "optionName", "price", "stock", "position") VALUES ($1, $3, 'INTEGRATION-TEE-M', $5, $6, 'Black / M', 15000, 5, 0), ($2, $4, 'INTEGRATION-SHOES-M', $5, $6, 'Black / M', 30000, 1, 0)`,
     [FIXTURE.skuId, FIXTURE.secondSkuId, FIXTURE.productId, FIXTURE.secondProductId, FIXTURE.colorId, FIXTURE.sizeId],
   );
 };
@@ -140,8 +140,8 @@ export const seedAdminFixtures = async (pool: Pool) => {
   );
   await pool.query(
     `INSERT INTO "productSkus"
-      ("skuId", "productId", "code", "colorId", "sizeId", "optionName", "price", "stock")
-     VALUES ($1, $2, 'ADMIN-PENDING-M', $3, $4, 'Black / M', 22000, 4)`,
+      ("skuId", "productId", "code", "colorId", "sizeId", "optionName", "price", "stock", "position")
+     VALUES ($1, $2, 'ADMIN-PENDING-M', $3, $4, 'Black / M', 22000, 4, 0)`,
     [ADMIN_FIXTURE.skuId, ADMIN_FIXTURE.productId, FIXTURE.colorId, FIXTURE.sizeId],
   );
   await pool.query(

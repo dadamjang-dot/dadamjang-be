@@ -1,6 +1,6 @@
 import { Injectable } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
-import { PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
+import { HeadObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { randomUUID } from "crypto";
 import { CustomBadRequestException } from "src/common/errors/custom-exceptions";
@@ -105,6 +105,27 @@ export class MediaService {
 
   isProductImageKeyForUser = (key: string, userId: string) =>
     key.startsWith(`products/${userId}/`) && PRODUCT_IMAGE_KEY_PATTERN.test(key);
+
+  validateProductImageObject = async (key: string, userId: string) => {
+    if (!this.isProductImageKeyForUser(key, userId)) throw new CustomBadRequestException(MediaErrorMessage.InvalidKey);
+    try {
+      const object = await this.client.send(new HeadObjectCommand({ Bucket: this.bucket, Key: key }));
+      if (
+        !object.ContentType ||
+        !SUPPORTED_CONTENT_TYPES.has(object.ContentType.toLowerCase()) ||
+        !Number.isInteger(object.ContentLength) ||
+        object.ContentLength === undefined ||
+        object.ContentLength < 1 ||
+        object.ContentLength > PRODUCT_IMAGE_MAX_FILE_SIZE
+      )
+        throw new CustomBadRequestException(MediaErrorMessage.ObjectInvalid);
+    } catch (error) {
+      if (error instanceof CustomBadRequestException) throw error;
+      if ((error as { $metadata?: { httpStatusCode?: number } }).$metadata?.httpStatusCode === 404)
+        throw new CustomBadRequestException(MediaErrorMessage.ObjectInvalid);
+      throw error;
+    }
+  };
 
   getStylePostImageUrl = (key: string, width?: number) => {
     if (!STYLE_POST_IMAGE_KEY_PATTERN.test(key)) throw new CustomBadRequestException(MediaErrorMessage.InvalidKey);
