@@ -1,11 +1,12 @@
 import { Module } from "@nestjs/common";
 import { CatalogModule } from "src/modules/catalog/catalog.module";
+import { MediaModule } from "src/modules/media/media.module";
 import { EmailModule } from "src/modules/email/email.module";
 import { PartnerResolver } from "./partner.resolver";
 import { PartnerService } from "./partner.service";
 
 @Module({
-  imports: [CatalogModule, EmailModule],
+  imports: [CatalogModule, EmailModule, MediaModule],
   providers: [PartnerService, PartnerResolver],
   exports: [PartnerService],
 })

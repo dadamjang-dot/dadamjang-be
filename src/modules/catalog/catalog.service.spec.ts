@@ -44,6 +44,7 @@ const product = (
   title: productId,
   description: productId,
   imageUrls: [],
+  imageKeys: [],
   status: "PUBLISHED",
   approvalStatus: "APPROVED",
   rejectionReason: null,
