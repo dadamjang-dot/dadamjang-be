@@ -226,7 +226,9 @@ export class CatalogService {
           isExpressDelivery: input.isExpressDelivery,
         })
         .returning();
-      await tx.insert(productSkus).values(input.skus.map((sku) => ({ ...sku, productId: product.productId })));
+      await tx
+        .insert(productSkus)
+        .values(input.skus.map((sku, position) => ({ ...sku, position, productId: product.productId })));
       return product;
     });
   };
@@ -280,7 +282,7 @@ export class CatalogService {
         .select()
         .from(productSkus)
         .where(and(inArray(productSkus.productId, productIds), eq(productSkus.isActive, true)))
-        .orderBy(productSkus.createdAt),
+        .orderBy(asc(productSkus.position), asc(productSkus.skuId)),
       brandIds.length
         ? this.db
             .select({ brandId: brands.brandId, name: brands.name, slug: brands.slug })

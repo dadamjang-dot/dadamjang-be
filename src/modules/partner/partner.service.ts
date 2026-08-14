@@ -1,5 +1,5 @@
 import { Inject, Injectable } from "@nestjs/common";
-import { SQL, and, desc, eq, ilike, inArray, or, sql } from "drizzle-orm";
+import { SQL, and, asc, desc, eq, exists, getTableColumns, ilike, inArray, or, sql } from "drizzle-orm";
 import { CustomBadRequestException, CustomNotFoundException } from "src/common/errors/custom-exceptions";
 import { Database, DRIZZLE } from "src/modules/database/database.module";
 import {
@@ -91,23 +91,37 @@ export class PartnerService {
       eq(products.partnerId, partner.partnerId),
       eq(products.brandId, partner.brandId),
     ];
-    if (filter.query?.trim()) conditions.push(ilike(products.title, `%${filter.query.trim()}%`));
+    if (filter.query?.trim()) {
+      const query = `%${filter.query.trim()}%`;
+      conditions.push(
+        or(
+          ilike(products.title, query),
+          exists(
+            this.db
+              .select({ value: sql`1` })
+              .from(productSkus)
+              .where(and(eq(productSkus.productId, products.productId), ilike(productSkus.code, query))),
+          ),
+        ),
+      );
+    }
     if (filter.categoryId) conditions.push(eq(products.categoryId, filter.categoryId));
     if (filter.state === PartnerProductState.Published) conditions.push(eq(products.status, "PUBLISHED"));
     else if (filter.state)
       conditions.push(and(eq(products.status, "DRAFT"), eq(products.approvalStatus, filter.state)));
     if (filter.after) {
       const cursor = decodeCursor(filter.after);
+      const cursorUpdatedAt = sql`${cursor.updatedAt}::timestamp`;
       conditions.push(
         or(
-          sql`${products.updatedAt} < ${new Date(cursor.updatedAt)}`,
-          and(eq(products.updatedAt, new Date(cursor.updatedAt)), sql`${products.productId} < ${cursor.productId}`),
+          sql`${products.updatedAt} < ${cursorUpdatedAt}`,
+          and(sql`${products.updatedAt} = ${cursorUpdatedAt}`, sql`${products.productId} < ${cursor.productId}`),
         ),
       );
     }
     const [rows, count] = await Promise.all([
       this.db
-        .select()
+        .select({ ...getTableColumns(products), cursorUpdatedAt: sql<string>`${products.updatedAt}::text` })
         .from(products)
         .where(and(...conditions))
         .orderBy(desc(products.updatedAt), desc(products.productId))
@@ -117,14 +131,15 @@ export class PartnerService {
         .from(products)
         .where(and(...conditions.slice(0, filter.after ? -1 : undefined))),
     ]);
-    const nodes = await this.hydrate(ownerUserId, rows.slice(0, first));
-    const tail = nodes[nodes.length - 1];
+    const pageRows = rows.slice(0, first);
+    const nodes = await this.hydrate(ownerUserId, pageRows);
+    const tail = pageRows[pageRows.length - 1];
     return {
       nodes,
       hasNextPage: rows.length > first,
       nextCursor:
         rows.length > first && tail
-          ? encodeCursor({ updatedAt: tail.updatedAt.toISOString(), productId: tail.productId })
+          ? encodeCursor({ updatedAt: tail.cursorUpdatedAt, productId: tail.productId })
           : null,
       totalCount: Number(count[0]?.count ?? 0),
     };
@@ -167,7 +182,9 @@ export class PartnerService {
           isExpressDelivery: input.isExpressDelivery,
         })
         .returning();
-      await tx.insert(productSkus).values(input.skus.map((sku) => ({ ...sku, productId: product.productId })));
+      await tx
+        .insert(productSkus)
+        .values(input.skus.map((sku, position) => ({ ...sku, position, productId: product.productId })));
       return [product];
     });
     return this.getProduct(ownerUserId, created.productId);
@@ -204,7 +221,7 @@ export class PartnerService {
         .returning();
       if (!updated) throw new CustomBadRequestException(PartnerErrorMessage.InvalidTransition);
       await tx.delete(productSkus).where(eq(productSkus.productId, productId));
-      await tx.insert(productSkus).values(input.skus.map((sku) => ({ ...sku, productId })));
+      await tx.insert(productSkus).values(input.skus.map((sku, position) => ({ ...sku, position, productId })));
     });
     return this.getProduct(ownerUserId, productId);
   };
@@ -223,6 +240,21 @@ export class PartnerService {
 
   private transition = async (ownerUserId: string, productId: string, from: string, to: string, publish: boolean) => {
     const partner = await this.approvedPartner(ownerUserId);
+    const [candidate] = await this.db
+      .select()
+      .from(products)
+      .where(
+        and(
+          eq(products.productId, productId),
+          eq(products.partnerId, partner.partnerId),
+          eq(products.brandId, partner.brandId),
+          eq(products.status, "DRAFT"),
+          eq(products.approvalStatus, from),
+        ),
+      )
+      .limit(1);
+    if (!candidate) throw new CustomBadRequestException(PartnerErrorMessage.InvalidTransition);
+    await Promise.all(candidate.imageKeys.map((key) => this.mediaService.validateProductImageObject(key, ownerUserId)));
     const [product] = await this.db
       .update(products)
       .set(
@@ -268,6 +300,7 @@ export class PartnerService {
       throw new CustomBadRequestException(PartnerErrorMessage.InvalidProductInput);
     if (input.imageKeys.some((key) => !this.mediaService.isProductImageKeyForUser(key, ownerUserId)))
       throw new CustomBadRequestException(PartnerErrorMessage.ImageOwnership);
+    await Promise.all(input.imageKeys.map((key) => this.mediaService.validateProductImageObject(key, ownerUserId)));
     const [category] = await this.db
       .select()
       .from(categories)
@@ -307,7 +340,8 @@ export class PartnerService {
           productSkus.productId,
           rows.map((row) => row.productId),
         ),
-      );
+      )
+      .orderBy(asc(productSkus.position), asc(productSkus.skuId));
     const partner = await this.getMine(ownerUserId);
     return Promise.all(
       rows.map(async (row) => ({
