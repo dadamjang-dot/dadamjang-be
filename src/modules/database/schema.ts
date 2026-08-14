@@ -306,7 +306,7 @@ export const products = pgTable(
     title: varchar("title", { length: 200 }).notNull(),
     description: text("description").notNull(),
     imageUrls: jsonb("imageUrls").$type<string[]>().notNull().default([]),
-    imageKeys: jsonb("imageKeys").$type<string[]>().notNull().default([]),
+    imageKeys: text("imageKeys").array().notNull().default([]),
     status: varchar("status", { length: 20 }).notNull().default("DRAFT"),
     approvalStatus: varchar("approvalStatus", { length: 20 }).notNull().default("DRAFT"),
     rejectionReason: text("rejectionReason"),

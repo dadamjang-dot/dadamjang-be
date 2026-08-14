@@ -74,7 +74,7 @@ export class PartnerService {
     const rows = await this.db
       .select({ status: products.status, approvalStatus: products.approvalStatus, count: sql<number>`count(*)` })
       .from(products)
-      .where(eq(products.partnerId, partner.partnerId))
+      .where(and(eq(products.partnerId, partner.partnerId), eq(products.brandId, partner.brandId)))
       .groupBy(products.status, products.approvalStatus);
     const result = { draftCount: 0, pendingCount: 0, rejectedCount: 0, approvedCount: 0, publishedCount: 0 };
     rows.forEach((row) => {
@@ -87,7 +87,10 @@ export class PartnerService {
   listProducts = async (ownerUserId: string, filter: PartnerProductFilterInput) => {
     const partner = await this.approvedPartner(ownerUserId);
     const first = Math.min(Math.max(filter.first ?? 20, 1), 100);
-    const conditions: (SQL | undefined)[] = [eq(products.partnerId, partner.partnerId)];
+    const conditions: (SQL | undefined)[] = [
+      eq(products.partnerId, partner.partnerId),
+      eq(products.brandId, partner.brandId),
+    ];
     if (filter.query?.trim()) conditions.push(ilike(products.title, `%${filter.query.trim()}%`));
     if (filter.categoryId) conditions.push(eq(products.categoryId, filter.categoryId));
     if (filter.state === PartnerProductState.Published) conditions.push(eq(products.status, "PUBLISHED"));
@@ -132,7 +135,13 @@ export class PartnerService {
     const [product] = await this.db
       .select()
       .from(products)
-      .where(and(eq(products.productId, productId), eq(products.partnerId, partner.partnerId)))
+      .where(
+        and(
+          eq(products.productId, productId),
+          eq(products.partnerId, partner.partnerId),
+          eq(products.brandId, partner.brandId),
+        ),
+      )
       .limit(1);
     if (!product) throw new CustomNotFoundException("Product not found");
     return (await this.hydrate(ownerUserId, [product]))[0];
@@ -187,6 +196,7 @@ export class PartnerService {
           and(
             eq(products.productId, productId),
             eq(products.partnerId, partner.partnerId),
+            eq(products.brandId, partner.brandId),
             eq(products.status, "DRAFT"),
             inArray(products.approvalStatus, ["DRAFT", "REJECTED"]),
           ),
@@ -224,6 +234,7 @@ export class PartnerService {
         and(
           eq(products.productId, productId),
           eq(products.partnerId, partner.partnerId),
+          eq(products.brandId, partner.brandId),
           eq(products.status, "DRAFT"),
           eq(products.approvalStatus, from),
         ),
@@ -237,7 +248,7 @@ export class PartnerService {
     const partner = await this.getMine(ownerUserId);
     if (partner.status !== "APPROVED" || !partner.brandId)
       throw new CustomBadRequestException(PartnerErrorMessage.ApprovalRequiredForProduct);
-    return partner;
+    return { ...partner, brandId: partner.brandId };
   };
 
   private validate = async (ownerUserId: string, input: PartnerProductInput) => {
