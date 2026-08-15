@@ -42,17 +42,15 @@ export class FeedService {
       .where(eq(activityEvents.actorUserId, userId))
       .orderBy(desc(activityEvents.createdAt))
       .limit(100);
-    const preferenceProductIds = [
-      ...new Set([
-        ...likedProducts.map((row) => row.productId),
-        ...viewed.filter((row) => row.subjectId.length === 36).map((row) => row.subjectId),
-      ]),
-    ];
-    const preferenceRows = preferenceProductIds.length
+    const preferenceProductIds = new Set(likedProducts.map(({ productId }) => productId));
+    for (const { subjectId } of viewed) {
+      if (subjectId.length === 36) preferenceProductIds.add(subjectId);
+    }
+    const preferenceRows = preferenceProductIds.size
       ? await this.db
           .select({ categoryId: products.categoryId })
           .from(products)
-          .where(inArray(products.productId, preferenceProductIds))
+          .where(inArray(products.productId, [...preferenceProductIds]))
       : [];
     const categoryIds = new Set(preferenceRows.map((row) => row.categoryId));
     const candidates = await this.db

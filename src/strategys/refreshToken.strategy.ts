@@ -19,36 +19,18 @@ const refreshTokenFromRequest = (request: Request) => {
 
 @Injectable()
 export class JwtRefreshTokenStrategy extends PassportStrategy(Strategy, "refresh_token") {
-  /**
-   * refresh token 쿠키 기반 JWT 전략을 설정한다.
-   *
-   * @param configService 환경 설정 서비스
-   * @param authService 인증 서비스
-   */
   constructor(
     private readonly configService: ConfigService,
     private readonly authService: AuthService,
   ) {
     super({
-      jwtFromRequest: ExtractJwt.fromExtractors([
-        (request: Request) => {
-          return refreshTokenFromRequest(request);
-        },
-      ]),
+      jwtFromRequest: ExtractJwt.fromExtractors([refreshTokenFromRequest]),
       secretOrKey: configService.getOrThrow<string>("JWT_REFRESH_TOKEN_SECRET"),
       ignoreExpiration: false,
       passReqToCallback: true,
     } satisfies StrategyOptions);
   }
 
-  /**
-   * refresh token 쿠키와 저장된 해시를 검증하고 payload를 요청 객체에 주입한다.
-   *
-   * @param req 인증 요청 객체
-   * @param payload refresh token payload
-   * @returns refresh token payload
-   * @throws {CustomUnauthorizedException} refresh token이 없거나 저장된 값과 다를 때
-   */
   async validate(req: RefreshRequest, payload: JwtPayload & { deviceId: string }) {
     const refreshToken = refreshTokenFromRequest(req);
 

@@ -291,7 +291,11 @@ export class CatalogService {
         : Promise.resolve<{ brandId: string; name: string; slug: string }[]>([]),
     ]);
     const skuMap = new Map<string, (typeof productSkus.$inferSelect)[]>();
-    skus.forEach((sku) => skuMap.set(sku.productId, [...(skuMap.get(sku.productId) ?? []), sku]));
+    for (const sku of skus) {
+      const productSkuRows = skuMap.get(sku.productId) ?? [];
+      productSkuRows.push(sku);
+      skuMap.set(sku.productId, productSkuRows);
+    }
     const brandById = new Map(brandRows.map((brand) => [brand.brandId, brand]));
     return productRows.map((product) => ({
       ...product,
