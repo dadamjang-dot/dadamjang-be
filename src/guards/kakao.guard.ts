@@ -8,13 +8,6 @@ import { authCookieOptions } from "src/modules/auth/cookie-options";
 
 @Injectable()
 export class KakaoGuard extends AuthGuard("kakao") {
-  /**
-   * 카카오 OAuth state를 생성하거나 콜백 state를 검증한다.
-   *
-   * @param context Nest 실행 컨텍스트
-   * @returns Passport authenticate options
-   * @throws {CustomUnauthorizedException} OAuth state가 일치하지 않을 때
-   */
   getAuthenticateOptions(context: ExecutionContext) {
     const request = context.switchToHttp().getRequest<Request>();
     const response = context.switchToHttp().getResponse<Response>();

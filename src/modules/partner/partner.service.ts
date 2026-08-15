@@ -77,10 +77,10 @@ export class PartnerService {
       .where(and(eq(products.partnerId, partner.partnerId), eq(products.brandId, partner.brandId)))
       .groupBy(products.status, products.approvalStatus);
     const result = { draftCount: 0, pendingCount: 0, rejectedCount: 0, approvedCount: 0, publishedCount: 0 };
-    rows.forEach((row) => {
+    for (const row of rows) {
       const key = `${this.state(row)}Count` as keyof typeof result;
       result[key] += Number(row.count);
-    });
+    }
     return result;
   };
 
