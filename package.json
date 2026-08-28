@@ -13,6 +13,7 @@
     "db:logs": "docker compose logs -f postgres",
     "format": "NODE_OPTIONS='--experimental-strip-types --disable-warning=ExperimentalWarning' prettier --write \"src/**/*.ts\" \"test/**/*.ts\"",
     "migrate": "node --env-file-if-exists=.env -r ts-node/register -r tsconfig-paths/register scripts/migrate.ts",
+    "migrate:prod": "node dist/scripts/migrate.js",
     "start": "nest start",
     "start:dev": "nest start --watch",
     "start:debug": "nest start --debug --watch",

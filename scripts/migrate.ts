@@ -1,5 +1,5 @@
-import { createDatabasePool } from "src/database/connection";
-import { migrate } from "src/database/migrate";
+import { createDatabasePool } from "../src/database/connection";
+import { migrate } from "../src/database/migrate";
 
 const main = async () => {
   const pool = createDatabasePool();
