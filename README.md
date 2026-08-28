@@ -86,6 +86,21 @@ pnpm build
 pnpm test
 ```
 
+## RDS CA 체크섬 교체
+
+Docker 빌드는 `https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem`만 내려받고 고정 SHA-256을 검증합니다. AWS가 번들을 교체하면 빌드가 의도적으로 실패합니다.
+
+공식 URL에서 다시 내려받은 뒤 별도의 신뢰 가능한 환경에서 두 방식의 SHA-256 결과와 인증서 파싱을 확인합니다. 결과가 모두 일치할 때만 Dockerfile과 자동화 계약의 체크섬을 함께 갱신합니다.
+
+```bash
+curl --fail --location https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem --output /tmp/aws-rds-global-bundle.pem
+sha256sum /tmp/aws-rds-global-bundle.pem
+openssl dgst -sha256 /tmp/aws-rds-global-bundle.pem
+openssl crl2pkcs7 -nocrl -certfile /tmp/aws-rds-global-bundle.pem | openssl pkcs7 -print_certs -noout
+echo "<new-sha256>  /tmp/aws-rds-global-bundle.pem" | sha256sum -c -
+docker build --no-cache --tag dadamjang-backend-ca-check .
+```
+
 ## 인증 계약
 
 - FO 이메일 로그인은 `signinFo(email, password)`를 사용합니다. Partner/BO와 구버전용 `signin(userid, password, portal)`은 유지합니다.

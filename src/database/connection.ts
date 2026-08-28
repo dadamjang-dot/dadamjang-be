@@ -1,6 +1,7 @@
 import type { OnApplicationShutdown } from "@nestjs/common";
 import { readFileSync } from "fs";
 import { Pool, type PoolConfig } from "pg";
+import { createSecureContext } from "tls";
 
 type DatabaseMode = "test" | "e2e";
 
@@ -33,9 +34,14 @@ const databaseSsl = (env: NodeJS.ProcessEnv) => {
   try {
     ca = readFileSync(caPath);
   } catch {
-    throw new Error("POSTGRES_SSL_CA_PATH must point to a readable nonempty AWS RDS CA bundle");
+    throw new Error("POSTGRES_SSL_CA_PATH must point to a readable nonempty valid CA bundle");
   }
-  if (!ca.length) throw new Error("POSTGRES_SSL_CA_PATH must point to a readable nonempty AWS RDS CA bundle");
+  if (!ca.length) throw new Error("POSTGRES_SSL_CA_PATH must point to a readable nonempty valid CA bundle");
+  try {
+    createSecureContext({ ca, cert: ca });
+  } catch {
+    throw new Error("POSTGRES_SSL_CA_PATH must point to a readable nonempty valid CA bundle");
+  }
   return { rejectUnauthorized: true, ca };
 };
 
@@ -47,6 +53,7 @@ export const databasePoolConfig = (env: NodeJS.ProcessEnv = process.env): PoolCo
     user: requiredEnv(env, "POSTGRES_USERNAME"),
     password: requiredEnv(env, "POSTGRES_PASSWORD"),
     database: requiredEnv(env, "POSTGRES_DATABASE"),
+    connectionTimeoutMillis: 3000,
     ...(ssl === undefined ? {} : { ssl }),
   };
 };

@@ -16,35 +16,43 @@ const waitForOutput = (child: ChildProcess, output: { value: string }, expected:
     });
   });
 
-const waitForExit = (child: ChildProcess) =>
-  new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
-    child.once("exit", (code, signal) => resolve({ code, signal }));
+const waitForExit = (child: ChildProcess, output: { value: string }) =>
+  new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error(`Timed out waiting for exit: ${output.value}`)), 5_000);
+    child.once("exit", (code, signal) => {
+      clearTimeout(timeout);
+      resolve({ code, signal });
+    });
   });
 
 describe("service shutdown", () => {
-  it("invokes DatabasePool.onApplicationShutdown on SIGTERM", async () => {
-    const child = spawn(
-      process.execPath,
-      ["-r", "ts-node/register", "-r", "tsconfig-paths/register", "test/support/shutdown-app.ts"],
-      { cwd: process.cwd(), env: process.env, stdio: ["ignore", "pipe", "pipe"] },
-    );
-    const output = { value: "" };
-    child.stdout?.on("data", (chunk: Buffer) => {
-      output.value += chunk.toString();
-    });
-    child.stderr?.on("data", (chunk: Buffer) => {
-      output.value += chunk.toString();
-    });
+  it.each(["SIGTERM", "SIGINT"] as const)(
+    "awaits DatabasePool.end on %s",
+    async (signal) => {
+      const child = spawn(
+        process.execPath,
+        ["-r", "ts-node/register", "-r", "tsconfig-paths/register", "test/support/shutdown-app.ts"],
+        { cwd: process.cwd(), env: process.env, stdio: ["ignore", "pipe", "pipe"] },
+      );
+      const output = { value: "" };
+      child.stdout?.on("data", (chunk: Buffer) => {
+        output.value += chunk.toString();
+      });
+      child.stderr?.on("data", (chunk: Buffer) => {
+        output.value += chunk.toString();
+      });
 
-    try {
-      await waitForOutput(child, output, "shutdown-ready");
-      child.kill("SIGTERM");
-      const exit = await waitForExit(child);
+      try {
+        await waitForOutput(child, output, "shutdown-ready");
+        child.kill(signal);
+        const exit = await waitForExit(child, output);
 
-      expect(output.value).toContain("database-pool-shutdown:SIGTERM");
-      expect(exit).toEqual({ code: null, signal: "SIGTERM" });
-    } finally {
-      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
-    }
-  }, 20_000);
+        expect(output.value).toContain("database-pool-ended");
+        expect(exit).toEqual({ code: null, signal });
+      } finally {
+        if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      }
+    },
+    10_000,
+  );
 });

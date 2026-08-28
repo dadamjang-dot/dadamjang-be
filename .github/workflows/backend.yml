@@ -38,7 +38,7 @@ jobs:
       EMAIL_CODE_PEPPER: integration-email-pepper
       CLOUDFLARE_R2_BUCKET: integration-bucket
       CLOUDFLARE_R2_PUBLIC_BASE_URL: http://localhost/r2
-      CLOUDFLARE_IMAGES_TRANSFORM_BASE_URL: http://localhost/images
+      CLOUDFLARE_IMAGES_TRANSFORM_BASE_URL: https://images.example.test/cdn-cgi/image
       CLOUDFLARE_R2_ENDPOINT: http://localhost/r2-api
       CLOUDFLARE_R2_ACCESS_KEY_ID: integration-r2-access
       CLOUDFLARE_R2_SECRET_ACCESS_KEY: integration-r2-secret
@@ -54,5 +54,6 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm lint
       - run: pnpm build
+      - run: docker build --tag dadamjang-backend-ci .
       - run: pnpm test:unit
       - run: pnpm test:integration

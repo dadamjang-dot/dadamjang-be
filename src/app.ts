@@ -25,7 +25,7 @@ const registerHealthRoutes = (app: Awaited<ReturnType<typeof NestFactory.create>
 
 export const createApp = async () => {
   const app = await NestFactory.create(AppModule, { logger: new DatadogLogger() });
-  app.enableShutdownHooks(["SIGTERM"]);
+  app.enableShutdownHooks();
   registerHealthRoutes(app);
   const logger = new Logger("Http");
   app.useGlobalFilters(new SentryGlobalFilter(app.getHttpAdapter()));

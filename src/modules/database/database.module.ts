@@ -11,7 +11,8 @@ export class DatabaseHealth {
   constructor(private readonly pool: DatabasePool) {}
 
   check = async () => {
-    await this.pool.query("SELECT 1");
+    const query = { text: "SELECT 1", query_timeout: 3000 };
+    await this.pool.query(query);
   };
 }
 

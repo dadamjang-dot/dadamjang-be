@@ -1,6 +1,7 @@
 import { mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import path from "path";
+import { rootCertificates } from "tls";
 import { createDatabasePool, databasePoolConfig } from "./connection";
 
 const baseEnv = (nodeEnv: string | undefined = "development"): NodeJS.ProcessEnv => ({
@@ -21,10 +22,10 @@ describe("databasePoolConfig", () => {
     expect(() => databasePoolConfig(baseEnv(nodeEnv))).toThrow("POSTGRES_SSL=true");
   });
 
-  it("loads a nonempty CA with certificate verification in non-local environments", async () => {
+  it("loads a valid built-in root CA with certificate verification in non-local environments", async () => {
     const directory = mkdtempSync(path.join(tmpdir(), "dadamjang-postgres-"));
     const caPath = path.join(directory, "global-bundle.pem");
-    const ca = Buffer.from("AWS RDS CA bundle");
+    const ca = Buffer.from(rootCertificates[0] ?? "");
     writeFileSync(caPath, ca);
 
     try {
@@ -75,6 +76,24 @@ describe("databasePoolConfig", () => {
     }
   });
 
+  it("rejects malformed CA content", () => {
+    const directory = mkdtempSync(path.join(tmpdir(), "dadamjang-postgres-"));
+    const caPath = path.join(directory, "global-bundle.pem");
+    writeFileSync(caPath, "not a certificate");
+
+    try {
+      expect(() =>
+        databasePoolConfig({
+          ...baseEnv("production"),
+          POSTGRES_SSL: "true",
+          POSTGRES_SSL_CA_PATH: caPath,
+        }),
+      ).toThrow("valid CA");
+    } finally {
+      rmSync(directory, { recursive: true });
+    }
+  });
+
   it.each(["POSTGRES_HOST", "POSTGRES_USERNAME", "POSTGRES_PASSWORD", "POSTGRES_DATABASE"])("requires %s", (name) => {
     const env = baseEnv();
     delete env[name];
@@ -91,6 +110,17 @@ describe("databasePoolConfig", () => {
     delete env.POSTGRES_PORT;
 
     expect(databasePoolConfig(env).port).toBe(5432);
+  });
+
+  it("bounds shared pool connections without globally bounding application queries", async () => {
+    const config = databasePoolConfig(baseEnv());
+    const pool = createDatabasePool(baseEnv());
+
+    expect(config.connectionTimeoutMillis).toBe(3000);
+    expect(config).not.toHaveProperty("query_timeout");
+    expect(pool.options.connectionTimeoutMillis).toBe(3000);
+    expect(pool.options).not.toHaveProperty("query_timeout");
+    await pool.end();
   });
 
   it("keeps scoped connection options on the shared pool path", async () => {

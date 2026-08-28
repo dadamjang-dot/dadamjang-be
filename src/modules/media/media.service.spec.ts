@@ -1,4 +1,6 @@
 import { ConfigService } from "@nestjs/config";
+import { readFileSync } from "fs";
+import path from "path";
 import { MediaErrorMessage } from "./media.error";
 import { MediaService } from "./media.service";
 
@@ -25,11 +27,23 @@ describe("MediaService", () => {
     "not-a-url",
     "http://images.example.com/cdn-cgi/image",
     "https://images.example.com/images",
+    "https://images.example.com/prefix/cdn-cgi/image",
+    "https://images.example.com/cdn-cgi/image/cdn-cgi/image",
     "https://images.example.com/cdn-cgi/image/width=640",
     "https://images.example.com/cdn-cgi/image?width=640",
     "https://images.example.com/cdn-cgi/image#fragment",
   ])("rejects invalid transform base %s at startup", (baseUrl) => {
     expect(() => createService(baseUrl)).toThrow("CLOUDFLARE_IMAGES_TRANSFORM_BASE_URL");
+  });
+
+  it("uses a valid HTTPS transform root in backend CI", () => {
+    const workflow = readFileSync(path.join(process.cwd(), ".github/workflows/backend.yml"), "utf8");
+    const baseUrl = /^\s+CLOUDFLARE_IMAGES_TRANSFORM_BASE_URL:\s+(\S+)$/m.exec(workflow)?.[1];
+    const url = new URL(baseUrl ?? "invalid");
+
+    expect(url.protocol).toBe("https:");
+    expect(url.pathname).toBe("/cdn-cgi/image");
+    expect(() => createService(url.toString())).not.toThrow();
   });
 
   it("creates a Cloudflare Images transformation URL without exposing R2 credentials", async () => {
