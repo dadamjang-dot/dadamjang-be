@@ -70,16 +70,16 @@
 - `checkoutCart(input)`은 `idempotencyKey`를 필수로 받습니다.
 - `checkoutIdempotencyKeys`는 `userId + idempotencyKey` unique constraint로 중복 checkout을 막습니다.
 - 같은 key로 재요청하면 저장된 `orderId`의 기존 주문을 반환합니다.
-- 주문 생성, order item 생성, SKU 재고 차감, cart 비우기는 하나의 PostgreSQL transaction에서 처리합니다.
-- SKU 재고 차감은 조건부 update로 수행해 stock이 0 미만이 되지 않게 합니다.
+- 주문 생성, order item 생성, cart 비우기, idempotency 완료는 하나의 PostgreSQL transaction에서 처리합니다.
+- checkout은 현재 SKU 재고를 비예약 availability snapshot으로 확인할 뿐 재고를 예약하거나 차감하지 않습니다. 주문은 `PAYMENT_PENDING`으로 생성되고 SKU stock은 그대로 유지됩니다.
 - 재사용된 checkout 요청은 `CHECKOUT_IDEMPOTENCY_REUSED` activity event로 기록합니다.
 
 측정 기준:
 
 - 중복 checkout 요청 수
 - idempotency 재사용 처리 수
-- 재고 차감 실패율
-- oversell 재현 수
+- checkout 시점 재고 부족 거부 수
+- `PAYMENT_PENDING` 주문 생성 수
 - checkout mutation p95
 - 주문 생성 후 장바구니 cache 불일치 수
 
@@ -133,7 +133,7 @@ docker build --no-cache --tag dadamjang-backend-ca-check .
 - FO 이메일 로그인은 `signinFo(email, password)`를 사용합니다. Partner/BO와 구버전용 `signin(userid, password, portal)`은 유지합니다.
 - access token은 `Authorization: Bearer <accessToken>` 또는 cookie를 지원합니다.
 - refresh token은 native 앱을 위해 `Authorization: Bearer <refreshToken>`도 지원합니다.
-- Kakao callback deep link에는 token 대신 10분 만료 일회용 `flowId`만 포함합니다.
+- Kakao callback deep link에는 10분 만료 `flowId`와 opaque 일회용 `callbackToken`이 포함됩니다. `callbackToken`은 hash만 저장되며 시작 device에 귀속되어 한 번만 소비됩니다.
 - 가입 본인확인 proof는 purpose와 device에 귀속되며 10분 만료·1회 소비됩니다.
 - KG이니시스 결과는 허용된 결과 URL에서 서버 간 조회한 뒤 CI와 생년월일을 복호화합니다. CI는 `IDENTITY_CI_PEPPER`로 HMAC 처리하고 원문 개인정보는 저장하지 않습니다.
 - `IDENTITY_VERIFICATION_MOCK_ENABLED=true`는 production 외 로컬 환경에서만 사용할 수 있습니다.
