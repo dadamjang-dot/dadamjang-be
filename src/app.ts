@@ -7,9 +7,26 @@ import type { NextFunction, Request, Response } from "express";
 import passport from "passport";
 import { DatadogLogger } from "src/common/logging/datadog-logger";
 import { AppModule } from "src/modules/app.module";
+import { DatabaseHealth } from "src/modules/database/database.module";
+
+const registerHealthRoutes = (app: Awaited<ReturnType<typeof NestFactory.create>>) => {
+  const health = app.get(DatabaseHealth);
+  const http = app.getHttpAdapter();
+  http.get("/health/live", (_req: Request, res: Response) => res.status(200).json({ status: "ok" }));
+  http.get("/health/ready", async (_req: Request, res: Response) => {
+    try {
+      await health.check();
+      res.status(200).json({ status: "ok" });
+    } catch {
+      res.status(503).json({ status: "unavailable" });
+    }
+  });
+};
 
 export const createApp = async () => {
   const app = await NestFactory.create(AppModule, { logger: new DatadogLogger() });
+  app.enableShutdownHooks(["SIGTERM"]);
+  registerHealthRoutes(app);
   const logger = new Logger("Http");
   app.useGlobalFilters(new SentryGlobalFilter(app.getHttpAdapter()));
   app

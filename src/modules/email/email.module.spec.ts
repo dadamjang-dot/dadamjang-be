@@ -1,5 +1,6 @@
 import { ConfigModule } from "@nestjs/config";
 import { Test, type TestingModule } from "@nestjs/testing";
+import { DatabasePool } from "src/database/connection";
 import { DatabaseModule } from "src/modules/database/database.module";
 import { EmailModule } from "./email.module";
 
@@ -60,7 +61,10 @@ describe("EmailModule", () => {
     try {
       module = await Test.createTestingModule({
         imports: [ConfigModule.forRoot({ isGlobal: true, ignoreEnvFile: true }), DatabaseModule, EmailModule],
-      }).compile();
+      })
+        .overrideProvider(DatabasePool)
+        .useValue({})
+        .compile();
     } catch (error) {
       startupError = error;
     } finally {

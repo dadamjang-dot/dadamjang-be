@@ -1,15 +1,17 @@
-import { Global, Module, OnApplicationShutdown } from "@nestjs/common";
-import { ConfigService } from "@nestjs/config";
+import { Global, Injectable, Module } from "@nestjs/common";
 import { drizzle } from "drizzle-orm/node-postgres";
-import { Pool } from "pg";
+import { createDatabasePool, DatabasePool } from "src/database/connection";
 import * as schema from "./schema";
 
 export const DRIZZLE = Symbol("DRIZZLE");
 export type Database = ReturnType<typeof drizzle<typeof schema>>;
 
-class DatabasePool extends Pool implements OnApplicationShutdown {
-  onApplicationShutdown = async () => {
-    await this.end();
+@Injectable()
+export class DatabaseHealth {
+  constructor(private readonly pool: DatabasePool) {}
+
+  check = async () => {
+    await this.pool.query("SELECT 1");
   };
 }
 
@@ -18,23 +20,15 @@ class DatabasePool extends Pool implements OnApplicationShutdown {
   providers: [
     {
       provide: DatabasePool,
-      inject: [ConfigService],
-      useFactory: (configService: ConfigService) => {
-        return new DatabasePool({
-          host: configService.get<string>("POSTGRES_HOST"),
-          port: Number(configService.get<string>("POSTGRES_PORT")),
-          user: configService.get<string>("POSTGRES_USERNAME"),
-          password: configService.get<string>("POSTGRES_PASSWORD"),
-          database: configService.get<string>("POSTGRES_DATABASE"),
-        });
-      },
+      useFactory: createDatabasePool,
     },
+    DatabaseHealth,
     {
       provide: DRIZZLE,
       inject: [DatabasePool],
       useFactory: (pool: DatabasePool) => drizzle(pool, { schema }),
     },
   ],
-  exports: [DRIZZLE],
+  exports: [DRIZZLE, DatabaseHealth],
 })
 export class DatabaseModule {}

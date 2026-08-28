@@ -1,19 +1,12 @@
 import { Pool, type PoolClient } from "pg";
+import { createDatabasePool } from "src/database/connection";
 import { seedMigrationPrerequisite } from "src/database/fixtures";
 import { migrate } from "src/database/migrate";
 import { testPool } from "./support/database";
 
 const SCHEMA_NAME = "catalog_migration_safety_test";
 
-const scopedPool = () =>
-  new Pool({
-    host: process.env.POSTGRES_HOST,
-    port: Number(process.env.POSTGRES_PORT),
-    user: process.env.POSTGRES_USERNAME,
-    password: process.env.POSTGRES_PASSWORD,
-    database: process.env.POSTGRES_DATABASE,
-    options: `-c search_path=${SCHEMA_NAME},public`,
-  });
+const scopedPool = () => createDatabasePool(process.env, `-c search_path=${SCHEMA_NAME},public`);
 
 const wait = (milliseconds: number) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 

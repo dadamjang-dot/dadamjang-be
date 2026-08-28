@@ -2,11 +2,11 @@ import { ConfigService } from "@nestjs/config";
 import { MediaErrorMessage } from "./media.error";
 import { MediaService } from "./media.service";
 
-const createService = () => {
+const createService = (imageTransformBaseUrl: string = "https://images.example.com/cdn-cgi/image/") => {
   const values: Record<string, string> = {
     CLOUDFLARE_R2_BUCKET: "dadamjang-staging-images",
     CLOUDFLARE_R2_PUBLIC_BASE_URL: "https://images.example.com/",
-    CLOUDFLARE_IMAGES_TRANSFORM_BASE_URL: "https://images.example.com/cdn-cgi/image/",
+    CLOUDFLARE_IMAGES_TRANSFORM_BASE_URL: imageTransformBaseUrl,
     CLOUDFLARE_R2_ENDPOINT: "https://account.r2.cloudflarestorage.com",
     CLOUDFLARE_R2_ACCESS_KEY_ID: "key",
     CLOUDFLARE_R2_SECRET_ACCESS_KEY: "secret",
@@ -21,6 +21,17 @@ const validProductKey = "products/00000000-0000-4000-8000-000000000001/00000000-
 const ownerUserId = "00000000-0000-4000-8000-000000000001";
 
 describe("MediaService", () => {
+  it.each([
+    "not-a-url",
+    "http://images.example.com/cdn-cgi/image",
+    "https://images.example.com/images",
+    "https://images.example.com/cdn-cgi/image/width=640",
+    "https://images.example.com/cdn-cgi/image?width=640",
+    "https://images.example.com/cdn-cgi/image#fragment",
+  ])("rejects invalid transform base %s at startup", (baseUrl) => {
+    expect(() => createService(baseUrl)).toThrow("CLOUDFLARE_IMAGES_TRANSFORM_BASE_URL");
+  });
+
   it("creates a Cloudflare Images transformation URL without exposing R2 credentials", async () => {
     const service = createService();
 

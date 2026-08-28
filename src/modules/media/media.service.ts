@@ -20,6 +20,20 @@ import type {
   ProductImageUploadTarget,
 } from "./media.types";
 
+const imageTransformBaseUrl = (value: string) => {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error("CLOUDFLARE_IMAGES_TRANSFORM_BASE_URL must be a valid HTTPS URL ending in /cdn-cgi/image");
+  }
+  const pathname = url.pathname.replace(/\/+$/, "");
+  if (url.protocol !== "https:" || !pathname.endsWith("/cdn-cgi/image") || url.search || url.hash)
+    throw new Error("CLOUDFLARE_IMAGES_TRANSFORM_BASE_URL must be a valid HTTPS URL ending in /cdn-cgi/image");
+  url.pathname = pathname;
+  return url.toString();
+};
+
 @Injectable()
 export class MediaService {
   private readonly client: S3Client;
@@ -30,9 +44,9 @@ export class MediaService {
   constructor(configService: ConfigService) {
     this.bucket = configService.getOrThrow<string>("CLOUDFLARE_R2_BUCKET");
     this.publicBaseUrl = configService.getOrThrow<string>("CLOUDFLARE_R2_PUBLIC_BASE_URL").replace(/\/$/, "");
-    this.imageTransformBaseUrl = configService
-      .getOrThrow<string>("CLOUDFLARE_IMAGES_TRANSFORM_BASE_URL")
-      .replace(/\/$/, "");
+    this.imageTransformBaseUrl = imageTransformBaseUrl(
+      configService.getOrThrow<string>("CLOUDFLARE_IMAGES_TRANSFORM_BASE_URL"),
+    );
     this.client = new S3Client({
       region: "auto",
       endpoint: configService.getOrThrow<string>("CLOUDFLARE_R2_ENDPOINT"),
