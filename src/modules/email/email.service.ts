@@ -55,7 +55,8 @@ export class EmailService {
       await this.sender.sendCode(normalizedEmail, code);
     } catch {
       await this.repository.deleteVerification(verification.id);
-      throw new CustomServiceUnavailableException(EmailErrorMessage.EmailSendFailed);
+      if (purpose === EmailVerificationPurpose.Signup)
+        throw new CustomServiceUnavailableException(EmailErrorMessage.EmailSendFailed);
     }
     return { ok: true };
   };
@@ -158,7 +159,6 @@ export class EmailService {
       );
     } catch {
       await this.repository.deletePasswordResetToken(token);
-      throw new CustomServiceUnavailableException(EmailErrorMessage.EmailSendFailed);
     }
   };
   private pepperedCode = (email: string, code: string, purpose: EmailVerificationPurposeValue) =>

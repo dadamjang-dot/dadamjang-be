@@ -96,20 +96,75 @@ describe("EmailService", () => {
     expect(repository.latestVerification).not.toHaveBeenCalled();
   });
 
-  it("removes an undelivered password reset token", async () => {
+  it("conceals password reset code delivery failures and removes the undelivered proof", async () => {
+    const deleteVerification = jest.fn().mockResolvedValue(undefined);
+    const knownRepository = {
+      findUserByEmail: jest.fn().mockResolvedValue({ userId: "user-id", email: "user@example.test" }),
+      createVerification: jest.fn().mockResolvedValue({ id: "verification-id" }),
+      deleteVerification,
+    } as unknown as EmailRepository;
+    const failingSender = {
+      sendCode: jest.fn().mockRejectedValue(new Error("delivery failed")),
+    } as unknown as EmailSender;
+    const unknownRepository = {
+      findUserByEmail: jest.fn().mockResolvedValue(undefined),
+    } as unknown as EmailRepository;
+    const unusedSender = { sendCode: jest.fn() } as unknown as EmailSender;
+    const knownService = new EmailService(knownRepository, config, failingSender, allow());
+    const unknownService = new EmailService(unknownRepository, config, unusedSender, allow());
+
+    const [known, unknown] = await Promise.all([
+      knownService.requestPasswordResetCode("user@example.test", { ip: "127.0.0.1" }),
+      unknownService.requestPasswordResetCode("unknown@example.test", { ip: "127.0.0.2" }),
+    ]);
+
+    expect(known).toEqual({ ok: true });
+    expect(known).toEqual(unknown);
+    expect(deleteVerification).toHaveBeenCalledWith("verification-id");
+    expect(unusedSender.sendCode).not.toHaveBeenCalled();
+  });
+
+  it("conceals password reset link delivery failures and removes the undelivered token", async () => {
     const deletePasswordResetToken = jest.fn().mockResolvedValue(undefined);
-    const repository = {
+    const knownRepository = {
       findUserByEmail: jest.fn().mockResolvedValue({ userId: "user-id", email: "user@example.test" }),
       createPasswordResetToken: jest.fn().mockResolvedValue(undefined),
       deletePasswordResetToken,
     } as unknown as EmailRepository;
-    const sender = { sendLink: jest.fn().mockRejectedValue(new Error("delivery failed")) } as unknown as EmailSender;
+    const failingSender = {
+      sendLink: jest.fn().mockRejectedValue(new Error("delivery failed")),
+    } as unknown as EmailSender;
+    const unknownRepository = {
+      findUserByEmail: jest.fn().mockResolvedValue(undefined),
+    } as unknown as EmailRepository;
+    const unusedSender = { sendLink: jest.fn() } as unknown as EmailSender;
+    const knownService = new EmailService(knownRepository, config, failingSender, allow());
+    const unknownService = new EmailService(unknownRepository, config, unusedSender, allow());
+
+    const [known, unknown] = await Promise.all([
+      knownService.requestPasswordReset("user@example.test", { ip: "127.0.0.1" }),
+      unknownService.requestPasswordReset("unknown@example.test", { ip: "127.0.0.2" }),
+    ]);
+
+    expect(known).toEqual({ ok: true });
+    expect(known).toEqual(unknown);
+    expect(deletePasswordResetToken).toHaveBeenCalledWith(expect.any(String));
+    expect(unusedSender.sendLink).not.toHaveBeenCalled();
+  });
+
+  it("keeps signup delivery failures observable after cleaning the proof", async () => {
+    const deleteVerification = jest.fn().mockResolvedValue(undefined);
+    const repository = {
+      createVerification: jest.fn().mockResolvedValue({ id: "verification-id" }),
+      deleteVerification,
+    } as unknown as EmailRepository;
+    const sender = { sendCode: jest.fn().mockRejectedValue(new Error("delivery failed")) } as unknown as EmailSender;
     const service = new EmailService(repository, config, sender, allow());
 
-    await expect(service.requestPasswordReset("user@example.test", { ip: "127.0.0.1" })).rejects.toThrow(
+    await expect(service.requestSignupCode("user@example.test", { ip: "127.0.0.1" })).rejects.toThrow(
       "이메일 발송에 실패했습니다.",
     );
-    expect(deletePasswordResetToken).toHaveBeenCalledWith(expect.any(String));
+    expect(deleteVerification).toHaveBeenCalledWith("verification-id");
   });
 
   it("rejects an unknown recovery proof before password mutation", async () => {
