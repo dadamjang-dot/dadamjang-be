@@ -20,24 +20,38 @@ const HISTORICAL_MIGRATIONS = [
   "0004_catalog_filters.sql",
   RETIRED_DEMO_MIGRATION.name,
 ] as const;
-const CURRENT_MIGRATIONS = [
-  ...HISTORICAL_MIGRATIONS,
-  "0006_assign_demo_product_categories.sql",
-  "0007_style_posts_feed.sql",
-  "0008_style_post_like_snapshots.sql",
-  "0009_wish_library_collections.sql",
-  "0010_auth_account_recovery.sql",
-  "0011_admin_backoffice.sql",
-  "0012_partner_catalog_portal.sql",
-  "0013_partner_product_image_keys_array.sql",
-  "0014_partner_catalog_integrity.sql",
-  "0015_catalog_keyset_indexes.sql",
-] as const;
 
-const databasePool = (database: string) =>
-  createDatabasePool({ ...process.env, POSTGRES_DATABASE: database });
+type MigrationArtifact = {
+  readonly checksum: string;
+  readonly name: string;
+  readonly retired: boolean;
+};
+
+const databasePool = (database: string) => createDatabasePool({ ...process.env, POSTGRES_DATABASE: database });
 
 const sha256 = (value: string) => createHash("sha256").update(value).digest("hex");
+
+const readMigrationArtifacts = async (rootDirectory = process.cwd()): Promise<MigrationArtifact[]> => {
+  const artifacts = (
+    await Promise.all(
+      [
+        { directory: "migrations", retired: false },
+        { directory: "retired-migrations", retired: true },
+      ].map(async ({ directory, retired }) =>
+        Promise.all(
+          (await fs.readdir(path.join(rootDirectory, directory)))
+            .filter((name) => name.endsWith(".sql"))
+            .map(async (name) => ({
+              checksum: sha256(await fs.readFile(path.join(rootDirectory, directory, name), "utf8")),
+              name,
+              retired,
+            })),
+        ),
+      ),
+    )
+  ).flat();
+  return artifacts.sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
+};
 
 const historicalMigrationPath = (name: string) =>
   path.join(process.cwd(), name === RETIRED_DEMO_MIGRATION.name ? "retired-migrations" : "migrations", name);
@@ -101,6 +115,30 @@ const seedHistoricalMigration = async (pool: Pool) => {
 
 const wait = (milliseconds: number) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
+const closePool = async (pool: Pool) => {
+  const openClients = pool.totalCount;
+  if (!openClients) {
+    await pool.end();
+    return;
+  }
+  let removedClients = 0;
+  let resolveClosed: () => void = () => undefined;
+  const clientsClosed = new Promise<void>((resolve) => {
+    resolveClosed = resolve;
+  });
+  const handleRemove = () => {
+    removedClients += 1;
+    if (removedClients === openClients) resolveClosed();
+  };
+  pool.on("remove", handleRemove);
+  try {
+    await pool.end();
+    await clientsClosed;
+  } finally {
+    pool.off("remove", handleRemove);
+  }
+};
+
 const waitForAdvisoryLock = async (pool: Pool) => {
   for (let attempt = 0; attempt < 100; attempt += 1) {
     const waiting = await pool.query<{ count: string }>(
@@ -129,8 +167,8 @@ describe("database migration PostgreSQL integration", () => {
   });
 
   afterEach(async () => {
-    await migrationPool.end();
-    await adminPool.query(`DROP DATABASE IF EXISTS "${DATABASE_NAME}" WITH (FORCE)`);
+    await closePool(migrationPool);
+    await adminPool.query(`DROP DATABASE IF EXISTS "${DATABASE_NAME}"`);
     await adminPool.end();
   });
 
@@ -150,14 +188,34 @@ describe("database migration PostgreSQL integration", () => {
     expect(extensions.rows).toEqual([{ extname: "pgcrypto" }]);
   });
 
-  it("records the retired migration checksum in a clean journal", async () => {
-    await migrate({ pool: migrationPool });
+  it("records artifact checksums in deterministic order and tombstones the retired migration", async () => {
+    const artifacts = await readMigrationArtifacts();
+    const executed: string[] = [];
+
+    await migrate({
+      pool: migrationPool,
+      beforeMigration: async (name, pool) => {
+        const artifactIndex = artifacts.findIndex((artifact) => artifact.name === name);
+        const applied = await pool.query<{ name: string }>(`SELECT "name" FROM "_migrations" ORDER BY "name"`);
+        expect(artifactIndex).toBeGreaterThanOrEqual(0);
+        expect(applied.rows.map((row) => row.name)).toEqual(
+          artifacts.slice(0, artifactIndex).map((artifact) => artifact.name),
+        );
+        executed.push(name);
+      },
+    });
 
     const journal = await migrationPool.query<{ name: string; checksum: string }>(
       `SELECT "name", "checksum" FROM "_migrations" ORDER BY "name"`,
     );
 
-    expect(journal.rows.map(({ name }) => name)).toEqual(CURRENT_MIGRATIONS);
+    expect(executed).toEqual(artifacts.filter(({ retired }) => !retired).map(({ name }) => name));
+    expect(executed).not.toContain(RETIRED_DEMO_MIGRATION.name);
+    expect(journal.rows).toEqual(artifacts.map(({ name, checksum }) => ({ name, checksum })));
+    expect(artifacts.find(({ name }) => name === RETIRED_DEMO_MIGRATION.name)).toEqual({
+      ...RETIRED_DEMO_MIGRATION,
+      retired: true,
+    });
     expect(journal.rows.find(({ name }) => name === RETIRED_DEMO_MIGRATION.name)).toEqual(RETIRED_DEMO_MIGRATION);
   });
 
@@ -234,7 +292,59 @@ describe("database migration PostgreSQL integration", () => {
     }
   });
 
+  it("accepts a legitimate next migration and still rejects its checksum mutation", async () => {
+    const originalDirectory = process.cwd();
+    const temporaryDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "dadamjang-future-migration-"));
+    const currentArtifacts = await readMigrationArtifacts(originalDirectory);
+    const nextNumber = Math.max(...currentArtifacts.map(({ name }) => Number.parseInt(name, 10))) + 1;
+    const nextName = `${String(nextNumber).padStart(4, "0")}_future_migration_probe.sql`;
+    const nextSql = 'CREATE TABLE "futureMigrationProbe" ("id" integer PRIMARY KEY);\n';
+    try {
+      await fs.cp(path.join(originalDirectory, "migrations"), path.join(temporaryDirectory, "migrations"), {
+        recursive: true,
+      });
+      await fs.cp(
+        path.join(originalDirectory, "retired-migrations"),
+        path.join(temporaryDirectory, "retired-migrations"),
+        { recursive: true },
+      );
+      await fs.writeFile(path.join(temporaryDirectory, "migrations", nextName), nextSql);
+      process.chdir(temporaryDirectory);
+      const artifacts = await readMigrationArtifacts(temporaryDirectory);
+      const executed: string[] = [];
+
+      await migrate({
+        pool: migrationPool,
+        beforeMigration: async (name) => {
+          executed.push(name);
+        },
+      });
+
+      const journal = await migrationPool.query<{ name: string; checksum: string }>(
+        `SELECT "name", "checksum" FROM "_migrations" ORDER BY "name"`,
+      );
+      expect(executed).toEqual(artifacts.filter(({ retired }) => !retired).map(({ name }) => name));
+      expect(journal.rows).toEqual(artifacts.map(({ name, checksum }) => ({ name, checksum })));
+      expect(journal.rows[journal.rows.length - 1]).toEqual({ name: nextName, checksum: sha256(nextSql) });
+      await expect(migrationPool.query(`SELECT to_regclass('"futureMigrationProbe"') AS table`)).resolves.toEqual(
+        expect.objectContaining({ rows: [{ table: '"futureMigrationProbe"' }] }),
+      );
+
+      await migrate({ pool: migrationPool });
+      await fs.appendFile(path.join(temporaryDirectory, "migrations", nextName), "SELECT 1;\n");
+      await expect(migrate({ pool: migrationPool })).rejects.toThrow(`migration checksum changed: ${nextName}`);
+      const unchangedJournal = await migrationPool.query<{ name: string; checksum: string }>(
+        `SELECT "name", "checksum" FROM "_migrations" ORDER BY "name"`,
+      );
+      expect(unchangedJournal.rows).toEqual(journal.rows);
+    } finally {
+      process.chdir(originalDirectory);
+      await fs.rm(temporaryDirectory, { recursive: true, force: true });
+    }
+  });
+
   it("serializes concurrent runners and preserves an idempotent journal rerun", async () => {
+    const expectedJournal = (await readMigrationArtifacts()).map(({ name, checksum }) => ({ name, checksum }));
     let releaseFirst: () => void = () => undefined;
     let reachedFirst: () => void = () => undefined;
     const firstPaused = new Promise<void>((resolve) => {
@@ -282,7 +392,7 @@ describe("database migration PostgreSQL integration", () => {
     const rerunJournal = await migrationPool.query<{ name: string; checksum: string }>(
       `SELECT "name", "checksum" FROM "_migrations" ORDER BY "name"`,
     );
-    expect(firstJournal.rows).toHaveLength(16);
+    expect(firstJournal.rows).toEqual(expectedJournal);
     expect(rerunJournal.rows).toEqual(firstJournal.rows);
   });
 
