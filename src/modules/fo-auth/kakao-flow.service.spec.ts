@@ -1,6 +1,7 @@
 import { ConfigService } from "@nestjs/config";
 import { hashToken } from "src/common/security/token-hash";
 import { UserRole } from "src/auth/role";
+import { AdmissionLimiter, type RequestOrigin } from "src/modules/admission/admission-limiter";
 import { AuthService } from "src/modules/auth/auth.service";
 import { EmailService } from "src/modules/email/email.service";
 import { InvalidFoAuthProofError } from "./fo-auth.error";
@@ -57,11 +58,47 @@ const createService = () => {
       {} as FoAuthService,
       { normalizeEmail: (email: string) => email } as EmailService,
       {} as ConfigService,
+      { assertAllowed: jest.fn().mockResolvedValue(undefined) } as unknown as AdmissionLimiter,
     ),
   };
 };
 
 describe("KakaoFlowService", () => {
+  it("does not persist a flow when start admission is rejected", async () => {
+    let inserts = 0;
+    const repository = {
+      createFlow: async () => {
+        inserts += 1;
+        return { flowId: "flow-id" };
+      },
+    } as unknown as KakaoFlowRepository;
+    const admissionLimiter = {
+      assertAllowed: async () => {
+        throw new Error("admission rejected");
+      },
+    } as unknown as AdmissionLimiter;
+    const Service = KakaoFlowService as unknown as new (
+      repository: KakaoFlowRepository,
+      authService: AuthService,
+      foAuthService: FoAuthService,
+      emailService: EmailService,
+      configService: ConfigService,
+      admissionLimiter: AdmissionLimiter,
+    ) => KakaoFlowService;
+    const service = new Service(
+      repository,
+      {} as AuthService,
+      {} as FoAuthService,
+      {} as EmailService,
+      { get: () => undefined } as unknown as ConfigService,
+      admissionLimiter,
+    );
+    const start = service.start as unknown as (deviceId: string, origin: RequestOrigin) => Promise<object>;
+
+    await expect(start("device-1", { ip: "203.0.113.10", deviceId: "device-1" })).rejects.toThrow("admission rejected");
+    expect(inserts).toBe(0);
+  });
+
   it("persists only a callback-token hash and returns the plaintext once", async () => {
     const { repository, service } = createService();
 

@@ -6,6 +6,7 @@ import { CustomBadRequestException, CustomUnauthorizedException } from "src/comm
 import { hasDatabaseErrorCode } from "src/common/errors/database-error";
 import { hashToken } from "src/common/security/token-hash";
 import { UserRole } from "src/auth/role";
+import { AdmissionLimiter, type RequestOrigin } from "src/modules/admission/admission-limiter";
 import type { KakaoProfile } from "src/modules/auth/auth.types";
 import { AuthService } from "src/modules/auth/auth.service";
 import { EmailService } from "src/modules/email/email.service";
@@ -22,9 +23,18 @@ export class KakaoFlowService {
     private readonly foAuthService: FoAuthService,
     private readonly emailService: EmailService,
     private readonly configService: ConfigService,
+    private readonly admissionLimiter: AdmissionLimiter,
   ) {}
 
-  start = async (deviceId: string) => {
+  start = async (deviceId: string, origin: RequestOrigin) => {
+    await this.admissionLimiter.assertAllowed(
+      "KAKAO_LOGIN_START",
+      [
+        { scopeType: "start-ip", value: origin.ip, limit: 20, windowMs: 15 * 60_000 },
+        { scopeType: "start-device", value: deviceId, limit: 20, windowMs: 15 * 60_000 },
+      ],
+      "카카오 로그인 요청 횟수를 초과했습니다.",
+    );
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
     const flow = await this.repository.createFlow(hashToken(deviceId), expiresAt);
     if (!flow) throw new CustomBadRequestException("카카오 로그인 흐름을 만들지 못했습니다.");
@@ -34,7 +44,7 @@ export class KakaoFlowService {
     return {
       flowId: flow.flowId,
       authUrl: `${apiBaseUrl}/api/auth/kakao?flowId=${encodeURIComponent(flow.flowId)}`,
-      expiresAt,
+      expiresAt: flow.expiresAt,
     };
   };
 

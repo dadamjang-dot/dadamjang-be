@@ -1,5 +1,5 @@
 import { Inject, Injectable } from "@nestjs/common";
-import { and, eq, gt, inArray, isNull, ne, sql } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, isNull, ne, sql } from "drizzle-orm";
 import { hashToken } from "src/common/security/token-hash";
 import type { RefreshTokenStore } from "src/modules/auth/auth.repository";
 import type { TokenPayload } from "src/modules/auth/auth.types";
@@ -37,8 +37,36 @@ type IssueTokens = (user: User, store: RefreshTokenStore) => Promise<TokenPayloa
 export class KakaoFlowRepository {
   constructor(@Inject(DRIZZLE) private readonly db: Database) {}
 
-  createFlow = async (deviceIdHash: string, expiresAt: Date) =>
-    (await this.db.insert(kakaoLoginFlows).values({ deviceIdHash, expiresAt }).returning())[0];
+  createFlow = (deviceIdHash: string, expiresAt: Date) =>
+    this.db.transaction(async (tx) => {
+      const now = new Date();
+      await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${deviceIdHash}, 3))`);
+      const [existing] = await tx
+        .select()
+        .from(kakaoLoginFlows)
+        .where(
+          and(
+            eq(kakaoLoginFlows.deviceIdHash, deviceIdHash),
+            eq(kakaoLoginFlows.status, "PENDING"),
+            isNull(kakaoLoginFlows.consumedAt),
+            gt(kakaoLoginFlows.expiresAt, now),
+          ),
+        )
+        .orderBy(desc(kakaoLoginFlows.createdAt))
+        .limit(1);
+      if (existing) return existing;
+      await tx.execute(sql`
+        DELETE FROM "kakaoLoginFlows"
+        WHERE ctid IN (
+          SELECT ctid
+          FROM "kakaoLoginFlows"
+          WHERE "expiresAt" <= ${now} OR "consumedAt" IS NOT NULL
+          ORDER BY "expiresAt"
+          LIMIT 100
+        )
+      `);
+      return (await tx.insert(kakaoLoginFlows).values({ deviceIdHash, expiresAt }).returning())[0];
+    });
 
   acceptCallback = async (
     flowId: string,

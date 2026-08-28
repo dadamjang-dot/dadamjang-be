@@ -382,6 +382,85 @@ describe("FO auth GraphQL integration", () => {
     expect(rejected?.body.errors[0].message).toBe("카카오 로그인 흐름이 유효하지 않습니다.");
   });
 
+  it("converges repeated anonymous starts onto one current row per device and purpose", async () => {
+    const kakaoStart = () =>
+      request(app.getHttpServer()).post("/graphql").set("x-device-id", "bounded-kakao-device").send({
+        query: `mutation { startKakaoLogin { flowId } }`,
+      });
+    const identityStart = () =>
+      request(app.getHttpServer())
+        .post("/graphql")
+        .set("x-device-id", "bounded-identity-device")
+        .send({
+          query: `mutation Start($input: StartIdentityVerificationInput!) {
+          startIdentityVerification(input: $input) { sessionId }
+        }`,
+          variables: { input: { purpose: "SIGNUP", provider: "KAKAO" } },
+        });
+
+    const [firstKakao, secondKakao, firstIdentity, secondIdentity] = await Promise.all([
+      kakaoStart(),
+      kakaoStart(),
+      identityStart(),
+      identityStart(),
+    ]);
+
+    expect(secondKakao.body.data.startKakaoLogin.flowId).toBe(firstKakao.body.data.startKakaoLogin.flowId);
+    expect(secondIdentity.body.data.startIdentityVerification.sessionId).toBe(
+      firstIdentity.body.data.startIdentityVerification.sessionId,
+    );
+    const rows = await pool.query<{ identity: number; kakao: number }>(
+      `SELECT
+        (SELECT count(*)::int FROM "kakaoLoginFlows" WHERE "deviceIdHash" = $1) AS kakao,
+        (SELECT count(*)::int FROM "identityVerificationSessions" WHERE "deviceIdHash" = $2) AS identity`,
+      [hashToken("bounded-kakao-device"), hashToken("bounded-identity-device")],
+    );
+    expect(rows.rows[0]).toEqual({ identity: 1, kakao: 1 });
+  });
+
+  it("deletes at most 100 expired or consumed anonymous start rows before insertion", async () => {
+    await pool.query(
+      `INSERT INTO "kakaoLoginFlows" ("deviceIdHash", "expiresAt", "consumedAt")
+       SELECT 'retired-kakao-' || value,
+         CASE WHEN value <= 51 THEN now() - interval '1 minute' ELSE now() + interval '10 minutes' END,
+         CASE WHEN value > 51 THEN now() ELSE NULL END
+       FROM generate_series(1, 102) AS value`,
+    );
+    await pool.query(
+      `INSERT INTO "identityVerificationSessions"
+        ("purpose", "provider", "deviceIdHash", "merchantTransactionId", "expiresAt", "consumedAt")
+       SELECT 'SIGNUP', 'KAKAO', 'retired-identity-' || value, 'cleanup-' || lpad(value::text, 3, '0'),
+         CASE WHEN value <= 51 THEN now() - interval '1 minute' ELSE now() + interval '10 minutes' END,
+         CASE WHEN value > 51 THEN now() ELSE NULL END
+       FROM generate_series(1, 102) AS value`,
+    );
+
+    const kakao = await request(app.getHttpServer())
+      .post("/graphql")
+      .set("x-device-id", "cleanup-kakao-device")
+      .send({ query: `mutation { startKakaoLogin { flowId } }` });
+    const identity = await request(app.getHttpServer())
+      .post("/graphql")
+      .set("x-device-id", "cleanup-identity-device")
+      .send({
+        query: `mutation Start($input: StartIdentityVerificationInput!) {
+          startIdentityVerification(input: $input) { sessionId }
+        }`,
+        variables: { input: { purpose: "SIGNUP", provider: "KAKAO" } },
+      });
+
+    expect(kakao.body.errors).toBeUndefined();
+    expect(identity.body.errors).toBeUndefined();
+    const rows = await pool.query<{ identity: number; kakao: number }>(
+      `SELECT
+        (SELECT count(*)::int FROM "kakaoLoginFlows"
+          WHERE "expiresAt" <= now() OR "consumedAt" IS NOT NULL) AS kakao,
+        (SELECT count(*)::int FROM "identityVerificationSessions"
+          WHERE "expiresAt" <= now() OR "consumedAt" IS NOT NULL) AS identity`,
+    );
+    expect(rows.rows[0]).toEqual({ identity: 2, kakao: 2 });
+  });
+
   it("allows only one active Kakao flow per device session", async () => {
     const deviceId = "kakao-concurrent-flow-device";
     const flowIds = ["d0000000-0000-4000-8000-000000000003", "d0000000-0000-4000-8000-000000000004"];

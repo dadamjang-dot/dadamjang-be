@@ -3,6 +3,7 @@ import { ConfigService } from "@nestjs/config";
 import { createHmac, randomBytes } from "crypto";
 import { CustomBadRequestException, CustomUnauthorizedException } from "src/common/errors/custom-exceptions";
 import { hashToken } from "src/common/security/token-hash";
+import { AdmissionLimiter, type RequestOrigin } from "src/modules/admission/admission-limiter";
 import { InicisIdentityAdapter } from "./inicis-identity.adapter";
 import { IdentityVerificationRepository } from "./identity-verification.repository";
 import {
@@ -19,9 +20,18 @@ export class IdentityVerificationService {
     private readonly repository: IdentityVerificationRepository,
     private readonly adapter: InicisIdentityAdapter,
     private readonly configService: ConfigService,
+    private readonly admissionLimiter: AdmissionLimiter,
   ) {}
 
-  start = async (input: StartIdentityVerificationInput, deviceId: string) => {
+  start = async (input: StartIdentityVerificationInput, deviceId: string, origin: RequestOrigin) => {
+    await this.admissionLimiter.assertAllowed(
+      "IDENTITY_VERIFICATION_START",
+      [
+        { scopeType: "start-ip", value: origin.ip, limit: 20, windowMs: 15 * 60_000 },
+        { scopeType: "start-device", value: deviceId, limit: 20, windowMs: 15 * 60_000 },
+      ],
+      "본인인증 요청 횟수를 초과했습니다.",
+    );
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
     const session = await this.repository.createSession({
       purpose: input.purpose,
@@ -37,7 +47,7 @@ export class IdentityVerificationService {
     return {
       sessionId: session.sessionId,
       launchUrl: `${apiBaseUrl}/api/auth/identity/inicis/start/${session.sessionId}`,
-      expiresAt,
+      expiresAt: session.expiresAt,
     };
   };
 

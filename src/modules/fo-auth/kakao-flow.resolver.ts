@@ -1,5 +1,6 @@
 import { Args, Context, Mutation, Resolver } from "@nestjs/graphql";
 import type { Request, Response } from "express";
+import { requestOriginFromRequest } from "src/modules/admission/admission-limiter";
 import { deviceIdFromRequest, setTokenCookies } from "src/modules/auth/auth-http";
 import { TokenPayload } from "src/modules/auth/auth.types";
 import {
@@ -16,7 +17,7 @@ export class KakaoFlowResolver {
 
   @Mutation(() => KakaoLoginStartPayload)
   startKakaoLogin(@Context("req") req: Request) {
-    return this.service.start(deviceIdFromRequest(req));
+    return this.service.start(deviceIdFromRequest(req), requestOriginFromRequest(req));
   }
 
   @Mutation(() => KakaoLoginResult)

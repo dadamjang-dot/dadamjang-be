@@ -1,5 +1,5 @@
 import { Inject, Injectable } from "@nestjs/common";
-import { and, eq, gt, isNull } from "drizzle-orm";
+import { and, desc, eq, gt, isNull, sql } from "drizzle-orm";
 import { hashToken } from "src/common/security/token-hash";
 import { Database, DRIZZLE } from "src/modules/database/database.module";
 import { identityVerificationSessions } from "src/modules/database/schema";
@@ -12,13 +12,46 @@ import type {
 export class IdentityVerificationRepository {
   constructor(@Inject(DRIZZLE) private readonly db: Database) {}
 
-  createSession = async (input: {
+  createSession = (input: {
     purpose: IdentityVerificationPurposeValue;
     provider: IdentityVerificationProviderValue;
     deviceIdHash: string;
     merchantTransactionId: string;
     expiresAt: Date;
-  }) => (await this.db.insert(identityVerificationSessions).values(input).returning())[0];
+  }) =>
+    this.db.transaction(async (tx) => {
+      const now = new Date();
+      await tx.execute(
+        sql`SELECT pg_advisory_xact_lock(hashtextextended(${`${input.deviceIdHash}:${input.purpose}:${input.provider}`}, 4))`,
+      );
+      const [existing] = await tx
+        .select()
+        .from(identityVerificationSessions)
+        .where(
+          and(
+            eq(identityVerificationSessions.deviceIdHash, input.deviceIdHash),
+            eq(identityVerificationSessions.purpose, input.purpose),
+            eq(identityVerificationSessions.provider, input.provider),
+            eq(identityVerificationSessions.status, "PENDING"),
+            isNull(identityVerificationSessions.consumedAt),
+            gt(identityVerificationSessions.expiresAt, now),
+          ),
+        )
+        .orderBy(desc(identityVerificationSessions.createdAt))
+        .limit(1);
+      if (existing) return existing;
+      await tx.execute(sql`
+        DELETE FROM "identityVerificationSessions"
+        WHERE ctid IN (
+          SELECT ctid
+          FROM "identityVerificationSessions"
+          WHERE "expiresAt" <= ${now} OR "consumedAt" IS NOT NULL
+          ORDER BY "expiresAt"
+          LIMIT 100
+        )
+      `);
+      return (await tx.insert(identityVerificationSessions).values(input).returning())[0];
+    });
 
   findSession = (sessionId: string) =>
     this.db.query.identityVerificationSessions.findFirst({

@@ -1,5 +1,6 @@
 import { ConfigService } from "@nestjs/config";
 import { hashToken } from "src/common/security/token-hash";
+import { AdmissionLimiter, type RequestOrigin } from "src/modules/admission/admission-limiter";
 import { InicisIdentityAdapter } from "./inicis-identity.adapter";
 import { IdentityVerificationRepository } from "./identity-verification.repository";
 import { IdentityVerificationService } from "./identity-verification.service";
@@ -8,6 +9,9 @@ const config = {
   getOrThrow: jest.fn().mockReturnValue("identity-pepper"),
   get: jest.fn((key: string) => (key === "NODE_ENV" ? "test" : undefined)),
 } as unknown as ConfigService;
+const admissionLimiter = {
+  assertAllowed: jest.fn().mockResolvedValue(undefined),
+} as unknown as AdmissionLimiter;
 
 const pendingSession = {
   sessionId: "session-1",
@@ -32,6 +36,41 @@ const pendingSession = {
 };
 
 describe("IdentityVerificationService", () => {
+  it("does not persist a session when start admission is rejected", async () => {
+    let inserts = 0;
+    const repository = {
+      createSession: async () => {
+        inserts += 1;
+        return pendingSession;
+      },
+    } as unknown as IdentityVerificationRepository;
+    const admissionLimiter = {
+      assertAllowed: async () => {
+        throw new Error("admission rejected");
+      },
+    } as unknown as AdmissionLimiter;
+    const Service = IdentityVerificationService as unknown as new (
+      repository: IdentityVerificationRepository,
+      adapter: InicisIdentityAdapter,
+      configService: ConfigService,
+      admissionLimiter: AdmissionLimiter,
+    ) => IdentityVerificationService;
+    const service = new Service(repository, {} as InicisIdentityAdapter, config, admissionLimiter);
+    const start = service.start as unknown as (
+      input: { purpose: "SIGNUP"; provider: "KAKAO" },
+      deviceId: string,
+      origin: RequestOrigin,
+    ) => Promise<object>;
+
+    await expect(
+      start({ purpose: "SIGNUP", provider: "KAKAO" }, "device-1", {
+        ip: "203.0.113.10",
+        deviceId: "device-1",
+      }),
+    ).rejects.toThrow("admission rejected");
+    expect(inserts).toBe(0);
+  });
+
   it("records under-fourteen results without retaining raw identity data", async () => {
     const repository = {
       findSession: jest.fn().mockResolvedValue(pendingSession),
@@ -48,7 +87,7 @@ describe("IdentityVerificationService", () => {
         certificateProvider: "KAKAO",
       }),
     } as unknown as InicisIdentityAdapter;
-    const service = new IdentityVerificationService(repository, adapter, config);
+    const service = new IdentityVerificationService(repository, adapter, config, admissionLimiter);
 
     const result = (await service.callback("session-1", {
       resultCode: "0000",
@@ -86,7 +125,7 @@ describe("IdentityVerificationService", () => {
         certificateProvider: "KAKAO",
       }),
     } as unknown as InicisIdentityAdapter;
-    const service = new IdentityVerificationService(repository, adapter, config);
+    const service = new IdentityVerificationService(repository, adapter, config, admissionLimiter);
 
     await service.callback("session-1", { resultCode: "0000" });
 
@@ -99,7 +138,7 @@ describe("IdentityVerificationService", () => {
       findSession: jest.fn().mockResolvedValue(verifiedSession),
     } as unknown as IdentityVerificationRepository;
     const adapter = { verify: jest.fn() } as unknown as InicisIdentityAdapter;
-    const service = new IdentityVerificationService(repository, adapter, config);
+    const service = new IdentityVerificationService(repository, adapter, config, admissionLimiter);
 
     await expect(service.callback("session-1", { resultCode: "0000" })).rejects.toThrow();
     expect(adapter.verify).not.toHaveBeenCalled();
@@ -119,7 +158,7 @@ describe("IdentityVerificationService", () => {
         return pendingSession;
       }),
     } as unknown as IdentityVerificationRepository;
-    const service = new IdentityVerificationService(repository, {} as InicisIdentityAdapter, config);
+    const service = new IdentityVerificationService(repository, {} as InicisIdentityAdapter, config, admissionLimiter);
     const complete = service.complete as unknown as (
       sessionId: string,
       deviceId: string,
@@ -141,7 +180,7 @@ describe("IdentityVerificationService", () => {
     const adapter = {
       verify: jest.fn().mockRejectedValue(new Error("invalid callback")),
     } as unknown as InicisIdentityAdapter;
-    const service = new IdentityVerificationService(repository, adapter, config);
+    const service = new IdentityVerificationService(repository, adapter, config, admissionLimiter);
 
     await expect(service.callback("session-1", { resultCode: "1001" })).rejects.toThrow("invalid callback");
     expect(repository.markFailed).toHaveBeenCalledWith("session-1", "1001");

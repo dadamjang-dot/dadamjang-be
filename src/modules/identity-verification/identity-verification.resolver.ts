@@ -1,5 +1,6 @@
 import { Args, Context, ID, Mutation, Query, Resolver } from "@nestjs/graphql";
 import type { Request } from "express";
+import { requestOriginFromRequest } from "src/modules/admission/admission-limiter";
 import { deviceIdFromRequest } from "src/modules/auth/auth-http";
 import { IdentityVerificationService } from "./identity-verification.service";
 import {
@@ -15,7 +16,7 @@ export class IdentityVerificationResolver {
 
   @Mutation(() => IdentityVerificationStartPayload)
   startIdentityVerification(@Args("input") input: StartIdentityVerificationInput, @Context("req") req: Request) {
-    return this.service.start(input, deviceIdFromRequest(req));
+    return this.service.start(input, deviceIdFromRequest(req), requestOriginFromRequest(req));
   }
 
   @Query(() => IdentityVerificationStatusPayload)
