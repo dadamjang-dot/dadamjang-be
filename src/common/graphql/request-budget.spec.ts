@@ -10,9 +10,13 @@ const schema = buildSchema(`
 const validateQuery = (query: string) => validate(schema, parse(query), [requestBudgetRule]);
 const requestBudgetPlugin = (jest.requireActual("./request-budget") as { requestBudgetPlugin?: ApolloServerPlugin })
   .requestBudgetPlugin;
-const validateVariables = async (variables: Record<string, unknown>) => {
+const validateVariables = async (
+  variables: Record<string, unknown>,
+  source = "query Budget($first: Int) { root(first: $first) { value } }",
+) => {
+  const document = parse(source);
   const listener = await requestBudgetPlugin?.requestDidStart?.({ request: { variables } } as never);
-  await listener?.didResolveOperation?.({ request: { variables } } as never);
+  await listener?.didResolveOperation?.({ request: { variables }, document, operationName: null } as never);
 };
 
 describe("requestBudgetRule", () => {
@@ -43,6 +47,12 @@ describe("requestBudgetRule", () => {
       "GraphQL operation exceeds the request budget",
     );
     await expect(validateVariables({ first: 101 })).rejects.toThrow("GraphQL operation exceeds the request budget");
+  });
+
+  it("rejects a cardinality variable whose name differs from its argument", async () => {
+    await expect(validateVariables({ n: 101 }, "query Budget($n: Int) { root(first: $n) { value } }")).rejects.toThrow(
+      "GraphQL operation exceeds the request budget",
+    );
   });
 
   it("accepts variable list and cardinality values at 100", async () => {

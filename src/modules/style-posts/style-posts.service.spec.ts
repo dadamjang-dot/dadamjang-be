@@ -1,5 +1,6 @@
 import { StylePostsService } from "./style-posts.service";
 import { PgDialect } from "drizzle-orm/pg-core";
+import assert from "node:assert/strict";
 
 const purchasedQuery = (rows: readonly unknown[]) => {
   const result = Promise.resolve(rows);
@@ -97,7 +98,7 @@ describe("StylePostsService ranking budget", () => {
     expect(transaction).toHaveBeenCalledTimes(1);
     expect(execute).toHaveBeenCalledTimes(1);
     const statement = execute.mock.calls[0]?.[0];
-    if (!statement) return;
+    assert(statement);
     expect(new PgDialect().sqlToQuery(statement)).toMatchObject({
       sql: "select set_config('statement_timeout', $1, true)",
       params: ["5000ms"],

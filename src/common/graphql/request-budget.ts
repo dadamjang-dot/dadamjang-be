@@ -2,6 +2,7 @@ import type { ApolloServerPlugin } from "@apollo/server";
 import {
   GraphQLError,
   Kind,
+  getOperationAST,
   type ASTNode,
   type FragmentDefinitionNode,
   type SelectionSetNode,
@@ -37,6 +38,44 @@ const variableValueExceedsBudget = (value: unknown, name?: string): boolean => {
   if (typeof value === "object" && value !== null)
     return Object.entries(value).some(([field, item]) => variableValueExceedsBudget(item, field));
   return typeof value === "number" && !!name && cardinalityNames.has(name) && value > maxCardinality;
+};
+
+const variableCardinalityExceedsBudget = (
+  selectionSet: SelectionSetNode,
+  fragments: ReadonlyMap<string, FragmentDefinitionNode>,
+  activeFragments: Set<string>,
+  variables: Readonly<Record<string, unknown>>,
+): boolean => {
+  for (const selection of selectionSet.selections) {
+    if (selection.kind === Kind.FIELD) {
+      if (
+        selection.arguments?.some((argument) => {
+          if (!cardinalityNames.has(argument.name.value) || argument.value.kind !== Kind.VARIABLE) return false;
+          const value = variables[argument.value.name.value];
+          return typeof value === "number" && value > maxCardinality;
+        })
+      )
+        return true;
+      if (
+        selection.selectionSet &&
+        variableCardinalityExceedsBudget(selection.selectionSet, fragments, activeFragments, variables)
+      )
+        return true;
+      continue;
+    }
+    if (selection.kind === Kind.INLINE_FRAGMENT) {
+      if (variableCardinalityExceedsBudget(selection.selectionSet, fragments, activeFragments, variables)) return true;
+      continue;
+    }
+    if (activeFragments.has(selection.name.value)) continue;
+    const fragment = fragments.get(selection.name.value);
+    if (!fragment) continue;
+    activeFragments.add(selection.name.value);
+    const exceeded = variableCardinalityExceedsBudget(fragment.selectionSet, fragments, activeFragments, variables);
+    activeFragments.delete(selection.name.value);
+    if (exceeded) return true;
+  }
+  return false;
 };
 
 const exceedsBudget = (
@@ -96,8 +135,17 @@ export const requestBudgetRule: ValidationRule = (context) => ({
 
 export const requestBudgetPlugin: ApolloServerPlugin = {
   requestDidStart: async () => ({
-    didResolveOperation: async ({ request }) => {
+    didResolveOperation: async ({ request, document, operationName }) => {
       if (variableValueExceedsBudget(request.variables)) throw requestBudgetError();
+      const operation = getOperationAST(document, operationName);
+      if (!operation) return;
+      const fragments = new Map(
+        document.definitions
+          .filter((definition): definition is FragmentDefinitionNode => definition.kind === Kind.FRAGMENT_DEFINITION)
+          .map((fragment) => [fragment.name.value, fragment]),
+      );
+      if (variableCardinalityExceedsBudget(operation.selectionSet, fragments, new Set(), request.variables ?? {}))
+        throw requestBudgetError(operation);
     },
   }),
 };

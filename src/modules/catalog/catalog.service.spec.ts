@@ -3,6 +3,7 @@ import { CatalogService, decodeProductCursor, encodeProductCursor } from "./cata
 import { CreateProductDraftInput, ProductSort } from "./catalog.types";
 import { PgDialect } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
+import assert from "node:assert/strict";
 
 const rawCursor = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url");
 const createCatalogService = () => new CatalogService({} as never, { getProductImageUrl: jest.fn() } as never);
@@ -260,7 +261,7 @@ describe("catalog ranking budget", () => {
 
     expect(execute).toHaveBeenCalledTimes(1);
     const statement = execute.mock.calls[0]?.[0];
-    if (!statement) return;
+    assert(statement);
     expect(new PgDialect().sqlToQuery(statement)).toMatchObject({
       sql: "select set_config('statement_timeout', $1, true)",
       params: ["5000ms"],
