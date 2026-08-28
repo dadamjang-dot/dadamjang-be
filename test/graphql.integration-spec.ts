@@ -487,11 +487,44 @@ describe("PostgreSQL GraphQL integration", () => {
       totalAmount: 30000,
     });
     expect(repeated.body.data.checkoutCart.orderId).toBe(checkout.body.data.checkoutCart.orderId);
+    const stock = await pool.query<{ stock: number }>(`SELECT stock FROM "productSkus" WHERE "skuId" = $1`, [
+      FIXTURE.skuId,
+    ]);
+    expect(stock.rows[0]?.stock).toBe(5);
     const events = await pool.query<{ eventType: string }>(
       `SELECT "eventType" FROM "activityEvents" WHERE "subjectId" = $1 ORDER BY "createdAt"`,
       [checkout.body.data.checkoutCart.orderId],
     );
     expect(events.rows).toEqual([{ eventType: "ORDER_PAYMENT_PENDING" }, { eventType: "CHECKOUT_IDEMPOTENCY_REUSED" }]);
+  });
+
+  it("uses stock as a non-reserving checkout availability snapshot", async () => {
+    const agent = request.agent(app.getHttpServer());
+    const accessToken = await signin(agent);
+    const auth = { Authorization: `Bearer ${accessToken}` };
+    await agent
+      .post("/graphql")
+      .set(auth)
+      .send({
+        query: `mutation { upsertCartItem(input: { skuId: "${FIXTURE.secondSkuId}", quantity: 1 }) { cartId } }`,
+      });
+    await pool.query(`UPDATE "productSkus" SET stock = 0 WHERE "skuId" = $1`, [FIXTURE.secondSkuId]);
+    const checkout = await agent.post("/graphql").set(auth).send({
+      query: `mutation { checkoutCart(input: { idempotencyKey: "unavailable-snapshot" }) { orderId } }`,
+    });
+    expect(checkout.body.errors[0]).toMatchObject({
+      message: "Insufficient stock for INTEGRATION-SHOES-M",
+      extensions: { code: "BAD_USER_INPUT" },
+    });
+    const state = await pool.query<{ cart_items: number; idempotency_keys: number; orders: number; stock: number }>(
+      `SELECT
+        (SELECT count(*)::int FROM "cartItems") AS cart_items,
+        (SELECT count(*)::int FROM "checkoutIdempotencyKeys") AS idempotency_keys,
+        (SELECT count(*)::int FROM "orders") AS orders,
+        (SELECT stock FROM "productSkus" WHERE "skuId" = $1) AS stock`,
+      [FIXTURE.secondSkuId],
+    );
+    expect(state.rows[0]).toEqual({ cart_items: 1, idempotency_keys: 0, orders: 0, stock: 0 });
   });
 
   it("rejects checkout test controls in the public GraphQL input", async () => {

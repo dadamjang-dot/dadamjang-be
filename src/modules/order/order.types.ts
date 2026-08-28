@@ -1,4 +1,5 @@
 import { Field, InputType, Int, ObjectType } from "@nestjs/graphql";
+import type { OrderStatus, PaymentStatus } from "./order.constant";
 
 @ObjectType()
 export class OrderItemType {
@@ -25,9 +26,9 @@ export class OrderType {
   @Field()
   orderNumber!: string;
   @Field()
-  status!: string;
+  status!: OrderStatus;
   @Field()
-  paymentStatus!: string;
+  paymentStatus!: PaymentStatus;
   @Field(() => Int)
   totalAmount!: number;
   @Field(() => String, { nullable: true })

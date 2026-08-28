@@ -47,34 +47,45 @@ export class CartService {
     if (row.products.status !== "PUBLISHED") throw new CustomBadRequestException(CartErrorMessage.ProductUnavailable);
     if (row.productSkus.stock < input.quantity)
       throw new CustomBadRequestException(getInsufficientStockMessage(row.productSkus.code));
-    const cart = await this.getOrCreateCart(userId);
-    await this.db
-      .insert(cartItems)
-      .values({ cartId: cart.cartId, skuId: input.skuId, quantity: input.quantity })
-      .onConflictDoUpdate({
-        target: [cartItems.cartId, cartItems.skuId],
-        set: { quantity: input.quantity, updatedAt: new Date() },
+    await this.db.transaction(async (tx) => {
+      const cart = await this.getOrCreateLockedCart(tx, userId);
+      await tx
+        .insert(cartItems)
+        .values({ cartId: cart.cartId, skuId: input.skuId, quantity: input.quantity })
+        .onConflictDoUpdate({
+          target: [cartItems.cartId, cartItems.skuId],
+          set: { quantity: input.quantity, updatedAt: new Date() },
+        });
+      await tx.insert(activityEvents).values({
+        actorUserId: userId,
+        eventType: "CART_ITEM_UPSERTED",
+        subjectType: "SKU",
+        subjectId: input.skuId,
+        payload: { quantity: input.quantity },
       });
-    await this.db.insert(activityEvents).values({
-      actorUserId: userId,
-      eventType: "CART_ITEM_UPSERTED",
-      subjectType: "SKU",
-      subjectId: input.skuId,
-      payload: { quantity: input.quantity },
     });
     return this.getCart(userId);
   };
 
   removeItem = async (userId: string, skuId: string) => {
-    const cart = await this.getOrCreateCart(userId);
-    await this.db.delete(cartItems).where(and(eq(cartItems.cartId, cart.cartId), eq(cartItems.skuId, skuId)));
-    await this.db.insert(activityEvents).values({
-      actorUserId: userId,
-      eventType: "CART_ITEM_REMOVED",
-      subjectType: "SKU",
-      subjectId: skuId,
+    await this.db.transaction(async (tx) => {
+      const cart = await this.getOrCreateLockedCart(tx, userId);
+      await tx.delete(cartItems).where(and(eq(cartItems.cartId, cart.cartId), eq(cartItems.skuId, skuId)));
+      await tx.insert(activityEvents).values({
+        actorUserId: userId,
+        eventType: "CART_ITEM_REMOVED",
+        subjectType: "SKU",
+        subjectId: skuId,
+      });
     });
     return this.getCart(userId);
+  };
+
+  private getOrCreateLockedCart = async (tx: Pick<Database, "insert" | "select">, userId: string) => {
+    await tx.insert(carts).values({ userId }).onConflictDoNothing();
+    const [cart] = await tx.select().from(carts).where(eq(carts.userId, userId)).limit(1).for("update");
+    if (!cart) throw new Error(CartErrorMessage.CartCreationFailed);
+    return cart;
   };
 
   private getOrCreateCart = async (userId: string) => {

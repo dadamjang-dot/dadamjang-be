@@ -218,12 +218,67 @@ describe("Admin GraphQL integration", () => {
       input: { orderId: ADMIN_FIXTURE.orderId, nextStatus: "PAID" },
     });
     expect(response.body.errors[0].extensions.code).toBe("BAD_USER_INPUT");
+    const unknown = await graphql(app, token, mutation, {
+      input: { orderId: ADMIN_FIXTURE.orderId, nextStatus: "REFUNDED" },
+    });
+    expect(unknown.body.errors[0].extensions.code).toBe("BAD_USER_INPUT");
     const order = await pool.query<{ paymentStatus: string; status: string }>(
       `SELECT status, "paymentStatus" FROM "orders" WHERE "orderId" = $1`,
       [ADMIN_FIXTURE.orderId],
     );
     expect(order.rows[0]).toEqual({ paymentStatus: "PENDING", status: "PAYMENT_PENDING" });
   });
+
+  it.each([
+    {
+      nextStatus: "FAILED",
+      paymentStatus: "FAILED",
+      paymentFailureReason: "Payment marked failed by an administrator",
+    },
+    { nextStatus: "CANCELLED", paymentStatus: "CANCELLED", paymentFailureReason: null },
+  ])(
+    "atomically keeps a payment-pending order coherent when transitioning to $nextStatus",
+    async ({ nextStatus, paymentStatus, paymentFailureReason }) => {
+      await pool.query(
+        `UPDATE "orders" SET status = 'PAYMENT_PENDING', "paymentStatus" = 'PENDING' WHERE "orderId" = $1`,
+        [ADMIN_FIXTURE.orderId],
+      );
+      const token = await adminToken(request.agent(app.getHttpServer()));
+      const mutation = `mutation Transition($input: TransitionOrderInput!) {
+        transitionOrder(input: $input) {
+          orderId status paymentStatus paymentFailureReason auditLogs { metadataJson }
+        }
+      }`;
+      const response = await graphql(app, token, mutation, {
+        input: { orderId: ADMIN_FIXTURE.orderId, nextStatus },
+      });
+      expect(response.body.errors).toBeUndefined();
+      expect(response.body.data.transitionOrder).toMatchObject({
+        status: nextStatus,
+        paymentStatus,
+        paymentFailureReason,
+      });
+      const metadata = JSON.parse(response.body.data.transitionOrder.auditLogs[0].metadataJson) as Record<
+        string,
+        unknown
+      >;
+      expect(metadata).toMatchObject({
+        previousStatus: "PAYMENT_PENDING",
+        nextStatus,
+        previousPaymentStatus: "PENDING",
+        nextPaymentStatus: paymentStatus,
+        paymentFailureReason,
+      });
+      const order = await pool.query<{
+        paymentFailureReason: string | null;
+        paymentStatus: string;
+        status: string;
+      }>(`SELECT status, "paymentStatus", "paymentFailureReason" FROM "orders" WHERE "orderId" = $1`, [
+        ADMIN_FIXTURE.orderId,
+      ]);
+      expect(order.rows[0]).toEqual({ status: nextStatus, paymentStatus, paymentFailureReason });
+    },
+  );
 
   it("validates category hierarchy, uniqueness, and deactivation constraints", async () => {
     const token = await adminToken(request.agent(app.getHttpServer()));

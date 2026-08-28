@@ -30,17 +30,17 @@ const signin = async (app: INestApplication) => {
   return response.body.data.signin.accessToken as string;
 };
 
-const addCartItem = async (app: INestApplication, accessToken: string) => {
+const addCartItem = async (app: INestApplication, accessToken: string, skuId: string = FIXTURE.skuId, quantity = 1) => {
   const response = await request(app.getHttpServer())
     .post("/graphql")
     .set("Authorization", `Bearer ${accessToken}`)
     .send({
-      query: `mutation { upsertCartItem(input: { skuId: "${FIXTURE.skuId}", quantity: 1 }) { cartId } }`,
+      query: `mutation { upsertCartItem(input: { skuId: "${skuId}", quantity: ${quantity} }) { cartId } }`,
     });
   expect(response.body.errors).toBeUndefined();
 };
 
-const checkout = async (app: INestApplication, accessToken: string, idempotencyKey: string) =>
+const checkout = (app: INestApplication, accessToken: string, idempotencyKey: string) =>
   request(app.getHttpServer())
     .post("/graphql")
     .set("Authorization", `Bearer ${accessToken}`)
@@ -49,7 +49,41 @@ const checkout = async (app: INestApplication, accessToken: string, idempotencyK
         checkoutCart(input: $input) { orderId status paymentStatus }
       }`,
       variables: { input: { idempotencyKey } },
-    });
+    })
+    .then((response) => response);
+
+const upsertCartItem = (app: INestApplication, accessToken: string, skuId: string, quantity: number) =>
+  request(app.getHttpServer())
+    .post("/graphql")
+    .set("Authorization", `Bearer ${accessToken}`)
+    .send({
+      query: `mutation Upsert($input: UpsertCartItemInput!) { upsertCartItem(input: $input) { cartId } }`,
+      variables: { input: { skuId, quantity } },
+    })
+    .then((response) => response);
+
+const removeCartItem = (app: INestApplication, accessToken: string, skuId: string) =>
+  request(app.getHttpServer())
+    .post("/graphql")
+    .set("Authorization", `Bearer ${accessToken}`)
+    .send({
+      query: `mutation Remove($skuId: String!) { removeCartItem(skuId: $skuId) { cartId } }`,
+      variables: { skuId },
+    })
+    .then((response) => response);
+
+const hasWaitingQuery = async (pool: Pool, relationName: string) => {
+  const waiting = await pool.query<{ count: number }>(
+    `SELECT count(*)::int AS count
+     FROM pg_stat_activity
+     WHERE datname = current_database()
+       AND pid <> pg_backend_pid()
+       AND wait_event_type = 'Lock'
+       AND query LIKE $1`,
+    [`%"${relationName}"%`],
+  );
+  return (waiting.rows[0]?.count ?? 0) >= 1;
+};
 
 describe("PostgreSQL checkout concurrency", () => {
   let app: INestApplication;
@@ -109,7 +143,7 @@ describe("PostgreSQL checkout concurrency", () => {
         (SELECT stock FROM "productSkus" WHERE "skuId" = $1) AS stock`,
       [FIXTURE.skuId],
     );
-    expect(state.rows[0]).toEqual({ cart_items: 0, idempotency_keys: 1, orders: 1, stock: 4 });
+    expect(state.rows[0]).toEqual({ cart_items: 0, idempotency_keys: 1, orders: 1, stock: 5 });
   });
 
   it("allows only one checkout to consume a cart across different idempotency keys", async () => {
@@ -155,6 +189,91 @@ describe("PostgreSQL checkout concurrency", () => {
         (SELECT stock FROM "productSkus" WHERE "skuId" = $1) AS stock`,
       [FIXTURE.skuId],
     );
-    expect(state.rows[0]).toEqual({ cart_items: 0, orders: 1, stock: 4 });
+    expect(state.rows[0]).toEqual({ cart_items: 0, orders: 1, stock: 5 });
   });
+
+  it("serializes checkout before a concurrent cart upsert", async () => {
+    const accessToken = await signin(app);
+    await addCartItem(app, accessToken);
+    const blocker = await pool.connect();
+    await blocker.query("BEGIN");
+    await blocker.query(`LOCK TABLE "orders" IN SHARE MODE`);
+    const checkoutRequest = checkout(app, accessToken, "checkout-before-upsert");
+    await waitFor(() => hasWaitingQuery(pool, "orders"));
+    const upsertRequest = upsertCartItem(app, accessToken, FIXTURE.skuId, 2);
+    let lockError: unknown;
+    try {
+      await waitFor(() => hasWaitingQuery(pool, "carts"));
+    } catch (error) {
+      lockError = error;
+    } finally {
+      await blocker.query("COMMIT");
+      blocker.release();
+    }
+    const [checkoutResponse, upsertResponse] = await Promise.all([checkoutRequest, upsertRequest]);
+    if (lockError) throw lockError;
+    expect(checkoutResponse.body.errors).toBeUndefined();
+    expect(upsertResponse.body.errors).toBeUndefined();
+    const state = await pool.query<{
+      cart_quantity: number;
+      order_quantity: number;
+      orders: number;
+      stock: number;
+    }>(
+      `SELECT
+        (SELECT quantity FROM "cartItems" WHERE "skuId" = $1) AS cart_quantity,
+        (SELECT quantity FROM "orderItems" WHERE "skuId" = $1) AS order_quantity,
+        (SELECT count(*)::int FROM "orders") AS orders,
+        (SELECT stock FROM "productSkus" WHERE "skuId" = $1) AS stock`,
+      [FIXTURE.skuId],
+    );
+    expect(state.rows[0]).toEqual({ cart_quantity: 2, order_quantity: 1, orders: 1, stock: 5 });
+  }, 15_000);
+
+  it("serializes a cart removal before concurrent checkout", async () => {
+    const accessToken = await signin(app);
+    await addCartItem(app, accessToken);
+    await addCartItem(app, accessToken, FIXTURE.secondSkuId);
+    const blocker = await pool.connect();
+    await blocker.query("BEGIN");
+    await blocker.query(`LOCK TABLE "activityEvents" IN SHARE MODE`);
+    const removeRequest = removeCartItem(app, accessToken, FIXTURE.secondSkuId);
+    await waitFor(() => hasWaitingQuery(pool, "activityEvents"));
+    const checkoutRequest = checkout(app, accessToken, "remove-before-checkout");
+    let lockError: unknown;
+    try {
+      await waitFor(() => hasWaitingQuery(pool, "carts"));
+    } catch (error) {
+      lockError = error;
+    } finally {
+      await blocker.query("COMMIT");
+      blocker.release();
+    }
+    const [removeResponse, checkoutResponse] = await Promise.all([removeRequest, checkoutRequest]);
+    if (lockError) throw lockError;
+    expect(removeResponse.body.errors).toBeUndefined();
+    expect(checkoutResponse.body.errors).toBeUndefined();
+    const state = await pool.query<{
+      cart_items: number;
+      order_items: number;
+      removed_order_items: number;
+      primary_stock: number;
+      removed_stock: number;
+    }>(
+      `SELECT
+        (SELECT count(*)::int FROM "cartItems") AS cart_items,
+        (SELECT count(*)::int FROM "orderItems") AS order_items,
+        (SELECT count(*)::int FROM "orderItems" WHERE "skuId" = $2) AS removed_order_items,
+        (SELECT stock FROM "productSkus" WHERE "skuId" = $1) AS primary_stock,
+        (SELECT stock FROM "productSkus" WHERE "skuId" = $2) AS removed_stock`,
+      [FIXTURE.skuId, FIXTURE.secondSkuId],
+    );
+    expect(state.rows[0]).toEqual({
+      cart_items: 0,
+      order_items: 1,
+      removed_order_items: 0,
+      primary_stock: 5,
+      removed_stock: 1,
+    });
+  }, 15_000);
 });

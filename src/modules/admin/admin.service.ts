@@ -24,7 +24,12 @@ import {
   users,
 } from "src/modules/database/schema";
 import { EmailService } from "src/modules/email/email.service";
-import { ALLOWED_TRANSITIONS } from "src/modules/order/order.constant";
+import {
+  getAllowedOrderTransitions,
+  getOrderTransitionRule,
+  isOrderStatus,
+  isPaymentStatus,
+} from "src/modules/order/order.constant";
 import { getCannotTransitionMessage } from "src/modules/order/order.error";
 import { AdminErrorMessage } from "./admin.error";
 import {
@@ -279,7 +284,7 @@ export class AdminService {
         .limit(first + 1),
       this.count(orders, and(...base)),
     ]);
-    const nodes = rows.map((row) => ({ ...row, allowedNextStatuses: ALLOWED_TRANSITIONS[row.status] ?? [] }));
+    const nodes = rows.map((row) => ({ ...row, allowedNextStatuses: getAllowedOrderTransitions(row.status) }));
     return this.toConnection(nodes, first, totalCount, (node) => node.orderId);
   };
 
@@ -307,7 +312,7 @@ export class AdminService {
       this.db.select().from(orderItems).where(eq(orderItems.orderId, orderId)).orderBy(asc(orderItems.createdAt)),
       this.entityAuditLogs("ORDER", orderId),
     ]);
-    return { ...order, allowedNextStatuses: ALLOWED_TRANSITIONS[order.status] ?? [], items, auditLogs: history };
+    return { ...order, allowedNextStatuses: getAllowedOrderTransitions(order.status), items, auditLogs: history };
   };
 
   listCategories = () =>
@@ -455,12 +460,29 @@ export class AdminService {
     await this.db.transaction(async (tx) => {
       const [current] = await tx.select().from(orders).where(eq(orders.orderId, input.orderId)).limit(1);
       if (!current) throw new CustomNotFoundException(AdminErrorMessage.OrderNotFound);
-      if (!ALLOWED_TRANSITIONS[current.status]?.includes(input.nextStatus))
+      if (!isOrderStatus(input.nextStatus))
         throw new CustomBadRequestException(getCannotTransitionMessage(current.status, input.nextStatus));
+      if (!isOrderStatus(current.status) || !isPaymentStatus(current.paymentStatus))
+        throw new Error("Order has an invalid persisted state");
+      const rule = getOrderTransitionRule(current.status, input.nextStatus);
+      if (!rule) throw new CustomBadRequestException(getCannotTransitionMessage(current.status, input.nextStatus));
+      if (current.paymentStatus !== rule.requiredPaymentStatus)
+        throw new CustomConflictException(AdminErrorMessage.OrderChanged);
       const [updated] = await tx
         .update(orders)
-        .set({ status: input.nextStatus, updatedAt: new Date() })
-        .where(and(eq(orders.orderId, input.orderId), eq(orders.status, current.status)))
+        .set({
+          status: input.nextStatus,
+          paymentStatus: rule.paymentStatus,
+          paymentFailureReason: rule.paymentFailureReason,
+          updatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(orders.orderId, input.orderId),
+            eq(orders.status, current.status),
+            eq(orders.paymentStatus, current.paymentStatus),
+          ),
+        )
         .returning();
       if (!updated) throw new CustomConflictException(AdminErrorMessage.OrderChanged);
       await tx.insert(auditLogs).values({
@@ -468,7 +490,13 @@ export class AdminService {
         action: "ORDER_STATUS_CHANGED",
         entityType: "ORDER",
         entityId: updated.orderId,
-        metadata: { previousStatus: current.status, nextStatus: updated.status },
+        metadata: {
+          previousStatus: current.status,
+          nextStatus: updated.status,
+          previousPaymentStatus: current.paymentStatus,
+          nextPaymentStatus: updated.paymentStatus,
+          paymentFailureReason: updated.paymentFailureReason,
+        },
       });
     });
     return this.getOrder(input.orderId);

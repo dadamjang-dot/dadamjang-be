@@ -1,8 +1,7 @@
 import { Inject, Injectable } from "@nestjs/common";
-import { and, desc, eq, gte, sql } from "drizzle-orm";
+import { and, desc, eq } from "drizzle-orm";
 import { CustomBadRequestException, CustomNotFoundException } from "src/common/errors/custom-exceptions";
-import { ALLOWED_TRANSITIONS } from "./order.constant";
-import { OrderErrorMessage, getInsufficientStockMessage, getCannotTransitionMessage } from "./order.error";
+import { OrderErrorMessage, getInsufficientStockMessage } from "./order.error";
 import { Database, DRIZZLE } from "src/modules/database/database.module";
 import {
   activityEvents,
@@ -62,6 +61,9 @@ export class OrderService {
       if (rows.length === 0) throw new CustomBadRequestException(OrderErrorMessage.CartEmpty);
       if (rows.some(({ productSkus: sku, products: product }) => !sku.isActive || product.status !== "PUBLISHED"))
         throw new CustomBadRequestException(OrderErrorMessage.CartContainsUnavailableItem);
+      const insufficientStock = rows.find(({ cartItems: item, productSkus: sku }) => sku.stock < item.quantity);
+      if (insufficientStock)
+        throw new CustomBadRequestException(getInsufficientStockMessage(insufficientStock.productSkus.code));
       const totalAmount = rows.reduce((sum, row) => sum + row.productSkus.price * row.cartItems.quantity, 0);
       const [order] = await tx.insert(orders).values({ orderNumber: orderNumber(), userId, totalAmount }).returning();
       await tx.insert(orderItems).values(
@@ -75,17 +77,6 @@ export class OrderService {
           quantity: item.quantity,
         })),
       );
-      for (const row of rows) {
-        const [updatedSku] = await tx
-          .update(productSkus)
-          .set({
-            stock: sql`${productSkus.stock} - ${row.cartItems.quantity}`,
-            updatedAt: new Date(),
-          })
-          .where(and(eq(productSkus.skuId, row.productSkus.skuId), gte(productSkus.stock, row.cartItems.quantity)))
-          .returning();
-        if (!updatedSku) throw new CustomBadRequestException(getInsufficientStockMessage(row.productSkus.code));
-      }
       await tx.delete(cartItems).where(eq(cartItems.cartId, cart.cartId));
       await tx.insert(activityEvents).values({
         actorUserId: userId,
@@ -136,17 +127,4 @@ export class OrderService {
       .update(checkoutIdempotencyKeys)
       .set({ orderId, status: "COMPLETED", updatedAt: new Date() })
       .where(eq(checkoutIdempotencyKeys.checkoutIdempotencyKeyId, checkoutIdempotencyKeyId));
-
-  transitionOrder = async (orderId: string, nextStatus: string) => {
-    const [order] = await this.db.select().from(orders).where(eq(orders.orderId, orderId)).limit(1);
-    if (!order) throw new CustomNotFoundException(OrderErrorMessage.OrderNotFound);
-    if (!ALLOWED_TRANSITIONS[order.status]?.includes(nextStatus))
-      throw new CustomBadRequestException(getCannotTransitionMessage(order.status, nextStatus));
-    const [updated] = await this.db
-      .update(orders)
-      .set({ status: nextStatus, updatedAt: new Date() })
-      .where(eq(orders.orderId, orderId))
-      .returning();
-    return updated;
-  };
 }
