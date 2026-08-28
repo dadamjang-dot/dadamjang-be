@@ -1,4 +1,4 @@
-import type { ApolloServerPlugin } from "@apollo/server";
+import type { ApolloDriverConfig } from "@nestjs/apollo";
 import {
   GraphQLError,
   Kind,
@@ -17,6 +17,7 @@ const maxCardinality = 100;
 const cardinalityNames = new Set(["first", "last", "limit", "pageSize", "take"]);
 
 type RequestBudget = { aliases: number; fields: number };
+type RequestBudgetPlugin = NonNullable<ApolloDriverConfig["plugins"]>[number];
 
 const requestBudgetError = (nodes?: ASTNode | readonly ASTNode[]) =>
   new GraphQLError("GraphQL operation exceeds the request budget", {
@@ -133,7 +134,7 @@ export const requestBudgetRule: ValidationRule = (context) => ({
   },
 });
 
-export const requestBudgetPlugin: ApolloServerPlugin = {
+export const requestBudgetPlugin: RequestBudgetPlugin = {
   requestDidStart: async () => ({
     didResolveOperation: async ({ request, document, operationName }) => {
       if (variableValueExceedsBudget(request.variables)) throw requestBudgetError();
