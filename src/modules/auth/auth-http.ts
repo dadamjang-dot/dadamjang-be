@@ -7,7 +7,7 @@ import type { TokenPayload } from "./auth.types";
 export const deviceIdFromRequest = (req: Request) => {
   const value = req.headers["x-device-id"];
   const deviceId = (Array.isArray(value) ? value[0] : value)?.trim();
-  if (!deviceId) throw new CustomUnauthorizedException(AuthErrorMessage.AuthRequired);
+  if (!deviceId || deviceId.length > 255) throw new CustomUnauthorizedException(AuthErrorMessage.AuthRequired);
   return deviceId;
 };
 
