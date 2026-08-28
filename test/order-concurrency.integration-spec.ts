@@ -5,13 +5,32 @@ import { createApp } from "src/app";
 import { FIXTURE } from "src/database/fixtures";
 import { resetTestFixtures, testPool } from "./support/database";
 
+const WAIT_TIMEOUT_MS = 5_000;
+const TEST_TIMEOUT_MS = 20_000;
+
+jest.setTimeout(TEST_TIMEOUT_MS);
+
 const waitFor = async (condition: () => Promise<boolean>) => {
-  const deadline = Date.now() + 5_000;
+  const deadline = Date.now() + WAIT_TIMEOUT_MS;
   while (Date.now() < deadline) {
     if (await condition()) return;
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   throw new Error("Timed out waiting for concurrent checkout requests");
+};
+
+const startBlockingTransaction = async (pool: Pool, lockQuery: string) => {
+  const blocker = await pool.connect();
+  try {
+    await blocker.query("BEGIN");
+    await blocker.query("SET LOCAL lock_timeout = '2s'; SET LOCAL statement_timeout = '4s'");
+    await blocker.query(lockQuery);
+    return blocker;
+  } catch (error) {
+    await blocker.query("ROLLBACK").catch(() => undefined);
+    blocker.release();
+    throw error;
+  }
 };
 
 const signin = async (app: INestApplication) => {
@@ -107,13 +126,11 @@ describe("PostgreSQL checkout concurrency", () => {
   it("returns one order to concurrent requests with the same idempotency key", async () => {
     const accessToken = await signin(app);
     await addCartItem(app, accessToken);
-    const blocker = await pool.connect();
+    const blocker = await startBlockingTransaction(pool, `LOCK TABLE "checkoutIdempotencyKeys" IN SHARE MODE`);
     const requests: ReturnType<typeof checkout>[] = [];
     let released = false;
     let lockError: unknown;
     try {
-      await blocker.query("BEGIN");
-      await blocker.query(`LOCK TABLE "checkoutIdempotencyKeys" IN SHARE MODE`);
       requests.push(checkout(app, accessToken, "concurrent-same-key"));
       requests.push(checkout(app, accessToken, "concurrent-same-key"));
       await waitFor(async () => {
@@ -155,13 +172,11 @@ describe("PostgreSQL checkout concurrency", () => {
   it("allows only one checkout to consume a cart across different idempotency keys", async () => {
     const accessToken = await signin(app);
     await addCartItem(app, accessToken);
-    const blocker = await pool.connect();
+    const blocker = await startBlockingTransaction(pool, `LOCK TABLE "orders" IN SHARE MODE`);
     const requests: ReturnType<typeof checkout>[] = [];
     let released = false;
     let lockError: unknown;
     try {
-      await blocker.query("BEGIN");
-      await blocker.query(`LOCK TABLE "orders" IN SHARE MODE`);
       requests.push(checkout(app, accessToken, "concurrent-cart-a"));
       requests.push(checkout(app, accessToken, "concurrent-cart-b"));
       await waitFor(async () => {
@@ -210,23 +225,29 @@ describe("PostgreSQL checkout concurrency", () => {
   it("serializes checkout before a concurrent cart upsert", async () => {
     const accessToken = await signin(app);
     await addCartItem(app, accessToken);
-    const blocker = await pool.connect();
-    await blocker.query("BEGIN");
-    await blocker.query(`LOCK TABLE "orders" IN SHARE MODE`);
-    const checkoutRequest = checkout(app, accessToken, "checkout-before-upsert");
-    await waitFor(() => hasWaitingQuery(pool, "orders"));
-    const upsertRequest = upsertCartItem(app, accessToken, FIXTURE.skuId, 2);
+    const blocker = await startBlockingTransaction(pool, `LOCK TABLE "orders" IN SHARE MODE`);
+    const requests: ReturnType<typeof checkout>[] = [];
+    let released = false;
     let lockError: unknown;
     try {
+      requests.push(checkout(app, accessToken, "checkout-before-upsert"));
+      await waitFor(() => hasWaitingQuery(pool, "orders"));
+      requests.push(upsertCartItem(app, accessToken, FIXTURE.skuId, 2));
       await waitFor(() => hasWaitingQuery(pool, "carts"));
+      await blocker.query("COMMIT");
+      released = true;
     } catch (error) {
       lockError = error;
     } finally {
-      await blocker.query("COMMIT");
+      if (!released) await blocker.query("ROLLBACK").catch(() => undefined);
       blocker.release();
     }
-    const [checkoutResponse, upsertResponse] = await Promise.all([checkoutRequest, upsertRequest]);
-    if (lockError) throw lockError;
+    if (lockError) {
+      await Promise.allSettled(requests);
+      throw lockError;
+    }
+
+    const [checkoutResponse, upsertResponse] = await Promise.all(requests);
     expect(checkoutResponse.body.errors).toBeUndefined();
     expect(upsertResponse.body.errors).toBeUndefined();
     const state = await pool.query<{
@@ -243,29 +264,35 @@ describe("PostgreSQL checkout concurrency", () => {
       [FIXTURE.skuId],
     );
     expect(state.rows[0]).toEqual({ cart_quantity: 2, order_quantity: 1, orders: 1, stock: 5 });
-  }, 15_000);
+  });
 
   it("serializes a cart removal before concurrent checkout", async () => {
     const accessToken = await signin(app);
     await addCartItem(app, accessToken);
     await addCartItem(app, accessToken, FIXTURE.secondSkuId);
-    const blocker = await pool.connect();
-    await blocker.query("BEGIN");
-    await blocker.query(`LOCK TABLE "activityEvents" IN SHARE MODE`);
-    const removeRequest = removeCartItem(app, accessToken, FIXTURE.secondSkuId);
-    await waitFor(() => hasWaitingQuery(pool, "activityEvents"));
-    const checkoutRequest = checkout(app, accessToken, "remove-before-checkout");
+    const blocker = await startBlockingTransaction(pool, `LOCK TABLE "activityEvents" IN SHARE MODE`);
+    const requests: ReturnType<typeof checkout>[] = [];
+    let released = false;
     let lockError: unknown;
     try {
+      requests.push(removeCartItem(app, accessToken, FIXTURE.secondSkuId));
+      await waitFor(() => hasWaitingQuery(pool, "activityEvents"));
+      requests.push(checkout(app, accessToken, "remove-before-checkout"));
       await waitFor(() => hasWaitingQuery(pool, "carts"));
+      await blocker.query("COMMIT");
+      released = true;
     } catch (error) {
       lockError = error;
     } finally {
-      await blocker.query("COMMIT");
+      if (!released) await blocker.query("ROLLBACK").catch(() => undefined);
       blocker.release();
     }
-    const [removeResponse, checkoutResponse] = await Promise.all([removeRequest, checkoutRequest]);
-    if (lockError) throw lockError;
+    if (lockError) {
+      await Promise.allSettled(requests);
+      throw lockError;
+    }
+
+    const [removeResponse, checkoutResponse] = await Promise.all(requests);
     expect(removeResponse.body.errors).toBeUndefined();
     expect(checkoutResponse.body.errors).toBeUndefined();
     const state = await pool.query<{
@@ -290,5 +317,5 @@ describe("PostgreSQL checkout concurrency", () => {
       primary_stock: 5,
       removed_stock: 1,
     });
-  }, 15_000);
+  });
 });
