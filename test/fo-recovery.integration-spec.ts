@@ -508,11 +508,50 @@ describe("FO account recovery GraphQL integration", () => {
     const completionMutation = `mutation CompleteIdentityVerification($sessionId: ID!, $callbackToken: String!) {
       completeIdentityVerification(sessionId: $sessionId, callbackToken: $callbackToken) { identityVerificationToken }
     }`;
+    const wrongToken = await request(app.getHttpServer())
+      .post("/graphql")
+      .set("x-device-id", deviceId)
+      .send({ query: completionMutation, variables: { sessionId, callbackToken: "wrong-callback" } });
+    expect(wrongToken.body.errors[0].message).toBe("본인인증 완료 상태가 유효하지 않습니다.");
+
     const relayed = await request(app.getHttpServer())
       .post("/graphql")
       .set("x-device-id", "wrong-device")
       .send({ query: completionMutation, variables: { sessionId, callbackToken } });
     expect(relayed.body.errors[0].message).toBe("본인인증 완료 상태가 유효하지 않습니다.");
+
+    await pool.query(
+      `UPDATE "identityVerificationSessions" SET "expiresAt" = now() - interval '1 second' WHERE "sessionId" = $1`,
+      [sessionId],
+    );
+    const expired = await request(app.getHttpServer())
+      .post("/graphql")
+      .set("x-device-id", deviceId)
+      .send({ query: completionMutation, variables: { sessionId, callbackToken } });
+    expect(expired.body.errors[0].message).toBe("본인인증 완료 상태가 유효하지 않습니다.");
+
+    await pool.query(
+      `UPDATE "identityVerificationSessions" SET "expiresAt" = now() + interval '10 minutes', "status" = 'PENDING' WHERE "sessionId" = $1`,
+      [sessionId],
+    );
+    const pending = await request(app.getHttpServer())
+      .post("/graphql")
+      .set("x-device-id", deviceId)
+      .send({ query: completionMutation, variables: { sessionId, callbackToken } });
+    expect(pending.body.errors[0].message).toBe("본인인증 완료 상태가 유효하지 않습니다.");
+
+    await pool.query(
+      `UPDATE "identityVerificationSessions" SET "status" = 'VERIFIED', "completedAt" = now() WHERE "sessionId" = $1`,
+      [sessionId],
+    );
+    const consumed = await request(app.getHttpServer())
+      .post("/graphql")
+      .set("x-device-id", deviceId)
+      .send({ query: completionMutation, variables: { sessionId, callbackToken } });
+    expect(consumed.body.errors[0].message).toBe("본인인증 완료 상태가 유효하지 않습니다.");
+    await pool.query(`UPDATE "identityVerificationSessions" SET "completedAt" = NULL WHERE "sessionId" = $1`, [
+      sessionId,
+    ]);
 
     const completed = await request(app.getHttpServer())
       .post("/graphql")

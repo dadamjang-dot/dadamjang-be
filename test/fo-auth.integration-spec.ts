@@ -466,7 +466,7 @@ describe("FO auth GraphQL integration", () => {
     expect(retried.body.data.completeKakaoLogin.status).toBe("SIGNED_IN");
   });
 
-  it("binds a Kakao signup flow to its device and reports email fallback", async () => {
+  it("atomically binds a Kakao signup callback to token, device, status, expiry, and one-time use", async () => {
     const flowId = "d0000000-0000-4000-8000-000000000002";
     const deviceId = "kakao-signup-device";
     const callbackToken = "kakao-signup-callback";
@@ -484,11 +484,47 @@ describe("FO auth GraphQL integration", () => {
         emailVerificationRequired
       }
     }`;
+    const wrongToken = await request(app.getHttpServer())
+      .post("/graphql")
+      .set("x-device-id", deviceId)
+      .send({ query: mutation, variables: { input: { flowId, callbackToken: "wrong-callback" } } });
+    expect(wrongToken.body.errors[0].message).toBe("카카오 로그인 흐름이 유효하지 않습니다.");
+
     const wrongDevice = await request(app.getHttpServer())
       .post("/graphql")
       .set("x-device-id", "another-device")
       .send({ query: mutation, variables: { input: { flowId, callbackToken } } });
     expect(wrongDevice.body.errors[0].message).toBe("카카오 로그인 흐름이 유효하지 않습니다.");
+
+    await pool.query(`UPDATE "kakaoLoginFlows" SET "expiresAt" = now() - interval '1 second' WHERE "flowId" = $1`, [
+      flowId,
+    ]);
+    const expired = await request(app.getHttpServer())
+      .post("/graphql")
+      .set("x-device-id", deviceId)
+      .send({ query: mutation, variables: { input: { flowId, callbackToken } } });
+    expect(expired.body.errors[0].message).toBe("카카오 로그인 흐름이 유효하지 않습니다.");
+
+    await pool.query(
+      `UPDATE "kakaoLoginFlows" SET "expiresAt" = now() + interval '10 minutes', "status" = 'PENDING' WHERE "flowId" = $1`,
+      [flowId],
+    );
+    const pending = await request(app.getHttpServer())
+      .post("/graphql")
+      .set("x-device-id", deviceId)
+      .send({ query: mutation, variables: { input: { flowId, callbackToken } } });
+    expect(pending.body.errors[0].message).toBe("카카오 로그인 흐름이 유효하지 않습니다.");
+
+    await pool.query(
+      `UPDATE "kakaoLoginFlows" SET "status" = 'SIGNUP_REQUIRED', "consumedAt" = now() WHERE "flowId" = $1`,
+      [flowId],
+    );
+    const consumed = await request(app.getHttpServer())
+      .post("/graphql")
+      .set("x-device-id", deviceId)
+      .send({ query: mutation, variables: { input: { flowId, callbackToken } } });
+    expect(consumed.body.errors[0].message).toBe("카카오 로그인 흐름이 유효하지 않습니다.");
+    await pool.query(`UPDATE "kakaoLoginFlows" SET "consumedAt" = NULL WHERE "flowId" = $1`, [flowId]);
 
     const completed = await request(app.getHttpServer())
       .post("/graphql")
@@ -501,6 +537,11 @@ describe("FO auth GraphQL integration", () => {
       email: null,
       emailVerificationRequired: true,
     });
+    const replayed = await request(app.getHttpServer())
+      .post("/graphql")
+      .set("x-device-id", deviceId)
+      .send({ query: mutation, variables: { input: { flowId, callbackToken } } });
+    expect(replayed.body.errors[0].message).toBe("카카오 로그인 흐름이 유효하지 않습니다.");
   });
 
   it("links a new Kakao identity to the existing FO account with the same CI", async () => {
