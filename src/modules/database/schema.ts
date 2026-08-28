@@ -317,7 +317,13 @@ export const products = pgTable(
     updatedAt: timestamp("updatedAt").defaultNow().notNull(),
   },
   (table) => [
-    index("products_catalog_idx").on(table.status, table.categoryId, table.createdAt),
+    index("products_catalog_default_keyset_idx").on(table.status, table.createdAt.desc(), table.productId.desc()),
+    index("products_catalog_category_keyset_idx").on(
+      table.status,
+      table.categoryId,
+      table.createdAt.desc(),
+      table.productId.desc(),
+    ),
     index("products_brand_idx").on(table.brandId, table.status),
     index("products_catalog_flags_idx").on(table.status, table.isOnSale, table.isExpressDelivery),
     index("products_partner_idx").on(table.partnerId, table.status),

@@ -16,20 +16,67 @@ import {
   ProductType,
 } from "./catalog.types";
 
-type ProductCursor = { createdAt: string; productId: string; sortValue?: number };
+type DateProductCursor = {
+  v: 1;
+  sort: ProductSort.RECOMMENDED | ProductSort.LATEST;
+  createdAt: string;
+  productId: string;
+};
+
+type MetricProductCursor = {
+  v: 1;
+  sort: ProductSort.LOW_PRICE | ProductSort.HIGH_PRICE | ProductSort.POPULAR;
+  sortValue: number;
+  createdAt: string;
+  productId: string;
+};
+
+type ProductCursor = DateProductCursor | MetricProductCursor;
+
+const DATE_PRODUCT_SORTS = new Set<ProductSort>([ProductSort.RECOMMENDED, ProductSort.LATEST]);
+const METRIC_PRODUCT_SORTS = new Set<ProductSort>([ProductSort.LOW_PRICE, ProductSort.HIGH_PRICE, ProductSort.POPULAR]);
+const PRODUCT_SORTS = new Set<string>(Object.values(ProductSort));
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const CURSOR_TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{1,6}Z$/;
+const DATE_CURSOR_KEYS = ["v", "sort", "createdAt", "productId"];
+const METRIC_CURSOR_KEYS = [...DATE_CURSOR_KEYS, "sortValue"];
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+const hasExactKeys = (value: Record<string, unknown>, expected: string[]) => {
+  const keys = Object.keys(value);
+  return keys.length === expected.length && keys.every((key) => expected.includes(key));
+};
+
+const isProductCursor = (value: unknown): value is ProductCursor => {
+  if (
+    !isRecord(value) ||
+    value.v !== 1 ||
+    typeof value.sort !== "string" ||
+    !PRODUCT_SORTS.has(value.sort) ||
+    typeof value.createdAt !== "string" ||
+    !CURSOR_TIMESTAMP_PATTERN.test(value.createdAt) ||
+    Number.isNaN(Date.parse(value.createdAt)) ||
+    typeof value.productId !== "string" ||
+    !UUID_PATTERN.test(value.productId)
+  )
+    return false;
+  if (DATE_PRODUCT_SORTS.has(value.sort as ProductSort)) return hasExactKeys(value, DATE_CURSOR_KEYS);
+  return (
+    METRIC_PRODUCT_SORTS.has(value.sort as ProductSort) &&
+    hasExactKeys(value, METRIC_CURSOR_KEYS) &&
+    typeof value.sortValue === "number" &&
+    Number.isFinite(value.sortValue)
+  );
+};
 
 export const encodeProductCursor = (cursor: ProductCursor) => Buffer.from(JSON.stringify(cursor)).toString("base64url");
 
-export const decodeProductCursor = (cursor: string): ProductCursor => {
+export const decodeProductCursor = (cursor: string, expectedSort: ProductSort): ProductCursor => {
   try {
-    const value = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8")) as ProductCursor;
-    if (
-      !value.createdAt ||
-      !value.productId ||
-      Number.isNaN(Date.parse(value.createdAt)) ||
-      (value.sortValue !== undefined && !Number.isFinite(value.sortValue))
-    )
-      throw new Error("invalid cursor");
+    const value: unknown = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"));
+    if (!isProductCursor(value) || value.sort !== expectedSort) throw new Error("invalid cursor");
     return value;
   } catch {
     throw new CustomBadRequestException(CatalogErrorMessage.InvalidCursor);
@@ -131,16 +178,19 @@ export class CatalogService {
 
   private listCatalogProducts = async (filter: ProductFilterInput) => {
     const first = Math.min(Math.max(filter.first ?? 20, 1), MAX_PAGE_SIZE);
-    const cursor = filter.after ? decodeProductCursor(filter.after) : undefined;
     const selectedSort = filter.sort ?? ProductSort.RECOMMENDED;
-    const conditions = this.productConditions(filter);
+    const cursor = filter.after ? decodeProductCursor(filter.after, selectedSort) : undefined;
+    const candidateSkuMetrics = this.activeSkuMetrics("candidateSkuMetrics");
+    const activeLowestPrice = sql<number>`${candidateSkuMetrics.activeLowestPrice}`;
+    const activeStockTotal = sql<number>`${candidateSkuMetrics.activeStockTotal}`;
+    const conditions = this.productConditions(filter, activeLowestPrice);
     const sortValue =
       selectedSort === ProductSort.LOW_PRICE || selectedSort === ProductSort.HIGH_PRICE
-        ? sql<number>`coalesce(${this.activeLowestPrice()}, 0)::double precision`
+        ? activeLowestPrice
         : selectedSort === ProductSort.POPULAR
-          ? this.activeStockTotal()
+          ? activeStockTotal
           : undefined;
-    const cursorCondition = cursor ? this.productCursorCondition(cursor, selectedSort, sortValue) : undefined;
+    const cursorCondition = cursor ? this.productCursorCondition(cursor, sortValue) : undefined;
     const order = sortValue
       ? [
           selectedSort === ProductSort.LOW_PRICE ? asc(sortValue) : desc(sortValue),
@@ -148,65 +198,81 @@ export class CatalogService {
           desc(products.productId),
         ]
       : [desc(products.createdAt), desc(products.productId)];
-    const cursorCreatedAt = sql<string>`to_char(${products.createdAt}, 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')`;
+    const cursorCreatedAt = sql<string>`to_char(${products.createdAt}, 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')`.as(
+      "cursorCreatedAt",
+    );
+    const cursorSortValue = sql<number | null>`${sortValue ?? sql`null::double precision`}`.as("cursorSortValue");
+    const countSkuMetrics = this.activeSkuMetrics("countSkuMetrics");
+    const countLowestPrice = sql<number>`${countSkuMetrics.activeLowestPrice}`;
+    const countRowsPromise =
+      filter.minPrice !== undefined || filter.maxPrice !== undefined
+        ? this.db
+            .select({ count: sql<number>`count(*)` })
+            .from(products)
+            .leftJoinLateral(countSkuMetrics, sql`true`)
+            .where(and(...this.productConditions(filter, countLowestPrice)))
+        : this.db
+            .select({ count: sql<number>`count(*)` })
+            .from(products)
+            .where(and(...this.productConditions(filter)));
     const [rows, countRows] = await Promise.all([
       this.db
-        .select({ ...getTableColumns(products), cursorCreatedAt })
+        .select({ ...getTableColumns(products), cursorCreatedAt, cursorSortValue })
         .from(products)
+        .leftJoinLateral(candidateSkuMetrics, sql`true`)
         .where(and(...conditions, cursorCondition))
         .orderBy(...order)
         .limit(first + 1),
-      this.db
-        .select({ count: sql<number>`count(*)` })
-        .from(products)
-        .where(and(...conditions)),
+      countRowsPromise,
     ]);
     const pageRows = rows.slice(0, first);
-    const nodes = await this.withSkus(pageRows.map(({ cursorCreatedAt: _, ...product }) => product));
+    const nodes = await this.withSkus(
+      pageRows.map(({ cursorCreatedAt: _, cursorSortValue: __, ...product }) => product),
+    );
     const hasNextPage = rows.length > first;
-    const tail = nodes[nodes.length - 1];
     const tailRow = pageRows[pageRows.length - 1];
     return {
       nodes,
       hasNextPage,
       nextCursor:
-        hasNextPage && tail && tailRow
-          ? encodeProductCursor(this.toProductCursor(tail, tailRow.cursorCreatedAt, filter.sort))
+        hasNextPage && tailRow
+          ? encodeProductCursor(
+              this.toProductCursor(tailRow.productId, tailRow.cursorCreatedAt, selectedSort, tailRow.cursorSortValue),
+            )
           : null,
       totalCount: Number(countRows[0]?.count ?? 0),
     };
   };
 
-  private productCursorCondition = (cursor: ProductCursor, sort: ProductSort, sortValue: SQL<number> | undefined) => {
+  private productCursorCondition = (cursor: ProductCursor, sortValue: SQL<number> | undefined) => {
     const createdAt = sql`${cursor.createdAt}::timestamp`;
     const tieBreaker = or(
       sql`${products.createdAt} < ${createdAt}`,
       and(sql`${products.createdAt} = ${createdAt}`, sql`${products.productId} < ${cursor.productId}`),
     );
-    if (!sortValue || cursor.sortValue === undefined) return tieBreaker;
+    if (!("sortValue" in cursor)) return tieBreaker;
+    if (!sortValue) throw new CustomBadRequestException(CatalogErrorMessage.InvalidCursor);
     return or(
-      sort === ProductSort.LOW_PRICE
+      cursor.sort === ProductSort.LOW_PRICE
         ? sql`${sortValue} > ${cursor.sortValue}`
         : sql`${sortValue} < ${cursor.sortValue}`,
       and(sql`${sortValue} = ${cursor.sortValue}`, tieBreaker),
     );
   };
 
-  private activeLowestPrice = () => sql<number>`(
-    select min(${productSkus.price})
-    from ${productSkus}
-    where ${productSkus.productId} = ${products.productId}
-      and ${productSkus.isActive} = true
-  )`;
+  private activeSkuMetrics = (alias: string) =>
+    this.db
+      .select({
+        activeLowestPrice: sql<number>`coalesce(min(${productSkus.price}), 0)::double precision`.as(
+          "activeLowestPrice",
+        ),
+        activeStockTotal: sql<number>`coalesce(sum(${productSkus.stock}), 0)::double precision`.as("activeStockTotal"),
+      })
+      .from(productSkus)
+      .where(and(eq(productSkus.productId, products.productId), eq(productSkus.isActive, true)))
+      .as(alias);
 
-  private activeStockTotal = () => sql<number>`coalesce((
-    select sum(${productSkus.stock})
-    from ${productSkus}
-    where ${productSkus.productId} = ${products.productId}
-      and ${productSkus.isActive} = true
-  ), 0)::double precision`;
-
-  private productConditions = (filter: ProductFilterInput) => {
+  private productConditions = (filter: ProductFilterInput, activeLowestPrice?: SQL<number>) => {
     const conditions = [eq(products.status, "PUBLISHED")];
     if (filter.categoryIds?.length) conditions.push(inArray(products.categoryId, filter.categoryIds));
     else if (filter.categoryId) conditions.push(eq(products.categoryId, filter.categoryId));
@@ -223,9 +289,9 @@ export class CatalogService {
     }
 
     if (filter.minPrice !== undefined || filter.maxPrice !== undefined) {
-      const lowestPrice = this.activeLowestPrice();
-      if (filter.minPrice !== undefined) conditions.push(gte(lowestPrice, filter.minPrice));
-      if (filter.maxPrice !== undefined) conditions.push(lte(lowestPrice, filter.maxPrice));
+      if (!activeLowestPrice) throw new Error("Active SKU price metric is required");
+      if (filter.minPrice !== undefined) conditions.push(gte(activeLowestPrice, filter.minPrice));
+      if (filter.maxPrice !== undefined) conditions.push(lte(activeLowestPrice, filter.maxPrice));
     }
 
     return conditions;
@@ -347,27 +413,21 @@ export class CatalogService {
   };
 
   private toProductCursor = (
-    product: ProductType,
+    productId: string,
     createdAt: string,
-    sort?: ProductFilterInput["sort"],
+    sort: ProductSort,
+    cursorSortValue: number | null,
   ): ProductCursor => {
-    const selectedSort = sort ?? ProductSort.RECOMMENDED;
+    if (sort === ProductSort.LATEST || sort === ProductSort.RECOMMENDED) return { v: 1, sort, createdAt, productId };
+    if (cursorSortValue === null) throw new Error("Catalog cursor sort metric is required");
     return {
+      v: 1,
+      sort,
+      sortValue: cursorSortValue,
       createdAt,
-      productId: product.productId,
-      ...(selectedSort === ProductSort.LATEST || selectedSort === ProductSort.RECOMMENDED
-        ? {}
-        : { sortValue: this.sortValue(product, selectedSort) }),
+      productId,
     };
   };
-
-  private sortValue = (product: ProductType, sort: ProductSort) => {
-    if (sort === ProductSort.LOW_PRICE) return this.lowestSkuPrice(product);
-    if (sort === ProductSort.HIGH_PRICE) return this.lowestSkuPrice(product);
-    return this.stockTotal(product);
-  };
-
-  private stockTotal = (product: ProductType) => product.skus.reduce((sum, sku) => sum + sku.stock, 0);
 
   private lowestSkuPrice = (product: ProductType) =>
     product.skus.length > 0 ? Math.min(...product.skus.map((sku) => sku.price)) : 0;
