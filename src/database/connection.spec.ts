@@ -22,10 +22,10 @@ describe("databasePoolConfig", () => {
     expect(() => databasePoolConfig(baseEnv(nodeEnv))).toThrow("POSTGRES_SSL=true");
   });
 
-  it("loads a valid built-in root CA with certificate verification in non-local environments", async () => {
+  it("loads a valid root CA bundle with certificate verification in non-local environments", async () => {
     const directory = mkdtempSync(path.join(tmpdir(), "dadamjang-postgres-"));
     const caPath = path.join(directory, "global-bundle.pem");
-    const ca = Buffer.from(rootCertificates[0] ?? "");
+    const ca = Buffer.from(rootCertificates.slice(0, 2).join("\n"));
     writeFileSync(caPath, ca);
 
     try {

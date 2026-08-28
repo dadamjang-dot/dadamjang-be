@@ -1,4 +1,5 @@
 import type { OnApplicationShutdown } from "@nestjs/common";
+import { X509Certificate } from "crypto";
 import { readFileSync } from "fs";
 import { Pool, type PoolConfig } from "pg";
 import { createSecureContext } from "tls";
@@ -11,6 +12,8 @@ const databaseNames = {
 } as const;
 
 const localEnvironments = new Set(["local", "development", "test"]);
+const certificatePattern = /-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g;
+const invalidCaMessage = "POSTGRES_SSL_CA_PATH must point to a readable nonempty valid CA bundle";
 
 const requiredEnv = (env: NodeJS.ProcessEnv, name: string) => {
   const value = env[name];
@@ -25,6 +28,16 @@ const databasePort = (value: string | undefined) => {
   return Number(port);
 };
 
+const validateCaBundle = (ca: Buffer) => {
+  const source = ca.toString("utf8");
+  const certificates = source.match(certificatePattern) ?? [];
+  if (!certificates.length || source.replace(certificatePattern, "").trim()) throw new Error(invalidCaMessage);
+  for (const certificate of certificates) {
+    if (!new X509Certificate(certificate).ca) throw new Error(invalidCaMessage);
+  }
+  createSecureContext({ ca });
+};
+
 const databaseSsl = (env: NodeJS.ProcessEnv) => {
   const environment = env.NODE_ENV ?? "development";
   if (localEnvironments.has(environment)) return undefined;
@@ -34,13 +47,13 @@ const databaseSsl = (env: NodeJS.ProcessEnv) => {
   try {
     ca = readFileSync(caPath);
   } catch {
-    throw new Error("POSTGRES_SSL_CA_PATH must point to a readable nonempty valid CA bundle");
+    throw new Error(invalidCaMessage);
   }
-  if (!ca.length) throw new Error("POSTGRES_SSL_CA_PATH must point to a readable nonempty valid CA bundle");
+  if (!ca.length) throw new Error(invalidCaMessage);
   try {
-    createSecureContext({ ca, cert: ca });
+    validateCaBundle(ca);
   } catch {
-    throw new Error("POSTGRES_SSL_CA_PATH must point to a readable nonempty valid CA bundle");
+    throw new Error(invalidCaMessage);
   }
   return { rejectUnauthorized: true, ca };
 };
