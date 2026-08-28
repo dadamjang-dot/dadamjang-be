@@ -12,6 +12,7 @@ const databaseNames = {
 } as const;
 
 const localEnvironments = new Set(["local", "development", "test"]);
+const databaseOptions = "-c timezone=UTC";
 const certificatePattern = /-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g;
 const invalidCaMessage = "POSTGRES_SSL_CA_PATH must point to a readable nonempty valid CA bundle";
 
@@ -67,6 +68,7 @@ export const databasePoolConfig = (env: NodeJS.ProcessEnv = process.env): PoolCo
     password: requiredEnv(env, "POSTGRES_PASSWORD"),
     database: requiredEnv(env, "POSTGRES_DATABASE"),
     connectionTimeoutMillis: 3000,
+    options: databaseOptions,
     ...(ssl === undefined ? {} : { ssl }),
   };
 };
@@ -88,4 +90,7 @@ export const assertDatabaseMode = (mode: DatabaseMode) => {
 };
 
 export const createDatabasePool = (env: NodeJS.ProcessEnv = process.env, options?: string) =>
-  new DatabasePool({ ...databasePoolConfig(env), ...(options === undefined ? {} : { options }) });
+  new DatabasePool({
+    ...databasePoolConfig(env),
+    options: options === undefined ? databaseOptions : `${databaseOptions} ${options}`,
+  });

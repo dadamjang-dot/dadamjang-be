@@ -112,6 +112,10 @@ describe("databasePoolConfig", () => {
     expect(databasePoolConfig(env).port).toBe(5432);
   });
 
+  it("uses UTC for database timestamp comparisons", () => {
+    expect(databasePoolConfig(baseEnv()).options).toBe("-c timezone=UTC");
+  });
+
   it("bounds shared pool connections without globally bounding application queries", async () => {
     const config = databasePoolConfig(baseEnv());
     const pool = createDatabasePool(baseEnv());
@@ -126,7 +130,7 @@ describe("databasePoolConfig", () => {
   it("keeps scoped connection options on the shared pool path", async () => {
     const pool = createDatabasePool(baseEnv(), "-c search_path=scoped,public");
 
-    expect(pool.options.options).toBe("-c search_path=scoped,public");
+    expect(pool.options.options).toBe("-c timezone=UTC -c search_path=scoped,public");
     await pool.end();
   });
 });
