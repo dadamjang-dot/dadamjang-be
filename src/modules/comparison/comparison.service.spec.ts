@@ -23,6 +23,13 @@ const listDatabase = () => ({
   }),
 });
 
+const query = (result: readonly unknown[]) => {
+  const chain = { from: jest.fn(), where: jest.fn(), limit: jest.fn().mockResolvedValue(result) };
+  chain.from.mockReturnValue(chain);
+  chain.where.mockReturnValue(chain);
+  return chain;
+};
+
 describe("ComparisonService", () => {
   it("hydrates comparison products with one batch while preserving item order", async () => {
     const getProductsByIds = jest.fn().mockResolvedValue([
@@ -46,5 +53,40 @@ describe("ComparisonService", () => {
     await expect(service.listPriceSummaries("user-1")).resolves.toEqual(summaries);
     expect(getProductPriceSummariesByIds).toHaveBeenCalledTimes(1);
     expect(getProductPriceSummariesByIds).toHaveBeenCalledWith(["product-a", "product-b"]);
+  });
+
+  it("returns an existing item without recording duplicate activity", async () => {
+    const existing = comparisonRows[0];
+    const insert = jest.fn().mockReturnValue({
+      values: jest.fn().mockReturnValue({
+        onConflictDoNothing: jest.fn().mockReturnValue({ returning: jest.fn().mockResolvedValue([]) }),
+      }),
+    });
+    const tx = { insert, select: () => query([existing]) };
+    const transaction = jest.fn(async (callback: (value: typeof tx) => unknown) => callback(tx));
+    const product = { productId: "product-a", status: "PUBLISHED" };
+    const service = new ComparisonService(
+      { transaction } as never,
+      {
+        getProduct: jest.fn().mockResolvedValue(product),
+      } as never,
+    );
+
+    await expect(service.add("user-1", "product-a")).resolves.toEqual({ ...existing, product });
+    expect(transaction).toHaveBeenCalledTimes(1);
+    expect(insert).toHaveBeenCalledTimes(1);
+  });
+
+  it("deletes an item and records its activity in one transaction", async () => {
+    const returning = jest.fn().mockResolvedValue([{ productId: "product-a" }]);
+    const deleteItem = jest.fn().mockReturnValue({ where: jest.fn().mockReturnValue({ returning }) });
+    const insert = jest.fn().mockReturnValue({ values: jest.fn().mockResolvedValue(undefined) });
+    const tx = { delete: deleteItem, insert };
+    const transaction = jest.fn(async (callback: (value: typeof tx) => unknown) => callback(tx));
+    const service = new ComparisonService({ transaction } as never, {} as never);
+
+    await expect(service.remove("user-1", "product-a")).resolves.toBe(true);
+    expect(transaction).toHaveBeenCalledTimes(1);
+    expect(insert).toHaveBeenCalledTimes(1);
   });
 });

@@ -47,35 +47,45 @@ export class ComparisonService {
     const product = await this.catalogService.getProduct(productId);
     if (!product || product.status !== "PUBLISHED")
       throw new CustomNotFoundException(ComparisonErrorMessage.ProductNotFound);
-    const [item] = await this.db
-      .insert(comparisonItems)
-      .values({ userId, productId })
-      .onConflictDoNothing()
-      .returning();
-    await this.db.insert(activityEvents).values({
-      actorUserId: userId,
-      eventType: "COMPARISON_ITEM_ADDED",
-      subjectType: "PRODUCT",
-      subjectId: productId,
+    const item = await this.db.transaction(async (tx) => {
+      const [created] = await tx
+        .insert(comparisonItems)
+        .values({ userId, productId })
+        .onConflictDoNothing()
+        .returning();
+      if (created) {
+        await tx.insert(activityEvents).values({
+          actorUserId: userId,
+          eventType: "COMPARISON_ITEM_ADDED",
+          subjectType: "PRODUCT",
+          subjectId: productId,
+        });
+        return created;
+      }
+      const [existing] = await tx
+        .select()
+        .from(comparisonItems)
+        .where(and(eq(comparisonItems.userId, userId), eq(comparisonItems.productId, productId)))
+        .limit(1);
+      if (!existing) throw new Error("Comparison item creation failed");
+      return existing;
     });
-    if (item) return { ...item, product };
-    const [existing] = await this.db
-      .select()
-      .from(comparisonItems)
-      .where(and(eq(comparisonItems.userId, userId), eq(comparisonItems.productId, productId)))
-      .limit(1);
-    return { ...existing, product };
+    return { ...item, product };
   };
 
   remove = async (userId: string, productId: string) => {
-    await this.db
-      .delete(comparisonItems)
-      .where(and(eq(comparisonItems.userId, userId), eq(comparisonItems.productId, productId)));
-    await this.db.insert(activityEvents).values({
-      actorUserId: userId,
-      eventType: "COMPARISON_ITEM_REMOVED",
-      subjectType: "PRODUCT",
-      subjectId: productId,
+    await this.db.transaction(async (tx) => {
+      const [removed] = await tx
+        .delete(comparisonItems)
+        .where(and(eq(comparisonItems.userId, userId), eq(comparisonItems.productId, productId)))
+        .returning({ productId: comparisonItems.productId });
+      if (!removed) return;
+      await tx.insert(activityEvents).values({
+        actorUserId: userId,
+        eventType: "COMPARISON_ITEM_REMOVED",
+        subjectType: "PRODUCT",
+        subjectId: productId,
+      });
     });
     return true;
   };
