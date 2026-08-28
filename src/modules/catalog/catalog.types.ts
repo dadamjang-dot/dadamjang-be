@@ -272,6 +272,21 @@ export class ProductSkuInput {
   stock!: number;
 }
 
+export const hasValidProductSkus = (skus: readonly ProductSkuInput[]) =>
+  skus.length >= 1 &&
+  skus.length <= 100 &&
+  skus.every(
+    (sku) =>
+      [...sku.code].length <= 80 &&
+      [...sku.optionName].length <= 160 &&
+      Number.isInteger(sku.price) &&
+      sku.price >= 0 &&
+      sku.price <= 2_147_483_647 &&
+      Number.isInteger(sku.stock) &&
+      sku.stock >= 0 &&
+      sku.stock <= 2_147_483_647,
+  );
+
 @InputType()
 export class CreateProductDraftInput {
   @Field()

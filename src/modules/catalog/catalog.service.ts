@@ -16,6 +16,7 @@ import {
   CatalogFilterOptionsType,
   CreateCategoryInput,
   CreateProductDraftInput,
+  hasValidProductSkus,
   ProductFilterInput,
   ProductPriceEvidenceType,
   ProductPriceSummaryType,
@@ -357,8 +358,7 @@ export class CatalogService {
 
   createDraft = async (partnerId: string, input: CreateProductDraftInput) => {
     if (input.skus.length === 0) throw new CustomBadRequestException("At least one SKU is required");
-    if (input.skus.some((sku) => sku.price < 0 || sku.stock < 0))
-      throw new CustomBadRequestException(CatalogErrorMessage.InvalidPriceOrStock);
+    if (!hasValidProductSkus(input.skus)) throw new CustomBadRequestException(CatalogErrorMessage.InvalidPriceOrStock);
     return this.db.transaction(async (tx) => {
       const product = requireResult(
         (

@@ -1,6 +1,6 @@
 import { CatalogErrorMessage } from "./catalog.error";
 import { CatalogService, decodeProductCursor, encodeProductCursor } from "./catalog.service";
-import { ProductSort } from "./catalog.types";
+import { CreateProductDraftInput, ProductSort } from "./catalog.types";
 
 const rawCursor = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url");
 const createCatalogService = () => new CatalogService({} as never, { getProductImageUrl: jest.fn() } as never);
@@ -213,6 +213,60 @@ describe("catalog product batches", () => {
         lowestPriceEvidenceSummary: "현재 옵션 최저가 기준",
       },
     ]);
+  });
+});
+
+describe("catalog SKU boundaries", () => {
+  const inputWithSkuCount = (count: number): CreateProductDraftInput => ({
+    categoryId: "category-1",
+    title: "Product",
+    description: "Description",
+    imageUrls: [],
+    skus: Array.from({ length: count }, (_, index) => ({
+      code: `sku-${index}`,
+      optionName: "Option",
+      price: 0,
+      stock: 0,
+    })),
+  });
+
+  it.each([1, 100])("accepts %i SKUs", async (count) => {
+    const transaction = jest.fn().mockResolvedValue({});
+    const service = new CatalogService({ transaction } as never, {} as never);
+
+    await expect(service.createDraft("partner-1", inputWithSkuCount(count))).resolves.toEqual({});
+    expect(transaction).toHaveBeenCalledTimes(1);
+  });
+
+  const invalidInputs: [string, CreateProductDraftInput][] = [
+    ["zero SKUs", inputWithSkuCount(0)],
+    ["101 SKUs", inputWithSkuCount(101)],
+    [
+      "an overlong code",
+      { ...inputWithSkuCount(1), skus: [{ ...inputWithSkuCount(1).skus[0]!, code: "c".repeat(81) }] },
+    ],
+    [
+      "an overlong option",
+      { ...inputWithSkuCount(1), skus: [{ ...inputWithSkuCount(1).skus[0]!, optionName: "o".repeat(161) }] },
+    ],
+    ["a negative price", { ...inputWithSkuCount(1), skus: [{ ...inputWithSkuCount(1).skus[0]!, price: -1 }] }],
+    [
+      "an excessive price",
+      { ...inputWithSkuCount(1), skus: [{ ...inputWithSkuCount(1).skus[0]!, price: 2_147_483_648 }] },
+    ],
+    ["negative stock", { ...inputWithSkuCount(1), skus: [{ ...inputWithSkuCount(1).skus[0]!, stock: -1 }] }],
+    [
+      "excessive stock",
+      { ...inputWithSkuCount(1), skus: [{ ...inputWithSkuCount(1).skus[0]!, stock: 2_147_483_648 }] },
+    ],
+  ];
+
+  it.each(invalidInputs)("rejects %s before database work", async (_case, input) => {
+    const transaction = jest.fn();
+    const service = new CatalogService({ transaction } as never, {} as never);
+
+    await expect(service.createDraft("partner-1", input)).rejects.toThrow();
+    expect(transaction).not.toHaveBeenCalled();
   });
 });
 

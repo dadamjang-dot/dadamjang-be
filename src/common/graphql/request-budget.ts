@@ -1,10 +1,43 @@
-import { GraphQLError, Kind, type FragmentDefinitionNode, type SelectionSetNode, type ValidationRule } from "graphql";
+import type { ApolloServerPlugin } from "@apollo/server";
+import {
+  GraphQLError,
+  Kind,
+  type ASTNode,
+  type FragmentDefinitionNode,
+  type SelectionSetNode,
+  type ValidationRule,
+  type ValueNode,
+} from "graphql";
 
 const maxAliases = 20;
 const maxDepth = 12;
 const maxFields = 250;
+const maxCardinality = 100;
+const cardinalityNames = new Set(["first", "last", "limit", "pageSize", "take"]);
 
 type RequestBudget = { aliases: number; fields: number };
+
+const requestBudgetError = (nodes?: ASTNode | readonly ASTNode[]) =>
+  new GraphQLError("GraphQL operation exceeds the request budget", {
+    ...(nodes ? { nodes } : {}),
+    extensions: { code: "GRAPHQL_VALIDATION_FAILED" },
+  });
+
+const valueExceedsBudget = (value: ValueNode, name?: string): boolean => {
+  if (value.kind === Kind.LIST)
+    return value.values.length > maxCardinality || value.values.some((item) => valueExceedsBudget(item));
+  if (value.kind === Kind.OBJECT)
+    return value.fields.some((field) => valueExceedsBudget(field.value, field.name.value));
+  return value.kind === Kind.INT && !!name && cardinalityNames.has(name) && Number(value.value) > maxCardinality;
+};
+
+const variableValueExceedsBudget = (value: unknown, name?: string): boolean => {
+  if (Array.isArray(value))
+    return value.length > maxCardinality || value.some((item) => variableValueExceedsBudget(item));
+  if (typeof value === "object" && value !== null)
+    return Object.entries(value).some(([field, item]) => variableValueExceedsBudget(item, field));
+  return typeof value === "number" && !!name && cardinalityNames.has(name) && value > maxCardinality;
+};
 
 const exceedsBudget = (
   selectionSet: SelectionSetNode,
@@ -17,7 +50,13 @@ const exceedsBudget = (
     if (selection.kind === Kind.FIELD) {
       budget.fields += 1;
       if (selection.alias) budget.aliases += 1;
-      if (depth > maxDepth || budget.fields > maxFields || budget.aliases > maxAliases) return true;
+      if (
+        depth > maxDepth ||
+        budget.fields > maxFields ||
+        budget.aliases > maxAliases ||
+        selection.arguments?.some((argument) => valueExceedsBudget(argument.value, argument.name.value))
+      )
+        return true;
       if (
         selection.selectionSet &&
         exceedsBudget(selection.selectionSet, fragments, activeFragments, budget, depth + 1)
@@ -50,12 +89,15 @@ export const requestBudgetRule: ValidationRule = (context) => ({
     for (const definition of document.definitions) {
       if (definition.kind !== Kind.OPERATION_DEFINITION) continue;
       if (!exceedsBudget(definition.selectionSet, fragments, new Set(), { aliases: 0, fields: 0 }, 1)) continue;
-      context.reportError(
-        new GraphQLError("GraphQL operation exceeds the request budget", {
-          nodes: definition,
-          extensions: { code: "GRAPHQL_VALIDATION_FAILED" },
-        }),
-      );
+      context.reportError(requestBudgetError(definition));
     }
   },
 });
+
+export const requestBudgetPlugin: ApolloServerPlugin = {
+  requestDidStart: async () => ({
+    didResolveOperation: async ({ request }) => {
+      if (variableValueExceedsBudget(request.variables)) throw requestBudgetError();
+    },
+  }),
+};

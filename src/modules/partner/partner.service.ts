@@ -16,6 +16,7 @@ import {
 } from "src/modules/database/schema";
 import { EmailService } from "src/modules/email/email.service";
 import { MediaService } from "src/modules/media/media.service";
+import { hasValidProductSkus } from "src/modules/catalog/catalog.types";
 import { PartnerErrorMessage } from "./partner.error";
 import {
   ApplyPartnerInput,
@@ -180,6 +181,7 @@ export class PartnerService {
   };
 
   createDraft = async (ownerUserId: string, input: PartnerProductInput) => {
+    if (!hasValidProductSkus(input.skus)) throw new CustomBadRequestException(PartnerErrorMessage.InvalidProductInput);
     const partner = await this.approvedPartner(ownerUserId);
     const imageKeys = await this.validate(ownerUserId, input);
     const imageUrls = await Promise.all(imageKeys.map((key) => this.mediaService.getProductImageUrl(key)));
@@ -213,6 +215,7 @@ export class PartnerService {
   };
 
   updateDraft = async (ownerUserId: string, productId: string, input: PartnerProductInput) => {
+    if (!hasValidProductSkus(input.skus)) throw new CustomBadRequestException(PartnerErrorMessage.InvalidProductInput);
     const partner = await this.approvedPartner(ownerUserId);
     const imageKeys = await this.validate(ownerUserId, input);
     const imageUrls = await Promise.all(imageKeys.map((key) => this.mediaService.getProductImageUrl(key)));
@@ -314,10 +317,6 @@ export class PartnerService {
       input.description.length > 2000 ||
       input.imageKeys.length < 1 ||
       input.imageKeys.length > 10 ||
-      input.skus.length < 1 ||
-      input.skus.some(
-        (sku) => !Number.isInteger(sku.price) || sku.price < 0 || !Number.isInteger(sku.stock) || sku.stock < 0,
-      ) ||
       new Set(input.skus.map((sku) => sku.code)).size !== input.skus.length
     )
       throw new CustomBadRequestException(PartnerErrorMessage.InvalidProductInput);
