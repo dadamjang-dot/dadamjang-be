@@ -279,25 +279,6 @@ export class MediaRepository {
     if (!completed) throw invalidObject();
   };
 
-  releaseGarbage = async (claim: ClaimedGarbage, now = new Date()) => {
-    await this.db
-      .update(mediaObjectPromotions)
-      .set({
-        gcClaimedAt: null,
-        gcClaimToken: null,
-        gcPreviousStatus: null,
-        status: claim.gcPreviousStatus,
-        updatedAt: now,
-      })
-      .where(
-        and(
-          eq(mediaObjectPromotions.finalKey, claim.finalKey),
-          eq(mediaObjectPromotions.status, "DELETING"),
-          eq(mediaObjectPromotions.gcClaimToken, claim.gcClaimToken),
-        ),
-      );
-  };
-
   private lockPromotion = async (tx: DatabaseTransaction, finalKey: string) =>
     requireResult(
       (

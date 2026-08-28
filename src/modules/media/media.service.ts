@@ -218,16 +218,11 @@ export class MediaService implements OnModuleInit, OnApplicationShutdown {
     const claim = await this.repository.claimGarbage(now);
     if (!claim) return false;
     try {
-      try {
-        await this.client.send(new DeleteObjectCommand({ Bucket: this.finalBucket, Key: claim.finalKey }));
-      } catch (error) {
-        if (storageStatus(error) !== 404) throw error;
-      }
-      await this.repository.completeGarbage(claim, now);
+      await this.client.send(new DeleteObjectCommand({ Bucket: this.finalBucket, Key: claim.finalKey }));
     } catch (error) {
-      await this.repository.releaseGarbage(claim, now);
-      throw error;
+      if (storageStatus(error) !== 404) throw error;
     }
+    await this.repository.completeGarbage(claim, now);
     return true;
   };
 

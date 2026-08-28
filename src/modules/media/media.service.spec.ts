@@ -1,4 +1,4 @@
-import { CopyObjectCommand, GetObjectCommand, HeadObjectCommand } from "@aws-sdk/client-s3";
+import { CopyObjectCommand, DeleteObjectCommand, GetObjectCommand, HeadObjectCommand } from "@aws-sdk/client-s3";
 import { ConfigService } from "@nestjs/config";
 import sharp from "sharp";
 import { CustomTooManyRequestsException } from "src/common/errors/custom-exceptions";
@@ -25,6 +25,7 @@ let imageBytes: Record<SupportedContentType, Buffer>;
 const createService = (
   admissionLimiter = allow(),
   imageTransformBaseUrl = "https://images.example.com/cdn-cgi/image/",
+  repositoryOverride?: Record<string, jest.Mock>,
 ) => {
   const values: Record<string, string> = {
     CLOUDFLARE_R2_BUCKET: "dadamjang-staging-images",
@@ -39,7 +40,7 @@ const createService = (
     get: jest.fn((key: string) => values[key]),
     getOrThrow: jest.fn((key: string) => values[key]),
   } as unknown as ConfigService;
-  const repository = {
+  const repository = repositoryOverride ?? {
     adoptFinalObject: jest.fn().mockResolvedValue(undefined),
     claimGarbage: jest.fn().mockResolvedValue(undefined),
     completeGarbage: jest.fn().mockResolvedValue(undefined),
@@ -404,6 +405,48 @@ describe("MediaService", () => {
         origin,
       ),
     ).rejects.toThrow(MediaErrorMessage.UnsupportedType);
+  });
+
+  it("keeps deletion monotonic when completion fails after object deletion starts", async () => {
+    const claim = { finalKey: validProductKey, gcClaimToken: "claim-1", gcPreviousStatus: "READY" };
+    let status = "READY";
+    let completionAttempts = 0;
+    const repository = {
+      claimGarbage: jest.fn(async () => {
+        if (status === "DELETED") return undefined;
+        status = "DELETING";
+        return claim;
+      }),
+      completeGarbage: jest.fn(async () => {
+        completionAttempts += 1;
+        if (completionAttempts === 1) throw new Error("completion failed");
+        status = "DELETED";
+      }),
+      releaseGarbage: jest.fn(async () => {
+        status = "READY";
+      }),
+      replaceReferences: jest.fn(async () => {
+        if (status !== "READY") throw new Error("reference rejected");
+      }),
+    };
+    const service = createService(allow(), "https://images.example.com/cdn-cgi/image/", repository);
+    const send = jest.spyOn(clientOf(service), "send").mockResolvedValue({});
+
+    await expect(service.runGarbageCollectionOnce()).rejects.toThrow("completion failed");
+    let referenceRejected = false;
+    try {
+      await repository.replaceReferences();
+    } catch {
+      referenceRejected = true;
+    }
+    await expect(service.runGarbageCollectionOnce()).resolves.toBe(true);
+
+    expect({
+      deleteAttempts: send.mock.calls.filter(([command]) => command instanceof DeleteObjectCommand).length,
+      referenceRejected,
+      releaseAttempts: repository.releaseGarbage.mock.calls.length,
+      status,
+    }).toEqual({ deleteAttempts: 2, referenceRejected: true, releaseAttempts: 0, status: "DELETED" });
   });
 
   it.each([
