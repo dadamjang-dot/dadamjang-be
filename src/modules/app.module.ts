@@ -4,6 +4,7 @@ import { GraphQLModule } from "@nestjs/graphql";
 import { ApolloDriver, ApolloDriverConfig } from "@nestjs/apollo";
 import type { ExpressContextFunctionArgument } from "@as-integrations/express5";
 import { GraphQLError } from "graphql";
+import { requestBudgetRule } from "src/common/graphql/request-budget";
 import { AuthModule } from "./auth/auth.module";
 import { DatabaseModule } from "./database/database.module";
 import { EmailModule } from "./email/email.module";
@@ -43,12 +44,15 @@ const graphQlErrorCode = (status: number) => {
     GraphQLModule.forRoot<ApolloDriverConfig>({
       driver: ApolloDriver,
       autoSchemaFile: true,
+      validationRules: [requestBudgetRule],
       context: ({ req, res }: ExpressContextFunctionArgument) => ({ req, res }),
       formatError: (formattedError, error) => {
         const originalError = error instanceof GraphQLError ? error.originalError : undefined;
         const extensions = Object.fromEntries(
           Object.entries(formattedError.extensions ?? {}).filter(([key]) => key !== "stacktrace"),
         );
+        if (extensions.code === "GRAPHQL_PARSE_FAILED" || extensions.code === "GRAPHQL_VALIDATION_FAILED")
+          return { ...formattedError, extensions };
         if (originalError instanceof HttpException)
           return {
             ...formattedError,

@@ -73,6 +73,19 @@ describe("PostgreSQL GraphQL integration", () => {
     expect(rejected.body.errors).toHaveLength(1);
   });
 
+  it("rejects GraphQL documents that exceed the request budget", async () => {
+    const aliases = Array.from({ length: 21 }, (_, index) => `field${index}: __typename`).join("\n");
+    const response = await request(app.getHttpServer())
+      .post("/graphql")
+      .send({ query: `query Oversized { ${aliases} }` })
+      .expect(400);
+
+    expect(response.body.errors[0]).toMatchObject({
+      message: "GraphQL operation exceeds the request budget",
+      extensions: { code: "GRAPHQL_VALIDATION_FAILED" },
+    });
+  });
+
   it("filters and paginates catalog products with stable cursors", async () => {
     const first = await request(app.getHttpServer())
       .post("/graphql")
