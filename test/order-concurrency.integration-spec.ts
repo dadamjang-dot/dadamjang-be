@@ -108,14 +108,14 @@ describe("PostgreSQL checkout concurrency", () => {
     const accessToken = await signin(app);
     await addCartItem(app, accessToken);
     const blocker = await pool.connect();
-    await blocker.query("BEGIN");
-    await blocker.query(`LOCK TABLE "checkoutIdempotencyKeys" IN SHARE MODE`);
-    const requests = [
-      checkout(app, accessToken, "concurrent-same-key"),
-      checkout(app, accessToken, "concurrent-same-key"),
-    ];
+    const requests: ReturnType<typeof checkout>[] = [];
     let released = false;
+    let lockError: unknown;
     try {
+      await blocker.query("BEGIN");
+      await blocker.query(`LOCK TABLE "checkoutIdempotencyKeys" IN SHARE MODE`);
+      requests.push(checkout(app, accessToken, "concurrent-same-key"));
+      requests.push(checkout(app, accessToken, "concurrent-same-key"));
       await waitFor(async () => {
         const waiting = await pool.query<{ count: number }>(
           `SELECT count(*)::int AS count
@@ -127,9 +127,15 @@ describe("PostgreSQL checkout concurrency", () => {
       });
       await blocker.query("COMMIT");
       released = true;
+    } catch (error) {
+      lockError = error;
     } finally {
-      if (!released) await blocker.query("ROLLBACK");
+      if (!released) await blocker.query("ROLLBACK").catch(() => undefined);
       blocker.release();
+    }
+    if (lockError) {
+      await Promise.allSettled(requests);
+      throw lockError;
     }
 
     const responses = await Promise.all(requests);
@@ -150,11 +156,14 @@ describe("PostgreSQL checkout concurrency", () => {
     const accessToken = await signin(app);
     await addCartItem(app, accessToken);
     const blocker = await pool.connect();
-    await blocker.query("BEGIN");
-    await blocker.query(`LOCK TABLE "orders" IN SHARE MODE`);
-    const requests = [checkout(app, accessToken, "concurrent-cart-a"), checkout(app, accessToken, "concurrent-cart-b")];
+    const requests: ReturnType<typeof checkout>[] = [];
     let released = false;
+    let lockError: unknown;
     try {
+      await blocker.query("BEGIN");
+      await blocker.query(`LOCK TABLE "orders" IN SHARE MODE`);
+      requests.push(checkout(app, accessToken, "concurrent-cart-a"));
+      requests.push(checkout(app, accessToken, "concurrent-cart-b"));
       await waitFor(async () => {
         const waiting = await pool.query<{ count: number }>(
           `SELECT count(*)::int AS count
@@ -168,9 +177,15 @@ describe("PostgreSQL checkout concurrency", () => {
       });
       await blocker.query("COMMIT");
       released = true;
+    } catch (error) {
+      lockError = error;
     } finally {
-      if (!released) await blocker.query("ROLLBACK");
+      if (!released) await blocker.query("ROLLBACK").catch(() => undefined);
       blocker.release();
+    }
+    if (lockError) {
+      await Promise.allSettled(requests);
+      throw lockError;
     }
 
     const responses = await Promise.all(requests);
