@@ -1,7 +1,7 @@
 import { Args, Context, Mutation, Query, Resolver } from "@nestjs/graphql";
 import { UseGuards } from "@nestjs/common";
 import type { Request, Response } from "express";
-import { JwtAccessTokenGuard } from "src/guards/accessToken.guard";
+import { JwtAccessTokenGuard } from "src/guards/access-token.guard";
 import { deviceIdFromRequest, setTokenCookies } from "src/modules/auth/auth-http";
 import type { AuthRequest } from "src/modules/auth/auth.types";
 import { TokenPayload } from "src/modules/auth/auth.types";

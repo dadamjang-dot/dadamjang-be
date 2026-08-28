@@ -2,7 +2,7 @@ import { Injectable } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { PassportStrategy } from "@nestjs/passport";
 import { Strategy } from "passport-kakao";
-import { KakaoProfile, KakaoRawProfile } from "src/modules/auth/auth.types";
+import type { KakaoProfile, KakaoRawProfile } from "src/modules/auth/auth.types";
 
 @Injectable()
 export class KakaoStrategy extends PassportStrategy(Strategy, "kakao") {

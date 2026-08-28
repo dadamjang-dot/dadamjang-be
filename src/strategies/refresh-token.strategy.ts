@@ -1,8 +1,8 @@
 import { Injectable } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { PassportStrategy } from "@nestjs/passport";
-import { Request } from "express";
-import { ExtractJwt, Strategy, StrategyOptions } from "passport-jwt";
+import type { Request } from "express";
+import { ExtractJwt, Strategy, type StrategyOptions } from "passport-jwt";
 import { CustomUnauthorizedException } from "src/common/errors/custom-exceptions";
 import { AuthErrorMessage } from "src/modules/auth/auth.error";
 import { AuthService } from "src/modules/auth/auth.service";

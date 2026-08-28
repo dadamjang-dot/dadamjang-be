@@ -1,6 +1,6 @@
 import { Args, Context, Mutation, Query, Resolver } from "@nestjs/graphql";
 import { UseGuards } from "@nestjs/common";
-import { JwtAccessTokenGuard } from "src/guards/accessToken.guard";
+import { JwtAccessTokenGuard } from "src/guards/access-token.guard";
 import { RolesGuard } from "src/guards/roles.guard";
 import { UserRole } from "src/auth/role";
 import { Roles } from "src/auth/roles.decorator";

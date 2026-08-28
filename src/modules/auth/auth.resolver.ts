@@ -1,14 +1,14 @@
 import { Args, Context, Mutation, Query, Resolver } from "@nestjs/graphql";
 import { UseGuards } from "@nestjs/common";
 import { Request, Response } from "express";
-import { JwtRefreshTokenGuard } from "src/guards/refreshToken.guard";
+import { JwtRefreshTokenGuard } from "src/guards/refresh-token.guard";
 import { CustomUnauthorizedException } from "src/common/errors/custom-exceptions";
 import { authCookieOptions } from "./cookie-options";
 import { AuthErrorMessage } from "./auth.error";
 import { deviceIdFromRequest, setTokenCookies } from "./auth-http";
 import { AuthService } from "./auth.service";
 import { AuthRequest, AuthViewer, RefreshAuthRequest, SigninAuthInput, TokenPayload } from "./auth.types";
-import { JwtAccessTokenGuard } from "src/guards/accessToken.guard";
+import { JwtAccessTokenGuard } from "src/guards/access-token.guard";
 
 @Resolver()
 export class AuthResolver {

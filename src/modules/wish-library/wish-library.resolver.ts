@@ -5,7 +5,7 @@ import { UserRole } from "src/auth/role";
 import { Roles } from "src/auth/roles.decorator";
 import { CustomUnauthorizedException } from "src/common/errors/custom-exceptions";
 import { BrandType } from "src/modules/catalog/catalog.types";
-import { JwtAccessTokenGuard } from "src/guards/accessToken.guard";
+import { JwtAccessTokenGuard } from "src/guards/access-token.guard";
 import { RolesGuard } from "src/guards/roles.guard";
 import { WishLibraryErrorMessage } from "./wish-library.error";
 import { WishLibraryService } from "./wish-library.service";
