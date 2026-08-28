@@ -1,5 +1,5 @@
 import { Inject, Injectable } from "@nestjs/common";
-import { and, asc, desc, eq, gte, ilike, inArray, lte, sql } from "drizzle-orm";
+import { SQL, and, asc, desc, eq, getTableColumns, gte, ilike, inArray, lte, or, sql } from "drizzle-orm";
 import { CustomBadRequestException, CustomNotFoundException } from "src/common/errors/custom-exceptions";
 import { Database, DRIZZLE } from "src/modules/database/database.module";
 import { brands, categories, colors, productSkus, products, sizes } from "src/modules/database/schema";
@@ -132,32 +132,79 @@ export class CatalogService {
   private listCatalogProducts = async (filter: ProductFilterInput) => {
     const first = Math.min(Math.max(filter.first ?? 20, 1), MAX_PAGE_SIZE);
     const cursor = filter.after ? decodeProductCursor(filter.after) : undefined;
+    const selectedSort = filter.sort ?? ProductSort.RECOMMENDED;
     const conditions = this.productConditions(filter);
+    const sortValue =
+      selectedSort === ProductSort.LOW_PRICE || selectedSort === ProductSort.HIGH_PRICE
+        ? sql<number>`coalesce(${this.activeLowestPrice()}, 0)::double precision`
+        : selectedSort === ProductSort.POPULAR
+          ? this.activeStockTotal()
+          : undefined;
+    const cursorCondition = cursor ? this.productCursorCondition(cursor, selectedSort, sortValue) : undefined;
+    const order = sortValue
+      ? [
+          selectedSort === ProductSort.LOW_PRICE ? asc(sortValue) : desc(sortValue),
+          desc(products.createdAt),
+          desc(products.productId),
+        ]
+      : [desc(products.createdAt), desc(products.productId)];
+    const cursorCreatedAt = sql<string>`to_char(${products.createdAt}, 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')`;
     const [rows, countRows] = await Promise.all([
       this.db
-        .select()
+        .select({ ...getTableColumns(products), cursorCreatedAt })
         .from(products)
-        .where(and(...conditions))
-        .orderBy(desc(products.createdAt), desc(products.productId)),
+        .where(and(...conditions, cursorCondition))
+        .orderBy(...order)
+        .limit(first + 1),
       this.db
         .select({ count: sql<number>`count(*)` })
         .from(products)
         .where(and(...conditions)),
     ]);
-    const filtered = (await this.withSkus(rows)).filter((product) => this.matchesFilter(product, filter));
-    const sorted = this.sortProducts(filtered, filter.sort);
-    const start = cursor ? this.cursorStart(sorted, cursor, filter.sort) : 0;
-    const page = sorted.slice(start, start + first + 1);
-    const nodes = page.slice(0, first);
-    const hasNextPage = page.length > first;
+    const pageRows = rows.slice(0, first);
+    const nodes = await this.withSkus(pageRows.map(({ cursorCreatedAt: _, ...product }) => product));
+    const hasNextPage = rows.length > first;
     const tail = nodes[nodes.length - 1];
+    const tailRow = pageRows[pageRows.length - 1];
     return {
       nodes,
       hasNextPage,
-      nextCursor: hasNextPage && tail ? encodeProductCursor(this.toProductCursor(tail, filter.sort)) : null,
-      totalCount: Number(countRows[0]?.count ?? sorted.length),
+      nextCursor:
+        hasNextPage && tail && tailRow
+          ? encodeProductCursor(this.toProductCursor(tail, tailRow.cursorCreatedAt, filter.sort))
+          : null,
+      totalCount: Number(countRows[0]?.count ?? 0),
     };
   };
+
+  private productCursorCondition = (cursor: ProductCursor, sort: ProductSort, sortValue: SQL<number> | undefined) => {
+    const createdAt = sql`${cursor.createdAt}::timestamp`;
+    const tieBreaker = or(
+      sql`${products.createdAt} < ${createdAt}`,
+      and(sql`${products.createdAt} = ${createdAt}`, sql`${products.productId} < ${cursor.productId}`),
+    );
+    if (!sortValue || cursor.sortValue === undefined) return tieBreaker;
+    return or(
+      sort === ProductSort.LOW_PRICE
+        ? sql`${sortValue} > ${cursor.sortValue}`
+        : sql`${sortValue} < ${cursor.sortValue}`,
+      and(sql`${sortValue} = ${cursor.sortValue}`, tieBreaker),
+    );
+  };
+
+  private activeLowestPrice = () => sql<number>`(
+    select min(${productSkus.price})
+    from ${productSkus}
+    where ${productSkus.productId} = ${products.productId}
+      and ${productSkus.isActive} = true
+  )`;
+
+  private activeStockTotal = () => sql<number>`coalesce((
+    select sum(${productSkus.stock})
+    from ${productSkus}
+    where ${productSkus.productId} = ${products.productId}
+      and ${productSkus.isActive} = true
+  ), 0)::double precision`;
 
   private productConditions = (filter: ProductFilterInput) => {
     const conditions = [eq(products.status, "PUBLISHED")];
@@ -176,12 +223,7 @@ export class CatalogService {
     }
 
     if (filter.minPrice !== undefined || filter.maxPrice !== undefined) {
-      const lowestPrice = sql<number>`(
-        select min(${productSkus.price})
-        from ${productSkus}
-        where ${productSkus.productId} = ${products.productId}
-          and ${productSkus.isActive} = true
-      )`;
+      const lowestPrice = this.activeLowestPrice();
       if (filter.minPrice !== undefined) conditions.push(gte(lowestPrice, filter.minPrice));
       if (filter.maxPrice !== undefined) conditions.push(lte(lowestPrice, filter.maxPrice));
     }
@@ -304,72 +346,14 @@ export class CatalogService {
     }));
   };
 
-  private matchesFilter = (product: ProductType, filter: ProductFilterInput) => {
-    if (filter.categoryIds?.length && !filter.categoryIds.includes(product.categoryId)) return false;
-    if (!filter.categoryIds?.length && filter.categoryId && product.categoryId !== filter.categoryId) return false;
-    if (filter.brandIds?.length && (!product.brandId || !filter.brandIds.includes(product.brandId))) return false;
-    if (
-      (filter.colorIds?.length || filter.sizeIds?.length) &&
-      !product.skus.some(
-        (sku) =>
-          (!filter.colorIds?.length || (sku.colorId !== null && filter.colorIds.includes(sku.colorId))) &&
-          (!filter.sizeIds?.length || (sku.sizeId !== null && filter.sizeIds.includes(sku.sizeId))),
-      )
-    )
-      return false;
-    if (filter.saleOnly !== undefined && product.isOnSale !== filter.saleOnly) return false;
-    if (filter.expressOnly !== undefined && product.isExpressDelivery !== filter.expressOnly) return false;
-    const lowestPrice = this.lowestSkuPrice(product);
-    if (filter.minPrice !== undefined && lowestPrice < filter.minPrice) return false;
-    if (filter.maxPrice !== undefined && lowestPrice > filter.maxPrice) return false;
-    return true;
-  };
-
-  private sortProducts = (nodes: ProductType[], sort?: ProductFilterInput["sort"]) =>
-    [...nodes].sort((left, right) => this.compareProducts(left, right, sort));
-
-  private compareProducts = (left: ProductType, right: ProductType, sort?: ProductFilterInput["sort"]) => {
-    const selectedSort = sort ?? ProductSort.RECOMMENDED;
-    const valueComparison =
-      selectedSort === ProductSort.LOW_PRICE
-        ? this.lowestSkuPrice(left) - this.lowestSkuPrice(right)
-        : selectedSort === ProductSort.HIGH_PRICE
-          ? this.lowestSkuPrice(right) - this.lowestSkuPrice(left)
-          : selectedSort === ProductSort.POPULAR
-            ? this.stockTotal(right) - this.stockTotal(left)
-            : right.createdAt.getTime() - left.createdAt.getTime();
-    if (valueComparison !== 0) return valueComparison;
-    const createdAtComparison = right.createdAt.getTime() - left.createdAt.getTime();
-    return createdAtComparison !== 0 ? createdAtComparison : right.productId.localeCompare(left.productId);
-  };
-
-  private cursorStart = (nodes: ProductType[], cursor: ProductCursor, sort?: ProductFilterInput["sort"]) => {
-    const cursorIndex = nodes.findIndex((node) => node.productId === cursor.productId);
-    if (cursorIndex >= 0) return cursorIndex + 1;
-    const start = nodes.findIndex((node) => this.compareProductToCursor(node, cursor, sort) > 0);
-    return start >= 0 ? start : nodes.length;
-  };
-
-  private compareProductToCursor = (product: ProductType, cursor: ProductCursor, sort?: ProductFilterInput["sort"]) => {
-    const selectedSort = sort ?? ProductSort.RECOMMENDED;
-    if (
-      selectedSort !== ProductSort.LATEST &&
-      selectedSort !== ProductSort.RECOMMENDED &&
-      cursor.sortValue !== undefined
-    ) {
-      const productValue = this.sortValue(product, selectedSort);
-      const valueComparison =
-        selectedSort === ProductSort.LOW_PRICE ? productValue - cursor.sortValue : cursor.sortValue - productValue;
-      if (valueComparison !== 0) return valueComparison;
-    }
-    const createdAtComparison = Date.parse(cursor.createdAt) - product.createdAt.getTime();
-    return createdAtComparison !== 0 ? createdAtComparison : cursor.productId.localeCompare(product.productId);
-  };
-
-  private toProductCursor = (product: ProductType, sort?: ProductFilterInput["sort"]): ProductCursor => {
+  private toProductCursor = (
+    product: ProductType,
+    createdAt: string,
+    sort?: ProductFilterInput["sort"],
+  ): ProductCursor => {
     const selectedSort = sort ?? ProductSort.RECOMMENDED;
     return {
-      createdAt: product.createdAt.toISOString(),
+      createdAt,
       productId: product.productId,
       ...(selectedSort === ProductSort.LATEST || selectedSort === ProductSort.RECOMMENDED
         ? {}
