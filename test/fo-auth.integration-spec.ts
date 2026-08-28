@@ -13,6 +13,31 @@ const documentIds = {
   marketing: "a0000000-0000-4000-8000-000000000004",
 } as const;
 
+const failedSessionDeviceId = "forced-session-write-failure";
+
+const installRefreshSessionFailure = async (pool: Pool) => {
+  await pool.query(`
+    CREATE OR REPLACE FUNCTION reject_test_refresh_session() RETURNS trigger AS $$
+    BEGIN
+      IF NEW."deviceId" = '${failedSessionDeviceId}' THEN
+        RAISE EXCEPTION 'forced refresh session failure';
+      END IF;
+      RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+    CREATE TRIGGER reject_test_refresh_session
+    BEFORE INSERT OR UPDATE ON "refreshToken"
+    FOR EACH ROW EXECUTE FUNCTION reject_test_refresh_session();
+  `);
+};
+
+const removeRefreshSessionFailure = async (pool: Pool) => {
+  await pool.query(`
+    DROP TRIGGER IF EXISTS reject_test_refresh_session ON "refreshToken";
+    DROP FUNCTION IF EXISTS reject_test_refresh_session();
+  `);
+};
+
 const seedConsentDocuments = async (pool: Pool) => {
   await pool.query(
     `INSERT INTO "consentDocuments" ("documentId", "type", "title", "body", "version", "required", "activeFrom") VALUES
@@ -179,6 +204,49 @@ describe("FO auth GraphQL integration", () => {
     expect(created.rows[0]?.email).toBe("new@example.test");
   });
 
+  it("rolls back FO account proofs when refresh-session persistence fails", async () => {
+    await seedSignupProofs(pool, failedSessionDeviceId);
+    const signup = () =>
+      request(app.getHttpServer())
+        .post("/graphql")
+        .set("x-device-id", failedSessionDeviceId)
+        .send({
+          query: `mutation SignupFo($input: SignupFoInput!) { signupFo(input: $input) { accessToken role } }`,
+          variables: {
+            input: {
+              email: "new@example.test",
+              password: "Password123!",
+              emailVerificationToken: "email-proof",
+              identityVerificationToken: "identity-proof",
+              consents: Object.values(documentIds).map((documentId) => ({
+                documentId,
+                agreed: documentId !== documentIds.marketing,
+              })),
+            },
+          },
+        });
+
+    await installRefreshSessionFailure(pool);
+    try {
+      const failed = await signup();
+      expect(failed.body.errors).toHaveLength(1);
+      const state = await pool.query<{ users: number; emailUsedAt: Date | null; identityConsumedAt: Date | null }>(
+        `SELECT
+          (SELECT count(*)::int FROM "users" WHERE "email" = 'new@example.test') AS "users",
+          (SELECT "usedAt" FROM "emailVerificationToken" WHERE "tokenHash" = $1) AS "emailUsedAt",
+          (SELECT "consumedAt" FROM "identityVerificationSessions" WHERE "proofTokenHash" = $2) AS "identityConsumedAt"`,
+        [hashToken("email-proof"), hashToken("identity-proof")],
+      );
+      expect(state.rows[0]).toEqual({ users: 0, emailUsedAt: null, identityConsumedAt: null });
+    } finally {
+      await removeRefreshSessionFailure(pool);
+    }
+
+    const retried = await signup();
+    expect(retried.body.errors).toBeUndefined();
+    expect(retried.body.data.signupFo.role).toBe("USER");
+  });
+
   it("starts a Kakao login with an opaque flow and consumes an existing-user flow once", async () => {
     const deviceId = "kakao-existing-device";
     const flowId = "d0000000-0000-4000-8000-000000000001";
@@ -226,6 +294,88 @@ describe("FO auth GraphQL integration", () => {
       tokenPayload: { role: "USER" },
     });
     expect(rejected?.body.errors[0].message).toBe("카카오 로그인 흐름이 유효하지 않습니다.");
+  });
+
+  it("allows only one active Kakao flow per device session", async () => {
+    const deviceId = "kakao-concurrent-flow-device";
+    const flowIds = ["d0000000-0000-4000-8000-000000000003", "d0000000-0000-4000-8000-000000000004"];
+    await pool.query(
+      `INSERT INTO "authIdentity" ("userId", "provider", "providerUserId")
+       VALUES ($1, 'kakao', 'kakao-concurrent')`,
+      [FIXTURE.userId],
+    );
+    for (const flowId of flowIds) {
+      await pool.query(
+        `INSERT INTO "kakaoLoginFlows"
+          ("flowId", "deviceIdHash", "providerUserId", "email", "emailVerified", "userId", "status", "expiresAt", "callbackAt")
+         VALUES ($1, $2, 'kakao-concurrent', 'integration@example.test', true, $3, 'EXISTING_USER', now() + interval '10 minutes', now())`,
+        [flowId, hashToken(deviceId), FIXTURE.userId],
+      );
+    }
+    const complete = (flowId: string) =>
+      request(app.getHttpServer())
+        .post("/graphql")
+        .set("x-device-id", deviceId)
+        .send({
+          query: `mutation CompleteKakaoLogin($input: CompleteKakaoLoginInput!) {
+            completeKakaoLogin(input: $input) { status tokenPayload { refreshToken } }
+          }`,
+          variables: { input: { flowId } },
+        });
+
+    const responses = await Promise.all(flowIds.map(complete));
+    const completed = responses.filter(({ body }) => body.errors === undefined);
+    const rejected = responses.filter(({ body }) => body.errors !== undefined);
+    expect(completed).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    const refreshToken = completed[0]?.body.data.completeKakaoLogin.tokenPayload.refreshToken as string;
+    const refreshed = await request(app.getHttpServer())
+      .post("/graphql")
+      .set("authorization", `Bearer ${refreshToken}`)
+      .send({ query: `mutation Refresh { refresh { refreshToken } }` });
+    expect(refreshed.body.errors).toBeUndefined();
+  });
+
+  it("rolls back Kakao flow consumption when refresh-session persistence fails", async () => {
+    const flowId = "d0000000-0000-4000-8000-000000000005";
+    await pool.query(
+      `INSERT INTO "authIdentity" ("userId", "provider", "providerUserId")
+       VALUES ($1, 'kakao', 'kakao-session-failure')`,
+      [FIXTURE.userId],
+    );
+    await pool.query(
+      `INSERT INTO "kakaoLoginFlows"
+        ("flowId", "deviceIdHash", "providerUserId", "email", "emailVerified", "userId", "status", "expiresAt", "callbackAt")
+       VALUES ($1, $2, 'kakao-session-failure', 'integration@example.test', true, $3, 'EXISTING_USER', now() + interval '10 minutes', now())`,
+      [flowId, hashToken(failedSessionDeviceId), FIXTURE.userId],
+    );
+    const complete = () =>
+      request(app.getHttpServer())
+        .post("/graphql")
+        .set("x-device-id", failedSessionDeviceId)
+        .send({
+          query: `mutation CompleteKakaoLogin($input: CompleteKakaoLoginInput!) {
+            completeKakaoLogin(input: $input) { status tokenPayload { accessToken } }
+          }`,
+          variables: { input: { flowId } },
+        });
+
+    await installRefreshSessionFailure(pool);
+    try {
+      const failed = await complete();
+      expect(failed.body.errors).toHaveLength(1);
+      const flow = await pool.query<{ consumedAt: Date | null }>(
+        `SELECT "consumedAt" FROM "kakaoLoginFlows" WHERE "flowId" = $1`,
+        [flowId],
+      );
+      expect(flow.rows[0]?.consumedAt).toBeNull();
+    } finally {
+      await removeRefreshSessionFailure(pool);
+    }
+
+    const retried = await complete();
+    expect(retried.body.errors).toBeUndefined();
+    expect(retried.body.data.completeKakaoLogin.status).toBe("SIGNED_IN");
   });
 
   it("binds a Kakao signup flow to its device and reports email fallback", async () => {

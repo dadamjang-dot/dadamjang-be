@@ -3,12 +3,12 @@ import { ConfigService } from "@nestjs/config";
 import { JwtService, JwtSignOptions } from "@nestjs/jwt";
 import * as bcrypt from "bcrypt";
 import { randomUUID, timingSafeEqual } from "crypto";
-import { CustomUnauthorizedException } from "src/common/errors/custom-exceptions";
+import { CustomConflictException, CustomUnauthorizedException } from "src/common/errors/custom-exceptions";
 import { hashToken } from "src/common/security/token-hash";
 import { EmailService } from "src/modules/email/email.service";
 import { User } from "src/modules/database/schema";
 import { AuthErrorMessage } from "./auth.error";
-import { AuthRepository } from "./auth.repository";
+import { AuthRepository, type RefreshTokenStore } from "./auth.repository";
 import { AuthPortal, SigninAuthInput } from "./auth.types";
 import { UserRole, type UserRoleValue } from "src/auth/role";
 
@@ -68,20 +68,26 @@ export class AuthService {
     return true;
   };
   getViewer = async (userId: string) => this.repository.findUser(userId);
-  issueTokensForUser = async (user: User, deviceId: string) => {
+  issueTokensForUser = async (user: User, deviceId: string, store?: RefreshTokenStore) => {
+    const previous = await this.repository.findRefreshToken(user.userId, deviceId, store);
     const tokens = await this.createTokensForUser(user, deviceId);
-    await this.repository.saveRefreshToken({
-      userId: user.userId,
-      deviceId,
-      refreshToken: tokens.refreshTokenHash,
-      refreshTokenExp: tokens.refreshTokenExp,
-    });
+    const saved = await this.repository.saveRefreshToken(
+      {
+        userId: user.userId,
+        deviceId,
+        ...(previous === undefined ? {} : { previousRefreshToken: previous.refreshToken }),
+        refreshToken: tokens.refreshTokenHash,
+        refreshTokenExp: tokens.refreshTokenExp,
+      },
+      store,
+    );
+    if (!saved) throw new CustomConflictException(AuthErrorMessage.SessionChanged);
     return tokens.payload;
   };
   private createTokensForUser = async (user: User, deviceId: string) => {
     const role = (user as User & { role?: UserRoleValue }).role ?? UserRole.User;
     const accessToken = await this.jwtService.signAsync(
-      { userId: user.userId, role },
+      { userId: user.userId, role, jti: randomUUID() },
       {
         secret: this.configService.getOrThrow<string>("JWT_ACCESS_TOKEN_SECRET"),
         expiresIn: this.configService.getOrThrow<string>("JWT_ACCESS_TOKEN_EXP") as JwtExpiration,

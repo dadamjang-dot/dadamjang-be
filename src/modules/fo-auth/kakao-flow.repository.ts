@@ -1,6 +1,8 @@
 import { Inject, Injectable } from "@nestjs/common";
-import { and, eq, gt, isNull } from "drizzle-orm";
+import { and, eq, gt, isNull, ne, sql } from "drizzle-orm";
 import { hashToken } from "src/common/security/token-hash";
+import type { RefreshTokenStore } from "src/modules/auth/auth.repository";
+import type { TokenPayload } from "src/modules/auth/auth.types";
 import { Database, DRIZZLE } from "src/modules/database/database.module";
 import {
   authIdentities,
@@ -11,6 +13,7 @@ import {
   userConsentAcceptances,
   users,
   verifiedIdentities,
+  type User,
 } from "src/modules/database/schema";
 import type { KakaoProfile } from "src/modules/auth/auth.types";
 import type { ConsentAcceptanceInput } from "./fo-auth.types";
@@ -27,6 +30,8 @@ type KakaoSignupInput = {
   readonly password: string;
   readonly consents: readonly ConsentAcceptanceInput[];
 };
+
+type IssueTokens = (user: User, store: RefreshTokenStore) => Promise<TokenPayload>;
 
 @Injectable()
 export class KakaoFlowRepository {
@@ -66,9 +71,10 @@ export class KakaoFlowRepository {
     )[0];
   };
 
-  completeLoginFlow = (flowId: string, deviceIdHash: string, signupToken: string) =>
+  completeLoginFlow = (flowId: string, deviceIdHash: string, signupToken: string, issueTokens: IssueTokens) =>
     this.db.transaction(async (tx) => {
       const now = new Date();
+      await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${deviceIdHash}, 0))`);
       const [flow] = await tx
         .update(kakaoLoginFlows)
         .set({ consumedAt: now, updatedAt: now })
@@ -82,10 +88,20 @@ export class KakaoFlowRepository {
         )
         .returning();
       if (!flow?.providerUserId) throw new InvalidFoAuthProofError();
+      await tx
+        .update(kakaoLoginFlows)
+        .set({ consumedAt: now, updatedAt: now })
+        .where(
+          and(
+            eq(kakaoLoginFlows.deviceIdHash, deviceIdHash),
+            ne(kakaoLoginFlows.flowId, flowId),
+            isNull(kakaoLoginFlows.consumedAt),
+          ),
+        );
       if (flow.status === "EXISTING_USER" && flow.userId) {
         const user = await tx.query.users.findFirst({ where: eq(users.userId, flow.userId) });
         if (!user) throw new InvalidFoAuthProofError();
-        return { kind: "existing" as const, user };
+        return { kind: "existing" as const, tokenPayload: await issueTokens(user, tx) };
       }
       if (flow.status !== "SIGNUP_REQUIRED") throw new InvalidFoAuthProofError();
       await tx.insert(kakaoSignupTokens).values({
@@ -103,9 +119,10 @@ export class KakaoFlowRepository {
       };
     });
 
-  completeSignup = (input: KakaoSignupInput) =>
+  completeSignup = (input: KakaoSignupInput, issueTokens: IssueTokens) =>
     this.db.transaction(async (tx) => {
       const now = new Date();
+      await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${input.deviceIdHash}, 0))`);
       const [signup] = await tx
         .update(kakaoSignupTokens)
         .set({ usedAt: now })
@@ -119,6 +136,16 @@ export class KakaoFlowRepository {
         )
         .returning();
       if (!signup) throw new InvalidFoAuthProofError();
+      await tx
+        .update(kakaoSignupTokens)
+        .set({ usedAt: now })
+        .where(
+          and(
+            eq(kakaoSignupTokens.deviceIdHash, input.deviceIdHash),
+            ne(kakaoSignupTokens.tokenHash, signup.tokenHash),
+            isNull(kakaoSignupTokens.usedAt),
+          ),
+        );
       const [identity] = await tx
         .update(identityVerificationSessions)
         .set({ consumedAt: now, updatedAt: now })
@@ -203,6 +230,6 @@ export class KakaoFlowRepository {
             set: { agreed: consent.agreed, agreedAt, recordedAt: new Date() },
           });
       }
-      return user;
+      return issueTokens(user, tx);
     });
 }

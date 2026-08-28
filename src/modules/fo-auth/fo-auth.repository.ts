@@ -1,6 +1,8 @@
 import { Inject, Injectable } from "@nestjs/common";
 import { and, desc, eq, gt, isNull, lte, or } from "drizzle-orm";
 import { hashToken } from "src/common/security/token-hash";
+import type { RefreshTokenStore } from "src/modules/auth/auth.repository";
+import type { TokenPayload } from "src/modules/auth/auth.types";
 import { Database, DRIZZLE } from "src/modules/database/database.module";
 import {
   consentDocuments,
@@ -9,6 +11,7 @@ import {
   userConsentAcceptances,
   users,
   verifiedIdentities,
+  type User,
 } from "src/modules/database/schema";
 import type { ConsentAcceptanceInput } from "./fo-auth.types";
 import { ExistingFoIdentityError, InvalidFoAuthProofError } from "./fo-auth.error";
@@ -23,6 +26,8 @@ type SignupUserInput = {
   readonly deviceIdHash: string;
   readonly consents: readonly ConsentAcceptanceInput[];
 };
+
+type IssueTokens = (user: User, store: RefreshTokenStore) => Promise<TokenPayload>;
 
 @Injectable()
 export class FoAuthRepository {
@@ -42,7 +47,7 @@ export class FoAuthRepository {
       )
       .orderBy(consentDocuments.type, desc(consentDocuments.activeFrom));
 
-  createEmailUser = (input: SignupUserInput) =>
+  createEmailUser = (input: SignupUserInput, issueTokens: IssueTokens) =>
     this.db.transaction(async (tx) => {
       const identity = await tx.query.identityVerificationSessions.findFirst({
         where: and(
@@ -105,7 +110,7 @@ export class FoAuthRepository {
           .set({ consumedAt: new Date(), updatedAt: new Date() })
           .where(eq(identityVerificationSessions.sessionId, identity.sessionId)),
       ]);
-      return user;
+      return issueTokens(user, tx);
     });
 
   consumeFindEmailProof = (identityVerificationToken: string, deviceIdHash: string) =>

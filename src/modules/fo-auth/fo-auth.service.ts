@@ -35,17 +35,19 @@ export class FoAuthService {
     const email = this.emailService.normalizeEmail(input.email);
     await this.assertSignupConsents(input.consents);
     try {
-      const user = await this.repository.createEmailUser({
-        userId: randomUUID(),
-        userid: `member-${randomBytes(6).toString("hex")}`,
-        email,
-        password: await bcrypt.hash(input.password, 10),
-        emailVerificationToken: input.emailVerificationToken,
-        identityVerificationToken: input.identityVerificationToken,
-        deviceIdHash: hashToken(deviceId),
-        consents: input.consents,
-      });
-      return this.authService.issueTokensForUser(user, deviceId);
+      return await this.repository.createEmailUser(
+        {
+          userId: randomUUID(),
+          userid: `member-${randomBytes(6).toString("hex")}`,
+          email,
+          password: await bcrypt.hash(input.password, 10),
+          emailVerificationToken: input.emailVerificationToken,
+          identityVerificationToken: input.identityVerificationToken,
+          deviceIdHash: hashToken(deviceId),
+          consents: input.consents,
+        },
+        (user, store) => this.authService.issueTokensForUser(user, deviceId, store),
+      );
     } catch (error) {
       if (error instanceof ExistingFoIdentityError)
         throw new CustomBadRequestException("이미 가입된 본인정보입니다. 이메일 찾기를 이용해주세요.");

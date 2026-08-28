@@ -4,4 +4,5 @@ export enum AuthErrorMessage {
   RefreshTokenUndefined = "Refresh token is missing.",
   RefreshTokenWrong = "Refresh token is invalid.",
   InvalidOauthState = "OAuth state is invalid.",
+  SessionChanged = "인증 세션이 변경되었습니다. 다시 시도해주세요.",
 }

@@ -47,12 +47,19 @@ export class KakaoFlowService {
   completeLogin = async (flowId: string, deviceId: string) => {
     const signupToken = randomBytes(32).toString("base64url");
     try {
-      const result = await this.repository.completeLoginFlow(flowId, hashToken(deviceId), signupToken);
+      const result = await this.repository.completeLoginFlow(
+        flowId,
+        hashToken(deviceId),
+        signupToken,
+        async (user, store) => {
+          if (user.role !== UserRole.User) throw new InvalidFoAuthProofError();
+          return this.authService.issueTokensForUser(user, deviceId, store);
+        },
+      );
       if (result.kind === "existing") {
-        if (result.user.role !== UserRole.User) throw new CustomUnauthorizedException("카카오 로그인에 실패했습니다.");
         return {
           status: "SIGNED_IN" as const,
-          tokenPayload: await this.authService.issueTokensForUser(result.user, deviceId),
+          tokenPayload: result.tokenPayload,
           emailVerificationRequired: false,
         };
       }
@@ -73,19 +80,25 @@ export class KakaoFlowService {
     await this.foAuthService.assertSignupConsents(input.consents);
     const email = input.email ? this.emailService.normalizeEmail(input.email) : undefined;
     try {
-      const user = await this.repository.completeSignup({
-        kakaoSignupToken: input.kakaoSignupToken,
-        ...(email === undefined ? {} : { email }),
-        ...(input.emailVerificationToken === undefined ? {} : { emailVerificationToken: input.emailVerificationToken }),
-        identityVerificationToken: input.identityVerificationToken,
-        deviceIdHash: hashToken(deviceId),
-        userId: randomUUID(),
-        userid: `member-${randomBytes(6).toString("hex")}`,
-        password: await bcrypt.hash(randomBytes(32).toString("base64url"), 10),
-        consents: input.consents,
-      });
-      if (user.role !== UserRole.User) throw new CustomUnauthorizedException("카카오 로그인에 실패했습니다.");
-      return this.authService.issueTokensForUser(user, deviceId);
+      return await this.repository.completeSignup(
+        {
+          kakaoSignupToken: input.kakaoSignupToken,
+          ...(email === undefined ? {} : { email }),
+          ...(input.emailVerificationToken === undefined
+            ? {}
+            : { emailVerificationToken: input.emailVerificationToken }),
+          identityVerificationToken: input.identityVerificationToken,
+          deviceIdHash: hashToken(deviceId),
+          userId: randomUUID(),
+          userid: `member-${randomBytes(6).toString("hex")}`,
+          password: await bcrypt.hash(randomBytes(32).toString("base64url"), 10),
+          consents: input.consents,
+        },
+        async (user, store) => {
+          if (user.role !== UserRole.User) throw new InvalidFoAuthProofError();
+          return this.authService.issueTokensForUser(user, deviceId, store);
+        },
+      );
     } catch (error) {
       if (error instanceof InvalidFoAuthProofError)
         throw new CustomUnauthorizedException("카카오 가입 인증이 유효하지 않습니다.");

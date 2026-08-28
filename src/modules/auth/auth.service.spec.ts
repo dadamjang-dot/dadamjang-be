@@ -57,4 +57,32 @@ describe("AuthService", () => {
     await expect(service.logout("user-1", "device", refreshToken)).resolves.toBe(true);
     expect(deleteRefreshToken).toHaveBeenCalledWith("user-1", "device", refreshTokenHash);
   });
+
+  it("issues distinct access tokens and persists them with compare-and-swap", async () => {
+    const repository = {
+      findRefreshToken: jest.fn().mockResolvedValue(undefined),
+      saveRefreshToken: jest.fn().mockResolvedValue(true),
+    };
+    const jwtService = {
+      signAsync: jest.fn(async (payload: object) => Buffer.from(JSON.stringify(payload)).toString("base64url")),
+      decode: jest.fn().mockReturnValue({ exp: Math.floor(Date.now() / 1000) + 3600 }),
+    };
+    const configService = {
+      getOrThrow: jest.fn((name: string) => (name.endsWith("EXP") ? "1h" : "secret")),
+    };
+    const service = new AuthService(repository as never, jwtService as never, configService as never, {} as never);
+
+    const [first, second] = await Promise.all([
+      service.issueTokensForUser(user, "device"),
+      service.issueTokensForUser(user, "device"),
+    ]);
+
+    expect(first.accessToken).not.toBe(second.accessToken);
+    expect(repository.saveRefreshToken).toHaveBeenCalledTimes(2);
+    expect(repository.saveRefreshToken.mock.calls[0]?.[0]).not.toHaveProperty("previousRefreshToken");
+    expect(repository.saveRefreshToken).toHaveBeenCalledWith(
+      expect.objectContaining({ deviceId: "device" }),
+      undefined,
+    );
+  });
 });
