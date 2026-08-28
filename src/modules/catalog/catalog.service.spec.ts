@@ -3,6 +3,7 @@ import { CatalogService, decodeProductCursor, encodeProductCursor } from "./cata
 import { ProductSort } from "./catalog.types";
 
 const rawCursor = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url");
+const createCatalogService = () => new CatalogService({} as never, { getProductImageUrl: jest.fn() } as never);
 const CURSOR_CREATED_AT = "2026-07-11T00:00:00.000000Z";
 const CURSOR_PRODUCT_ID = "70000000-0000-4000-8000-000000000001";
 
@@ -158,11 +159,12 @@ describe("catalog cursor", () => {
 describe("catalog product batches", () => {
   it("returns price summaries in requested product order", async () => {
     const createdAt = new Date("2026-08-29T00:00:00Z");
-    const service = new CatalogService({} as never);
+    const service = createCatalogService();
     jest.spyOn(service, "getProductsByIds").mockResolvedValue([
       {
         productId: "product-b",
         title: "B",
+        imageKeys: [],
         imageUrls: [],
         isOnSale: false,
         isExpressDelivery: true,
@@ -172,6 +174,7 @@ describe("catalog product batches", () => {
       {
         productId: "product-a",
         title: "A",
+        imageKeys: [],
         imageUrls: ["https://images.test/a.png"],
         isOnSale: true,
         isExpressDelivery: false,
@@ -215,11 +218,12 @@ describe("catalog product batches", () => {
 
 describe("catalog price evidence", () => {
   it("changes the revision when the evidence base price changes", async () => {
-    const service = new CatalogService({} as never);
+    const service = createCatalogService();
     const getProduct = jest.spyOn(service, "getProduct");
     const product = {
       productId: "product-a",
       title: "A",
+      imageKeys: [],
       imageUrls: [],
       isOnSale: true,
       isExpressDelivery: false,
@@ -236,10 +240,11 @@ describe("catalog price evidence", () => {
   });
 
   it("rejects evidence for a stale price revision", async () => {
-    const service = new CatalogService({} as never);
+    const service = createCatalogService();
     jest.spyOn(service, "getProduct").mockResolvedValue({
       productId: "product-a",
       title: "A",
+      imageKeys: [],
       imageUrls: [],
       isOnSale: true,
       isExpressDelivery: false,

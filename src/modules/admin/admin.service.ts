@@ -6,7 +6,6 @@ import {
   CustomBadRequestException,
   CustomConflictException,
   CustomNotFoundException,
-  CustomServiceUnavailableException,
 } from "src/common/errors/custom-exceptions";
 import { hasDatabaseErrorCode } from "src/common/errors/database-error";
 import { requireResult } from "src/common/invariants/require-result";
@@ -610,11 +609,7 @@ export class AdminService {
         )[0],
       );
       inviteId = invite.inviteId;
-      try {
-        await this.emailService.sendAdminInvite(email, token);
-      } catch {
-        throw new CustomServiceUnavailableException(AdminErrorMessage.InviteEmailFailed);
-      }
+      await this.emailService.queueAdminInvite(tx, email, token, invite.inviteId);
       await tx.insert(auditLogs).values({
         actorUserId: adminUserId,
         action: "ADMIN_INVITED",

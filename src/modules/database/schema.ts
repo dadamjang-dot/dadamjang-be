@@ -1,10 +1,12 @@
 import { sql } from "drizzle-orm";
 import {
   boolean,
+  check,
   index,
   integer,
   jsonb,
   pgTable,
+  primaryKey,
   text,
   timestamp,
   unique,
@@ -87,6 +89,167 @@ export const passwordResetTokens = pgTable("passwordResetToken", {
   requestIpHash: text("requestIpHash"),
   createdAt: timestamp("createdAt").defaultNow().notNull(),
 });
+
+export const requestAdmissions = pgTable(
+  "requestAdmission",
+  {
+    action: varchar("action", { length: 80 }).notNull(),
+    scopeType: varchar("scopeType", { length: 40 }).notNull(),
+    scopeHash: varchar("scopeHash", { length: 64 }).notNull(),
+    requestCount: integer("requestCount").notNull().default(1),
+    windowStartedAt: timestamp("windowStartedAt", { withTimezone: true }).notNull(),
+    expiresAt: timestamp("expiresAt", { withTimezone: true }).notNull(),
+    updatedAt: timestamp("updatedAt", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    primaryKey({
+      columns: [table.action, table.scopeType, table.scopeHash],
+      name: "request_admission_scope_pk",
+    }),
+    check("request_admission_count_positive", sql`${table.requestCount} > 0`),
+    index("request_admission_expires_idx").on(table.expiresAt),
+  ],
+);
+
+export const emailDeliveryOutbox = pgTable(
+  "emailDeliveryOutbox",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    kind: varchar("kind", { length: 40 }).notNull(),
+    email: varchar("email", { length: 255 }).notNull(),
+    requestIpHash: varchar("requestIpHash", { length: 64 }),
+    payloadCiphertext: text("payloadCiphertext"),
+    proofId: text("proofId"),
+    status: varchar("status", { length: 20 }).notNull().default("PENDING"),
+    attemptCount: integer("attemptCount").notNull().default(0),
+    availableAt: timestamp("availableAt", { withTimezone: true }).defaultNow().notNull(),
+    claimedAt: timestamp("claimedAt", { withTimezone: true }),
+    claimToken: uuid("claimToken"),
+    expiresAt: timestamp("expiresAt", { withTimezone: true }).notNull(),
+    sentAt: timestamp("sentAt", { withTimezone: true }),
+    lastError: varchar("lastError", { length: 500 }),
+    createdAt: timestamp("createdAt", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    check(
+      "email_delivery_outbox_kind_check",
+      sql`${table.kind} IN ('SIGNUP_CODE', 'PASSWORD_RESET_CODE', 'PASSWORD_RESET_LINK', 'ADMIN_INVITE')`,
+    ),
+    check(
+      "email_delivery_outbox_status_check",
+      sql`${table.status} IN ('PENDING', 'PROCESSING', 'SENT', 'SUPPRESSED', 'FAILED')`,
+    ),
+    check("email_delivery_outbox_attempt_count_check", sql`${table.attemptCount} >= 0`),
+    check(
+      "email_delivery_outbox_claim_check",
+      sql`(${table.status} = 'PROCESSING' AND ${table.claimedAt} IS NOT NULL AND ${table.claimToken} IS NOT NULL)
+        OR (${table.status} <> 'PROCESSING' AND ${table.claimedAt} IS NULL AND ${table.claimToken} IS NULL)`,
+    ),
+    check(
+      "email_delivery_outbox_payload_check",
+      sql`(${table.payloadCiphertext} IS NULL AND ${table.proofId} IS NULL)
+        OR (${table.payloadCiphertext} IS NOT NULL AND ${table.proofId} IS NOT NULL)`,
+    ),
+    check(
+      "email_delivery_outbox_sent_check",
+      sql`(${table.status} = 'SENT' AND ${table.sentAt} IS NOT NULL)
+        OR (${table.status} <> 'SENT' AND ${table.sentAt} IS NULL)`,
+    ),
+    index("email_delivery_outbox_pending_idx")
+      .on(table.availableAt, table.createdAt, table.id)
+      .where(sql`${table.status} = 'PENDING'`),
+    index("email_delivery_outbox_processing_idx")
+      .on(table.claimedAt, table.createdAt, table.id)
+      .where(sql`${table.status} = 'PROCESSING'`),
+    index("email_delivery_outbox_expiry_idx")
+      .on(table.expiresAt)
+      .where(sql`${table.status} IN ('PENDING', 'PROCESSING')`),
+    index("email_delivery_outbox_email_created_idx").on(table.email, table.createdAt),
+  ],
+);
+
+export const mediaObjectPromotions = pgTable(
+  "mediaObjectPromotions",
+  {
+    finalKey: text("finalKey").primaryKey(),
+    ownerUserId: uuid("ownerUserId").notNull(),
+    kind: varchar("kind", { length: 20 }).notNull(),
+    contentType: varchar("contentType", { length: 80 }).notNull(),
+    objectSize: integer("objectSize"),
+    finalEtag: text("finalEtag"),
+    sourceBucket: varchar("sourceBucket", { length: 255 }),
+    sourceKey: text("sourceKey"),
+    sourceEtag: text("sourceEtag"),
+    status: varchar("status", { length: 20 }).notNull(),
+    unreferencedAt: timestamp("unreferencedAt", { withTimezone: true }),
+    readyAt: timestamp("readyAt", { withTimezone: true }),
+    gcClaimedAt: timestamp("gcClaimedAt", { withTimezone: true }),
+    gcClaimToken: uuid("gcClaimToken"),
+    gcPreviousStatus: varchar("gcPreviousStatus", { length: 20 }),
+    deletedAt: timestamp("deletedAt", { withTimezone: true }),
+    createdAt: timestamp("createdAt", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    check("media_object_promotions_kind_check", sql`${table.kind} IN ('PRODUCT', 'STYLE_POST')`),
+    check(
+      "media_object_promotions_status_check",
+      sql`${table.status} IN ('PREPARING', 'READY', 'DELETING', 'DELETED')`,
+    ),
+    check("media_object_promotions_size_check", sql`${table.objectSize} IS NULL OR ${table.objectSize} > 0`),
+    check(
+      "media_object_promotions_source_check",
+      sql`(${table.sourceBucket} IS NULL AND ${table.sourceKey} IS NULL AND ${table.sourceEtag} IS NULL)
+        OR (${table.sourceBucket} IS NOT NULL AND ${table.sourceKey} IS NOT NULL AND ${table.sourceEtag} IS NOT NULL)`,
+    ),
+    check(
+      "media_object_promotions_gc_claim_check",
+      sql`(
+          ${table.status} = 'DELETING'
+          AND ${table.gcClaimedAt} IS NOT NULL
+          AND ${table.gcClaimToken} IS NOT NULL
+          AND ${table.gcPreviousStatus} IN ('PREPARING', 'READY')
+        ) OR (
+          ${table.status} <> 'DELETING'
+          AND ${table.gcClaimedAt} IS NULL
+          AND ${table.gcClaimToken} IS NULL
+          AND ${table.gcPreviousStatus} IS NULL
+        )`,
+    ),
+    check(
+      "media_object_promotions_deleted_check",
+      sql`(${table.status} = 'DELETED' AND ${table.deletedAt} IS NOT NULL)
+        OR (${table.status} <> 'DELETED' AND ${table.deletedAt} IS NULL)`,
+    ),
+    index("media_object_promotions_gc_idx")
+      .on(table.unreferencedAt, table.createdAt, table.finalKey)
+      .where(sql`${table.status} IN ('PREPARING', 'READY')`),
+    index("media_object_promotions_stale_claim_idx")
+      .on(table.gcClaimedAt, table.finalKey)
+      .where(sql`${table.status} = 'DELETING'`),
+  ],
+);
+
+export const mediaObjectReferences = pgTable(
+  "mediaObjectReferences",
+  {
+    entityType: varchar("entityType", { length: 20 }).notNull(),
+    entityId: uuid("entityId").notNull(),
+    finalKey: text("finalKey")
+      .notNull()
+      .references(() => mediaObjectPromotions.finalKey, { onDelete: "restrict" }),
+    createdAt: timestamp("createdAt", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    primaryKey({
+      columns: [table.entityType, table.entityId, table.finalKey],
+      name: "media_object_references_pk",
+    }),
+    check("media_object_references_entity_type_check", sql`${table.entityType} IN ('PRODUCT', 'STYLE_POST')`),
+    index("media_object_references_final_key_idx").on(table.finalKey),
+  ],
+);
 
 export const kakaoSignupTokens = pgTable("kakaoSignupToken", {
   tokenHash: text("tokenHash").primaryKey(),
@@ -288,6 +451,7 @@ export const partners = pgTable(
   (table) => [
     index("partners_status_idx").on(table.status),
     index("partners_status_created_idx").on(table.status, table.createdAt),
+    unique("partners_owner_user_unique").on(table.ownerUserId),
     unique("partners_brand_unique").on(table.brandId),
   ],
 );

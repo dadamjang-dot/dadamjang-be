@@ -32,11 +32,11 @@ export class ProductImageUploadTarget {
   @Field()
   uploadUrl!: string;
 
-  @Field()
-  originalUrl!: string;
+  @Field(() => String, { nullable: true })
+  originalUrl!: string | null;
 
-  @Field()
-  imageUrl!: string;
+  @Field(() => String, { nullable: true })
+  imageUrl!: string | null;
 }
 
 @ArgsType()

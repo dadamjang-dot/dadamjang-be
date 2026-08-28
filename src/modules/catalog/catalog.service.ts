@@ -8,6 +8,8 @@ import {
 import { requireResult } from "src/common/invariants/require-result";
 import { Database, DRIZZLE } from "src/modules/database/database.module";
 import { brands, categories, colors, productSkus, products, sizes } from "src/modules/database/schema";
+import { IMAGE_SUMMARY_WIDTH } from "src/modules/media/media.constant";
+import { MediaService } from "src/modules/media/media.service";
 import { CatalogErrorMessage } from "./catalog.error";
 import { MAX_PAGE_SIZE } from "./catalog.constant";
 import {
@@ -38,6 +40,7 @@ type MetricProductCursor = {
 
 type ProductCursor = DateProductCursor | MetricProductCursor;
 type CatalogDatabase = Database | Parameters<Parameters<Database["transaction"]>[0]>[0];
+type HydratedProduct = ProductType & Pick<typeof products.$inferSelect, "imageKeys">;
 
 const DATE_PRODUCT_SORTS = new Set<ProductSort>([ProductSort.RECOMMENDED, ProductSort.LATEST]);
 const METRIC_PRODUCT_SORTS = new Set<ProductSort>([ProductSort.LOW_PRICE, ProductSort.HIGH_PRICE, ProductSort.POPULAR]);
@@ -100,7 +103,10 @@ export const decodeProductCursor = (cursor: string, expectedSort: ProductSort): 
 
 @Injectable()
 export class CatalogService {
-  constructor(@Inject(DRIZZLE) private readonly db: Database) {}
+  constructor(
+    @Inject(DRIZZLE) private readonly db: Database,
+    private readonly mediaService: MediaService,
+  ) {}
 
   listCategories = () =>
     this.db
@@ -340,7 +346,7 @@ export class CatalogService {
     return requireResult((await this.withSkus([product]))[0]);
   };
 
-  getProductsByIds = async (productIds: string[]): Promise<ProductType[]> => {
+  getProductsByIds = async (productIds: string[]): Promise<HydratedProduct[]> => {
     if (!productIds.length) return [];
     const rows = await this.db
       .select()
@@ -421,7 +427,7 @@ export class CatalogService {
   private withSkus = async (
     productRows: (typeof products.$inferSelect)[],
     db: CatalogDatabase = this.db,
-  ): Promise<ProductType[]> => {
+  ): Promise<HydratedProduct[]> => {
     if (productRows.length === 0) return [];
     const productIds = productRows.map((product) => product.productId);
     const brandIds = productRows.flatMap((product) => (product.brandId ? [product.brandId] : []));
@@ -475,14 +481,16 @@ export class CatalogService {
   private highestSkuPrice = (product: ProductType) =>
     product.skus.length > 0 ? Math.max(...product.skus.map((sku) => sku.price)) : 0;
 
-  private toPriceSummary = (product: ProductType): ProductPriceSummaryType => {
+  private toPriceSummary = (product: HydratedProduct): ProductPriceSummaryType => {
     const finalPrice = this.lowestSkuPrice(product);
     const basePrice = this.highestSkuPrice(product);
     const discountAmount = Math.max(basePrice - finalPrice, 0);
     return {
       productId: product.productId,
       name: product.title,
-      thumbnail: product.imageUrls[0] ?? null,
+      thumbnail: product.imageKeys[0]
+        ? this.mediaService.getProductImageUrl(product.imageKeys[0], IMAGE_SUMMARY_WIDTH)
+        : (product.imageUrls[0] ?? null),
       isOnSale: product.isOnSale,
       isExpressDelivery: product.isExpressDelivery,
       basePrice,

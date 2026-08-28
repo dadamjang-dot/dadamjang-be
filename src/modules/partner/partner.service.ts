@@ -1,5 +1,6 @@
 import { Inject, Injectable } from "@nestjs/common";
 import { SQL, and, asc, desc, eq, exists, getTableColumns, ilike, inArray, or, sql } from "drizzle-orm";
+import { hasDatabaseErrorCode } from "src/common/errors/database-error";
 import { CustomBadRequestException, CustomNotFoundException } from "src/common/errors/custom-exceptions";
 import { requireResult } from "src/common/invariants/require-result";
 import { Database, DRIZZLE } from "src/modules/database/database.module";
@@ -44,25 +45,36 @@ export class PartnerService {
   ) {}
 
   apply = async (ownerUserId: string, input: ApplyPartnerInput) => {
-    const [existing] = await this.db.select().from(partners).where(eq(partners.ownerUserId, ownerUserId)).limit(1);
-    if (existing) throw new CustomBadRequestException(PartnerErrorMessage.AlreadyExists);
     const businessEmail = this.emailService.normalizeEmail(input.businessEmail);
-    await this.emailService.consumeVerifiedEmailToken(input.businessEmailVerificationToken, businessEmail);
-    const partner = requireResult(
-      (
-        await this.db
-          .insert(partners)
-          .values({ ...input, businessEmail, ownerUserId })
-          .returning()
-      )[0],
-    );
-    await this.db.insert(activityEvents).values({
-      actorUserId: ownerUserId,
-      eventType: "PARTNER_APPLICATION_SUBMITTED",
-      subjectType: "PARTNER",
-      subjectId: partner.partnerId,
-    });
-    return partner;
+    const businessRegistrationNumber = input.businessRegistrationNumber.trim();
+    const tradeName = input.tradeName.trim();
+    if (!businessRegistrationNumber || businessRegistrationNumber.length > 20 || !tradeName || tradeName.length > 160)
+      throw new CustomBadRequestException(PartnerErrorMessage.InvalidApplicationInput);
+    try {
+      return await this.db.transaction(async (tx) => {
+        const [existing] = await tx.select().from(partners).where(eq(partners.ownerUserId, ownerUserId)).limit(1);
+        if (existing) throw new CustomBadRequestException(PartnerErrorMessage.AlreadyExists);
+        await this.emailService.consumeVerifiedEmailToken(input.businessEmailVerificationToken, businessEmail, tx);
+        const partner = requireResult(
+          (
+            await tx
+              .insert(partners)
+              .values({ businessEmail, businessRegistrationNumber, ownerUserId, tradeName })
+              .returning()
+          )[0],
+        );
+        await tx.insert(activityEvents).values({
+          actorUserId: ownerUserId,
+          eventType: "PARTNER_APPLICATION_SUBMITTED",
+          subjectType: "PARTNER",
+          subjectId: partner.partnerId,
+        });
+        return partner;
+      });
+    } catch (error) {
+      if (hasDatabaseErrorCode(error, "23505")) throw new CustomBadRequestException(PartnerErrorMessage.AlreadyExists);
+      throw error;
+    }
   };
 
   getMine = async (ownerUserId: string) => {
@@ -169,8 +181,8 @@ export class PartnerService {
 
   createDraft = async (ownerUserId: string, input: PartnerProductInput) => {
     const partner = await this.approvedPartner(ownerUserId);
-    await this.validate(ownerUserId, input);
-    const imageUrls = await Promise.all(input.imageKeys.map((key) => this.mediaService.getProductImageUrl(key)));
+    const imageKeys = await this.validate(ownerUserId, input);
+    const imageUrls = await Promise.all(imageKeys.map((key) => this.mediaService.getProductImageUrl(key)));
     const created = await this.db.transaction(async (tx) => {
       const product = requireResult(
         (
@@ -182,7 +194,7 @@ export class PartnerService {
               categoryId: input.categoryId,
               title: input.title.trim(),
               description: input.description.trim(),
-              imageKeys: input.imageKeys,
+              imageKeys,
               imageUrls,
               approvalStatus: "DRAFT",
               isOnSale: input.isOnSale,
@@ -194,6 +206,7 @@ export class PartnerService {
       await tx
         .insert(productSkus)
         .values(input.skus.map((sku, position) => ({ ...sku, position, productId: product.productId })));
+      await this.mediaService.replaceImageReferences(tx, "PRODUCT", product.productId, imageKeys);
       return product;
     });
     return this.getProduct(ownerUserId, created.productId);
@@ -201,8 +214,8 @@ export class PartnerService {
 
   updateDraft = async (ownerUserId: string, productId: string, input: PartnerProductInput) => {
     const partner = await this.approvedPartner(ownerUserId);
-    await this.validate(ownerUserId, input);
-    const imageUrls = await Promise.all(input.imageKeys.map((key) => this.mediaService.getProductImageUrl(key)));
+    const imageKeys = await this.validate(ownerUserId, input);
+    const imageUrls = await Promise.all(imageKeys.map((key) => this.mediaService.getProductImageUrl(key)));
     await this.db.transaction(async (tx) => {
       const [updated] = await tx
         .update(products)
@@ -210,7 +223,7 @@ export class PartnerService {
           categoryId: input.categoryId,
           title: input.title.trim(),
           description: input.description.trim(),
-          imageKeys: input.imageKeys,
+          imageKeys,
           imageUrls,
           isOnSale: input.isOnSale,
           isExpressDelivery: input.isExpressDelivery,
@@ -231,6 +244,7 @@ export class PartnerService {
       if (!updated) throw new CustomBadRequestException(PartnerErrorMessage.InvalidTransition);
       await tx.delete(productSkus).where(eq(productSkus.productId, productId));
       await tx.insert(productSkus).values(input.skus.map((sku, position) => ({ ...sku, position, productId })));
+      await this.mediaService.replaceImageReferences(tx, "PRODUCT", productId, imageKeys);
     });
     return this.getProduct(ownerUserId, productId);
   };
@@ -263,7 +277,7 @@ export class PartnerService {
       )
       .limit(1);
     if (!candidate) throw new CustomBadRequestException(PartnerErrorMessage.InvalidTransition);
-    await Promise.all(candidate.imageKeys.map((key) => this.mediaService.validateProductImageObject(key, ownerUserId)));
+    await this.mediaService.validateProductImageObjects(candidate.imageKeys, ownerUserId);
     const [product] = await this.db
       .update(products)
       .set(
@@ -309,7 +323,6 @@ export class PartnerService {
       throw new CustomBadRequestException(PartnerErrorMessage.InvalidProductInput);
     if (input.imageKeys.some((key) => !this.mediaService.isProductImageKeyForUser(key, ownerUserId)))
       throw new CustomBadRequestException(PartnerErrorMessage.ImageOwnership);
-    await Promise.all(input.imageKeys.map((key) => this.mediaService.validateProductImageObject(key, ownerUserId)));
     const [category] = await this.db
       .select()
       .from(categories)
@@ -337,6 +350,7 @@ export class PartnerService {
       new Set(validSizes.map((v) => v.sizeId)).size !== new Set(sizeIds).size
     )
       throw new CustomBadRequestException(PartnerErrorMessage.CatalogOptionInactive);
+    return this.mediaService.validateProductImageObjects(input.imageKeys, ownerUserId);
   };
 
   private hydrate = async (ownerUserId: string, rows: (typeof products.$inferSelect)[]) => {

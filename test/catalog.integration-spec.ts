@@ -134,6 +134,32 @@ describe("catalog PostgreSQL integration", () => {
     await pool.end();
   });
 
+  it("bounds catalog summary thumbnails while preserving product detail images", async () => {
+    const imageKey = `products/${FIXTURE.userId}/00000000-0000-4000-8000-000000000001.webp`;
+    const fullSizeUrl = `http://localhost/images/format=auto,fit=scale-down/http://localhost/r2/${imageKey}`;
+    await pool.query(
+      `UPDATE "products" SET "imageKeys" = ARRAY[$2]::text[], "imageUrls" = $3::jsonb WHERE "productId" = $1`,
+      [FIXTURE.productId, imageKey, JSON.stringify([fullSizeUrl])],
+    );
+
+    const summary = await request(app.getHttpServer())
+      .post("/graphql")
+      .send({
+        query: `query { productPriceSummaries(filter: { query: "Integration Sale Tee" }) { nodes { thumbnail } } }`,
+      })
+      .expect(200);
+    const detail = await request(app.getHttpServer())
+      .post("/graphql")
+      .send({ query: `{ product(productId: "${FIXTURE.productId}") { imageUrls } }` })
+      .expect(200);
+
+    expect(summary.body.errors).toBeUndefined();
+    expect(summary.body.data.productPriceSummaries.nodes[0].thumbnail).toBe(
+      `https://images.example.test/cdn-cgi/image/format=auto,width=640/http://localhost/r2/${imageKey}`,
+    );
+    expect(detail.body.data.product.imageUrls).toEqual([fullSizeUrl]);
+  });
+
   it.each([
     ["RECOMMENDED", [CURSOR_PRODUCTS.second, CURSOR_PRODUCTS.first, CURSOR_PRODUCTS.third, CURSOR_PRODUCTS.fourth]],
     ["LATEST", [CURSOR_PRODUCTS.second, CURSOR_PRODUCTS.first, CURSOR_PRODUCTS.third, CURSOR_PRODUCTS.fourth]],

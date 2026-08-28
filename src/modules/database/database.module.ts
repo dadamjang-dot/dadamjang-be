@@ -5,6 +5,8 @@ import * as schema from "./schema";
 
 export const DRIZZLE = Symbol("DRIZZLE");
 export type Database = ReturnType<typeof drizzle<typeof schema>>;
+export type DatabaseTransaction = Parameters<Parameters<Database["transaction"]>[0]>[0];
+export type DatabaseExecutor = Database | DatabaseTransaction;
 
 @Injectable()
 export class DatabaseHealth {

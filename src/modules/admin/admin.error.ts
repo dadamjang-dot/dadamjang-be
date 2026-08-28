@@ -16,7 +16,6 @@ export enum AdminErrorMessage {
   CategoryHasActiveChildren = "Category has active child categories",
   CategoryHasPublicProducts = "Category has public products",
   InviteEmailAlreadyRegistered = "A user with this email already exists",
-  InviteEmailFailed = "Admin invite email could not be sent",
   InvalidOrExpiredInvite = "Invalid or expired admin invite",
   AuthenticationRequired = "Authentication required",
 }

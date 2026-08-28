@@ -4,6 +4,8 @@ import request from "supertest";
 import { createApp } from "src/app";
 import { hashToken } from "src/common/security/token-hash";
 import { ADMIN_FIXTURE, FIXTURE, seedAdminFixtures } from "src/database/fixtures";
+import { EmailDeliveryWorker } from "src/modules/email/email.outbox";
+import type { EmailSender } from "src/modules/email/email.sender";
 import { resetTestFixtures, testPool } from "./support/database";
 
 type Agent = ReturnType<typeof request.agent>;
@@ -36,6 +38,7 @@ describe("Admin GraphQL integration", () => {
   });
 
   beforeEach(async () => {
+    jest.restoreAllMocks();
     await resetTestFixtures(pool);
     await seedAdminFixtures(pool);
   });
@@ -332,13 +335,14 @@ describe("Admin GraphQL integration", () => {
     const failedDelivery = await graphql(app, token, createMutation, {
       input: { email: "failed-delivery@example.test" },
     });
-    expect(failedDelivery.body.errors[0].extensions.code).toBe("SERVICE_UNAVAILABLE");
-    const rolledBack = await pool.query(
-      `SELECT 1 FROM "adminInvites" WHERE "email" = 'failed-delivery@example.test'
-       UNION ALL
-       SELECT 1 FROM "auditLogs" WHERE "action" = 'ADMIN_INVITED' AND "metadata"->>'email' = 'failed-delivery@example.test'`,
+    expect(failedDelivery.body.errors).toBeUndefined();
+    const queued = await pool.query<{ status: string }>(
+      `SELECT o."status"
+       FROM "adminInvites" i
+       JOIN "emailDeliveryOutbox" o ON o."proofId" = i."inviteId"::text
+       WHERE i."email" = 'failed-delivery@example.test'`,
     );
-    expect(rolledBack.rowCount).toBe(0);
+    expect(queued.rows).toEqual([{ status: "PENDING" }]);
     const created = await graphql(app, token, createMutation, { input: { email: "second-admin@example.test" } });
     expect(created.body.errors).toBeUndefined();
     expect(created.body.data.createAdminInvite).not.toHaveProperty("token");
@@ -415,6 +419,95 @@ describe("Admin GraphQL integration", () => {
       query: `{ __type(name: "AdminInviteType") { fields { name } } }`,
     });
     expect(schema.body.data.__type.fields.map(({ name }: { name: string }) => name)).not.toContain("token");
+  });
+
+  it("never sends an admin invite from a transaction that fails to commit", async () => {
+    const token = await adminToken(request.agent(app.getHttpServer()));
+    const sender = app.get<EmailSender>("EmailSender");
+    const sendLink = jest.spyOn(sender, "sendLink").mockResolvedValue(undefined);
+    await pool.query(`
+      CREATE FUNCTION reject_admin_invite_commit() RETURNS trigger AS $$
+      BEGIN
+        IF NEW."email" = 'commit-failure@example.test' THEN
+          RAISE EXCEPTION 'blocked admin invite commit';
+        END IF;
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql
+    `);
+    await pool.query(`
+      CREATE CONSTRAINT TRIGGER reject_admin_invite_commit
+      AFTER INSERT ON "emailDeliveryOutbox"
+      DEFERRABLE INITIALLY DEFERRED
+      FOR EACH ROW EXECUTE FUNCTION reject_admin_invite_commit()
+    `);
+
+    let response;
+    try {
+      response = await graphql(
+        app,
+        token,
+        `
+          mutation Invite($input: CreateAdminInviteInput!) {
+            createAdminInvite(input: $input) {
+              inviteId
+            }
+          }
+        `,
+        { input: { email: "commit-failure@example.test" } },
+      );
+    } finally {
+      await pool.query(`DROP TRIGGER reject_admin_invite_commit ON "emailDeliveryOutbox"`);
+      await pool.query(`DROP FUNCTION reject_admin_invite_commit()`);
+    }
+
+    expect(response.body.errors).toBeDefined();
+    expect(sendLink).not.toHaveBeenCalled();
+    const rows = await pool.query(
+      `SELECT 1 FROM "adminInvites" WHERE "email" = 'commit-failure@example.test'
+       UNION ALL
+       SELECT 1 FROM "emailDeliveryOutbox" WHERE "email" = 'commit-failure@example.test'`,
+    );
+    expect(rows.rowCount).toBe(0);
+  });
+
+  it("delivers an admin invite through the shared worker only after its transaction commits", async () => {
+    const token = await adminToken(request.agent(app.getHttpServer()));
+    const sender = app.get<EmailSender>("EmailSender");
+    const sendLink = jest.spyOn(sender, "sendLink").mockResolvedValue(undefined);
+    const created = await graphql(
+      app,
+      token,
+      `
+        mutation Invite($input: CreateAdminInviteInput!) {
+          createAdminInvite(input: $input) {
+            inviteId
+            email
+          }
+        }
+      `,
+      { input: { email: "worker-admin@example.test" } },
+    );
+
+    expect(created.body.errors).toBeUndefined();
+    expect(sendLink).not.toHaveBeenCalled();
+    const before = await pool.query<{ status: string }>(`
+      SELECT "status" FROM "emailDeliveryOutbox" WHERE "email" = 'worker-admin@example.test'
+    `);
+    expect(before.rows).toEqual([{ status: "PENDING" }]);
+
+    await app.get(EmailDeliveryWorker).runOnce(new Date(Date.now() + 1_000));
+
+    expect(sendLink).toHaveBeenCalledWith(
+      "worker-admin@example.test",
+      "다담장 관리자 초대",
+      expect.stringMatching(/^http:\/\/localhost:3001\/invite\/accept#token=[A-Za-z0-9_-]+$/),
+      expect.stringMatching(/^email-delivery\/[0-9a-f-]+$/),
+    );
+    const after = await pool.query<{ status: string }>(`
+      SELECT "status" FROM "emailDeliveryOutbox" WHERE "email" = 'worker-admin@example.test'
+    `);
+    expect(after.rows).toEqual([{ status: "SENT" }]);
   });
 
   it("filters immutable audit logs by actor, action, entity, and date", async () => {

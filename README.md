@@ -38,6 +38,33 @@
 - 이미 journal에 기록될 수 있는 migration SQL은 checksum 계약 때문에 수정하지 않습니다. `0015_catalog_keyset_indexes.sql`은 이 원자성을 유지하는 일반 index build이며 timeout으로 무기한 대기를 막습니다.
 - `CREATE INDEX CONCURRENTLY`는 transaction 밖 DDL과 journal 사이의 crash 복구 및 invalid index 재실행 protocol이 마련되기 전에는 runner에서 지원하지 않습니다.
 
+## Media trust boundary와 R2 운영 계약
+
+- `CLOUDFLARE_R2_PENDING_BUCKET`은 public final bucket과 다른 전용 private bucket이어야 합니다. 업로드 mutation은 이 bucket에 대한 5분 만료 presigned `PUT`과 pending 키만 반환하며 public pending URL은 반환하거나 계산하지 않습니다. 서명은 `Content-Type`과 `Content-Length`를 포함하고 소유자·선언 MIME·선언 크기 metadata를 고정합니다.
+- 시작 시 pending/final bucket이 같거나 `CLOUDFLARE_R2_PENDING_PUBLIC_BASE_URL`이 설정되거나 final delivery origin이 `r2.dev`이면 실패합니다. 새 업로드는 JPEG/PNG/WebP만 허용합니다. 기존 HEIC/HEIF final 키의 delivery URL 호환성은 유지하지만 새 업로드·재첨부에는 사용하지 않습니다.
+- 첨부 시 서버는 먼저 전체 묶음의 경로와 `HeadObject` MIME·크기·ETag를 검증하고, `If-Match`가 적용된 전체 객체를 최대 10MB까지만 스트리밍합니다. JPEG/PNG/WebP 컨테이너 완결성, 실제 `sharp` decode, 단일 page, 각 축 8192px, 총 2천만 pixel 상한을 전부 통과한 뒤에만 승격합니다.
+- pending bucket에서 final bucket으로 보내는 `CopyObject`는 leading-slash `CopySource`와 source ETag 조건을 사용합니다. final 키는 source key와 ETag의 SHA-256이므로 재시도와 동시 승격은 같은 immutable 키로 수렴합니다. 배포 전 final 객체는 전체 decode 후 ledger에 채택되어 기존 UUID 키를 유지합니다.
+- `mediaObjectPromotions`와 `mediaObjectReferences`가 copy-before-DB-commit 간극을 추적합니다. 도메인 참조는 상품·스타일 글 transaction 안에서 기록되고, `SKIP LOCKED` 기반 GC는 24시간 동안 참조되지 않은 final 객체만 claim한 뒤 삭제합니다. 삭제 후 DB 기록 실패와 stale multi-instance claim도 동일 ledger에서 재시도합니다.
+- Cloudflare 설정은 애플리케이션이 조회해 증명할 수 없으므로 다음 항목은 **배포 필수 전제**입니다.
+  - pending bucket의 `r2.dev`, custom domain, 기타 public access를 모두 비활성화하고 final bucket과 pending bucket 모두에 접근할 수 있는 최소 권한 credential을 배포합니다.
+  - pending bucket CORS는 production 앱 origin, `PUT`, 필요한 `Content-Type`만 허용하고 prefix `pending/`에 expiration 1일 lifecycle을 설정합니다.
+  - final bucket의 `r2.dev` development URL을 비활성화합니다. 과거 final bucket에 남은 `pending/` 객체가 모두 만료·삭제될 때까지 custom domain에서 `/pending/`의 `GET`/`HEAD`와 Images 변환을 WAF로 차단하고 캐시하지 않습니다.
+  - `0018_media_object_ledger.sql`을 먼저 적용하고 모든 구버전 writer가 종료된 뒤 `MEDIA_GC_WORKER_ENABLED=true`인 새 버전을 활성화합니다. rolling 중 구버전 writer가 ledger 없이 새 참조를 만들게 해서는 안 됩니다.
+
+이 저장소는 외부 R2 bucket을 소유하는 Terraform resource를 만들지 않습니다. 운영자는 Cloudflare의 [public bucket access](https://developers.cloudflare.com/r2/buckets/public-buckets/), [CORS](https://developers.cloudflare.com/r2/buckets/cors/), [object lifecycle](https://developers.cloudflare.com/r2/buckets/object-lifecycles/) 설정을 별도 배포 게이트로 확인해야 합니다. `HeadObject`, conditional `GetObject`, `CopyObject` 지원 여부는 [R2 S3 compatibility](https://developers.cloudflare.com/r2/api/s3/api/) 계약을 기준으로 합니다.
+
+## 외부 메일 outbox 계약
+
+- 가입 코드, 비밀번호 재설정 코드·링크, 관리자 초대는 모두 `emailDeliveryOutbox`를 사용합니다. 요청/관리자 transaction은 암호화된 payload와 proof를 원자적으로 기록할 뿐 Resend를 기다리지 않습니다.
+- PostgreSQL `SKIP LOCKED` claim, stale-claim 복구, 동일 outbox ID 기반 provider idempotency key로 multi-instance 재시도합니다. 전송 성공 여부가 모호하면 proof를 삭제하지 않으며 다음 claim이 같은 payload와 key를 사용합니다.
+- 복구 요청은 등록 여부와 관계없이 같은 admission·outbox 경로와 generic 응답을 사용합니다. 사용자 조회와 미등록 주소 suppress는 응답이 끝난 뒤 worker에서 수행합니다.
+- 운영에서는 `EMAIL_OUTBOX_WORKER_ENABLED=true`를 명시합니다. `0017_email_delivery_outbox.sql`과 새 writer를 함께 배포하고, outbox를 처리할 인스턴스가 최소 하나 이상 실행 중인지 모니터링해야 합니다.
+
+## ALB client IP 계약
+
+- `TRUST_PROXY=false`가 direct/local 기본값입니다. staging·production에서만 app task로의 직접 ingress를 차단하고 ALB security group만 허용한 뒤 `TRUST_PROXY=true`를 사용합니다.
+- backend는 socket 바로 앞의 한 hop만 신뢰합니다. ALB attribute `routing.http.xff_header_processing.mode`는 `append`여야 하며 `preserve` 또는 `remove`를 사용하면 안 됩니다. `routing.http.xff_client_port.enabled`는 `false`로 유지합니다. 이 계약에서 ALB가 붙인 가장 오른쪽 client hop만 admission identity가 되고 그 왼쪽의 forged/rotating XFF 값은 무시됩니다.
+
 ## Checkout 정합성 계약
 
 - `checkoutCart(input)`은 `idempotencyKey`를 필수로 받습니다.

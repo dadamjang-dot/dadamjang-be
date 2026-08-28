@@ -7,6 +7,15 @@ export const EmailVerificationPurpose = {
 
 export type EmailVerificationPurposeValue = (typeof EmailVerificationPurpose)[keyof typeof EmailVerificationPurpose];
 
+export const EmailDeliveryKind = {
+  SignupCode: "SIGNUP_CODE",
+  PasswordResetCode: "PASSWORD_RESET_CODE",
+  PasswordResetLink: "PASSWORD_RESET_LINK",
+  AdminInvite: "ADMIN_INVITE",
+} as const;
+
+export type EmailDeliveryKindValue = (typeof EmailDeliveryKind)[keyof typeof EmailDeliveryKind];
+
 @InputType()
 export class RequestEmailCodeInput {
   @Field() email!: string;

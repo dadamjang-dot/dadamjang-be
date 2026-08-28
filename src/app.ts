@@ -32,7 +32,7 @@ export const createApp = async () => {
   app
     .getHttpAdapter()
     .getInstance()
-    .set("trust proxy", process.env.TRUST_PROXY === "true");
+    .set("trust proxy", process.env.TRUST_PROXY === "true" ? 1 : false);
   app.use(cookieParser());
   app.use(passport.initialize());
   app.use((req: Request, res: Response, next: NextFunction) => {
