@@ -3,6 +3,7 @@ import { ConfigService } from "@nestjs/config";
 import * as bcrypt from "bcrypt";
 import { randomBytes, randomUUID } from "crypto";
 import { CustomBadRequestException, CustomUnauthorizedException } from "src/common/errors/custom-exceptions";
+import { hasDatabaseErrorCode } from "src/common/errors/database-error";
 import { hashToken } from "src/common/security/token-hash";
 import { UserRole } from "src/auth/role";
 import type { KakaoProfile } from "src/modules/auth/auth.types";
@@ -102,11 +103,8 @@ export class KakaoFlowService {
     } catch (error) {
       if (error instanceof InvalidFoAuthProofError)
         throw new CustomUnauthorizedException("카카오 가입 인증이 유효하지 않습니다.");
-      if (this.isUniqueViolation(error)) throw new CustomBadRequestException("이미 가입된 이메일입니다.");
+      if (hasDatabaseErrorCode(error, "23505")) throw new CustomBadRequestException("이미 가입된 이메일입니다.");
       throw error;
     }
   };
-
-  private isUniqueViolation = (error: unknown) =>
-    typeof error === "object" && error !== null && "code" in error && error.code === "23505";
 }

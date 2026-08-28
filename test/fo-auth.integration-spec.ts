@@ -70,6 +70,72 @@ const seedSignupProofs = async (pool: Pool, deviceId: string) => {
   );
 };
 
+type KakaoSignupAttempt = {
+  readonly deviceId: string;
+  readonly signupToken: string;
+  readonly identityToken: string;
+  readonly emailToken: string;
+  readonly email: string;
+  readonly ciHash: string;
+  readonly providerUserId: string;
+  readonly verificationId: string;
+  readonly sessionId: string;
+  readonly merchantTransactionId: string;
+};
+
+const seedKakaoSignupAttempt = async (pool: Pool, attempt: KakaoSignupAttempt) => {
+  await pool.query(
+    `INSERT INTO "kakaoSignupToken"
+      ("tokenHash", "providerUserId", "emailVerified", "deviceIdHash", "expiresAt")
+     VALUES ($1, $2, false, $3, now() + interval '10 minutes')`,
+    [hashToken(attempt.signupToken), attempt.providerUserId, hashToken(attempt.deviceId)],
+  );
+  await pool.query(
+    `INSERT INTO "emailVerification" ("id", "email", "purpose", "codeHash", "expiresAt", "verifiedAt")
+     VALUES ($1, $2, 'SIGNUP', 'hash', now() + interval '10 minutes', now())`,
+    [attempt.verificationId, attempt.email],
+  );
+  await pool.query(
+    `INSERT INTO "emailVerificationToken" ("tokenHash", "email", "purpose", "verificationId", "expiresAt")
+     VALUES ($1, $2, 'SIGNUP', $3, now() + interval '10 minutes')`,
+    [hashToken(attempt.emailToken), attempt.email, attempt.verificationId],
+  );
+  await pool.query(
+    `INSERT INTO "identityVerificationSessions"
+      ("sessionId", "purpose", "provider", "deviceIdHash", "merchantTransactionId", "status", "ciHash", "certificateProvider", "isFourteenOrOlder", "proofTokenHash", "expiresAt", "verifiedAt", "completedAt")
+     VALUES ($1, 'SIGNUP', 'TOSS', $2, $3, 'VERIFIED', $4, 'TOSS', true, $5, now() + interval '10 minutes', now(), now())`,
+    [
+      attempt.sessionId,
+      hashToken(attempt.deviceId),
+      attempt.merchantTransactionId,
+      attempt.ciHash,
+      hashToken(attempt.identityToken),
+    ],
+  );
+};
+
+const completeKakaoSignup = (app: INestApplication, attempt: KakaoSignupAttempt) =>
+  request(app.getHttpServer())
+    .post("/graphql")
+    .set("x-device-id", attempt.deviceId)
+    .send({
+      query: `mutation CompleteKakaoSignupFo($input: CompleteKakaoSignupFoInput!) {
+        completeKakaoSignupFo(input: $input) { accessToken role }
+      }`,
+      variables: {
+        input: {
+          kakaoSignupToken: attempt.signupToken,
+          email: attempt.email,
+          emailVerificationToken: attempt.emailToken,
+          identityVerificationToken: attempt.identityToken,
+          consents: Object.values(documentIds).map((documentId) => ({
+            documentId,
+            agreed: documentId !== documentIds.marketing,
+          })),
+        },
+      },
+    });
+
 describe("FO auth GraphQL integration", () => {
   let app: INestApplication;
   let pool: Pool;
@@ -77,7 +143,7 @@ describe("FO auth GraphQL integration", () => {
   beforeAll(async () => {
     pool = testPool();
     app = await createApp();
-    await app.init();
+    await app.listen(0, "127.0.0.1");
   });
 
   beforeEach(async () => {
@@ -117,6 +183,25 @@ describe("FO auth GraphQL integration", () => {
         variables: { input: { email: "missing@example.test", password: "wrong-password" } },
       });
     expect(rejected.body.errors[0].message).toBe("이메일 또는 비밀번호가 올바르지 않습니다.");
+  });
+
+  it("allows only one overlapping sign-in to claim the same device session", async () => {
+    const signin = () =>
+      request(app.getHttpServer())
+        .post("/graphql")
+        .set("x-device-id", "fo-concurrent-signin-device")
+        .send({
+          query: `mutation SigninFo($input: SigninFoInput!) { signinFo(input: $input) { refreshToken } }`,
+          variables: { input: { email: "integration@example.test", password: "IntegrationPassword123!" } },
+        });
+
+    const responses = await Promise.all(Array.from({ length: 16 }, signin));
+    const succeeded = responses.filter(({ body }) => body.errors === undefined);
+    const rejected = responses.filter(({ body }) => body.errors !== undefined);
+
+    expect(succeeded).toHaveLength(1);
+    expect(rejected).toHaveLength(15);
+    expect(new Set(rejected.map(({ body }) => body.errors[0].extensions.code))).toEqual(new Set(["CONFLICT"]));
   });
 
   it("rotates a refresh token exactly once under concurrent requests", async () => {
@@ -477,6 +562,7 @@ describe("FO auth GraphQL integration", () => {
         emailToken: "kakao-provider-email-a",
         email: "kakao-provider-a@example.test",
         ciHash: "kakao-provider-ci-a",
+        providerUserId: "kakao-shared-provider",
         verificationId: "b2000000-0000-4000-8000-000000000001",
         sessionId: "c2000000-0000-4000-8000-000000000001",
         merchantTransactionId: "77654321098765432101",
@@ -488,64 +574,15 @@ describe("FO auth GraphQL integration", () => {
         emailToken: "kakao-provider-email-b",
         email: "kakao-provider-b@example.test",
         ciHash: "kakao-provider-ci-b",
+        providerUserId: "kakao-shared-provider",
         verificationId: "b2000000-0000-4000-8000-000000000002",
         sessionId: "c2000000-0000-4000-8000-000000000002",
         merchantTransactionId: "77654321098765432102",
       },
     ] as const;
-    for (const attempt of attempts) {
-      await pool.query(
-        `INSERT INTO "kakaoSignupToken"
-          ("tokenHash", "providerUserId", "emailVerified", "deviceIdHash", "expiresAt")
-         VALUES ($1, 'kakao-shared-provider', false, $2, now() + interval '10 minutes')`,
-        [hashToken(attempt.signupToken), hashToken(attempt.deviceId)],
-      );
-      await pool.query(
-        `INSERT INTO "emailVerification" ("id", "email", "purpose", "codeHash", "expiresAt", "verifiedAt")
-         VALUES ($1, $2, 'SIGNUP', 'hash', now() + interval '10 minutes', now())`,
-        [attempt.verificationId, attempt.email],
-      );
-      await pool.query(
-        `INSERT INTO "emailVerificationToken" ("tokenHash", "email", "purpose", "verificationId", "expiresAt")
-         VALUES ($1, $2, 'SIGNUP', $3, now() + interval '10 minutes')`,
-        [hashToken(attempt.emailToken), attempt.email, attempt.verificationId],
-      );
-      await pool.query(
-        `INSERT INTO "identityVerificationSessions"
-          ("sessionId", "purpose", "provider", "deviceIdHash", "merchantTransactionId", "status", "ciHash", "certificateProvider", "isFourteenOrOlder", "proofTokenHash", "expiresAt", "verifiedAt", "completedAt")
-         VALUES ($1, 'SIGNUP', 'TOSS', $2, $3, 'VERIFIED', $4, 'TOSS', true, $5, now() + interval '10 minutes', now(), now())`,
-        [
-          attempt.sessionId,
-          hashToken(attempt.deviceId),
-          attempt.merchantTransactionId,
-          attempt.ciHash,
-          hashToken(attempt.identityToken),
-        ],
-      );
-    }
-    const complete = (attempt: (typeof attempts)[number]) =>
-      request(app.getHttpServer())
-        .post("/graphql")
-        .set("x-device-id", attempt.deviceId)
-        .send({
-          query: `mutation CompleteKakaoSignupFo($input: CompleteKakaoSignupFoInput!) {
-            completeKakaoSignupFo(input: $input) { accessToken role }
-          }`,
-          variables: {
-            input: {
-              kakaoSignupToken: attempt.signupToken,
-              email: attempt.email,
-              emailVerificationToken: attempt.emailToken,
-              identityVerificationToken: attempt.identityToken,
-              consents: Object.values(documentIds).map((documentId) => ({
-                documentId,
-                agreed: documentId !== documentIds.marketing,
-              })),
-            },
-          },
-        });
+    await Promise.all(attempts.map((attempt) => seedKakaoSignupAttempt(pool, attempt)));
 
-    const responses = await Promise.all(attempts.map(complete));
+    const responses = await Promise.all(attempts.map((attempt) => completeKakaoSignup(app, attempt)));
     expect(responses.filter(({ body }) => body.errors === undefined)).toHaveLength(1);
     expect(responses.filter(({ body }) => body.errors !== undefined)).toHaveLength(1);
     const state = await pool.query<{ users: number; identities: number; links: number; sessions: number }>(
@@ -556,6 +593,48 @@ describe("FO auth GraphQL integration", () => {
         (SELECT count(*)::int FROM "refreshToken" WHERE "deviceId" LIKE 'kakao-provider-race-%') AS sessions`,
     );
     expect(state.rows[0]).toEqual({ users: 1, identities: 1, links: 1, sessions: 1 });
+  });
+
+  it("converges concurrent Kakao signups with the same CI on one account", async () => {
+    const attempts = [
+      {
+        deviceId: "kakao-ci-race-a",
+        signupToken: "kakao-ci-token-a",
+        identityToken: "kakao-ci-identity-a",
+        emailToken: "kakao-ci-email-a",
+        email: "kakao-ci-a@example.test",
+        ciHash: "kakao-shared-ci",
+        providerUserId: "kakao-ci-provider-a",
+        verificationId: "b3000000-0000-4000-8000-000000000001",
+        sessionId: "c3000000-0000-4000-8000-000000000001",
+        merchantTransactionId: "88654321098765432101",
+      },
+      {
+        deviceId: "kakao-ci-race-b",
+        signupToken: "kakao-ci-token-b",
+        identityToken: "kakao-ci-identity-b",
+        emailToken: "kakao-ci-email-b",
+        email: "kakao-ci-b@example.test",
+        ciHash: "kakao-shared-ci",
+        providerUserId: "kakao-ci-provider-b",
+        verificationId: "b3000000-0000-4000-8000-000000000002",
+        sessionId: "c3000000-0000-4000-8000-000000000002",
+        merchantTransactionId: "88654321098765432102",
+      },
+    ] as const;
+    await Promise.all(attempts.map((attempt) => seedKakaoSignupAttempt(pool, attempt)));
+
+    const responses = await Promise.all(attempts.map((attempt) => completeKakaoSignup(app, attempt)));
+
+    expect(responses.filter(({ body }) => body.errors === undefined)).toHaveLength(2);
+    const state = await pool.query<{ users: number; identities: number; links: number; sessions: number }>(
+      `SELECT
+        (SELECT count(*)::int FROM "users" WHERE "email" LIKE 'kakao-ci-%@example.test') AS users,
+        (SELECT count(*)::int FROM "verifiedIdentities" WHERE "ciHash" = 'kakao-shared-ci') AS identities,
+        (SELECT count(*)::int FROM "authIdentity" WHERE "providerUserId" LIKE 'kakao-ci-provider-%') AS links,
+        (SELECT count(*)::int FROM "refreshToken" WHERE "deviceId" LIKE 'kakao-ci-race-%') AS sessions`,
+    );
+    expect(state.rows[0]).toEqual({ users: 1, identities: 1, links: 2, sessions: 2 });
   });
 
   it("rejects signup when the verified identity is under fourteen", async () => {

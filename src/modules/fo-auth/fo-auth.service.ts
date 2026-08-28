@@ -2,6 +2,7 @@ import { Injectable } from "@nestjs/common";
 import * as bcrypt from "bcrypt";
 import { randomBytes, randomUUID } from "crypto";
 import { CustomBadRequestException, CustomUnauthorizedException } from "src/common/errors/custom-exceptions";
+import { hasDatabaseErrorCode } from "src/common/errors/database-error";
 import { hashToken } from "src/common/security/token-hash";
 import { UserRole } from "src/auth/role";
 import { AuthService } from "src/modules/auth/auth.service";
@@ -22,12 +23,19 @@ export class FoAuthService {
   ) {}
 
   signin = async (input: SigninFoInput, deviceId: string) => {
+    const signinStartedAt = await this.authService.signinStartedAt();
     const email = this.emailService.normalizeEmail(input.email);
     const user = await this.repository.findByEmail(email);
-    const validPassword = await bcrypt.compare(input.password, user?.password ?? invalidPasswordHash);
-    if (!user || !validPassword || user.role !== UserRole.User)
+    if (!user) {
+      await bcrypt.compare(input.password, invalidPasswordHash);
       throw new CustomUnauthorizedException("이메일 또는 비밀번호가 올바르지 않습니다.");
-    return this.authService.issueTokensForUser(user, deviceId);
+    }
+    return this.authService.withSigninLock(user.userId, deviceId, async (store) => {
+      const validPassword = await bcrypt.compare(input.password, user.password);
+      if (!validPassword || user.role !== UserRole.User)
+        throw new CustomUnauthorizedException("이메일 또는 비밀번호가 올바르지 않습니다.");
+      return this.authService.issueTokensForUser(user, deviceId, store, signinStartedAt);
+    });
   };
 
   signup = async (input: SignupFoInput, deviceId: string) => {
@@ -53,7 +61,7 @@ export class FoAuthService {
         throw new CustomBadRequestException("이미 가입된 본인정보입니다. 이메일 찾기를 이용해주세요.");
       if (error instanceof InvalidFoAuthProofError)
         throw new CustomUnauthorizedException("가입 인증이 유효하지 않습니다.");
-      if (this.isUniqueViolation(error)) throw new CustomBadRequestException("이미 가입된 이메일입니다.");
+      if (hasDatabaseErrorCode(error, "23505")) throw new CustomBadRequestException("이미 가입된 이메일입니다.");
       throw error;
     }
   };
@@ -104,7 +112,4 @@ export class FoAuthService {
       (left, right) => signupConsentTypes.indexOf(left.type) - signupConsentTypes.indexOf(right.type),
     );
   };
-
-  private isUniqueViolation = (error: unknown) =>
-    typeof error === "object" && error !== null && "code" in error && error.code === "23505";
 }

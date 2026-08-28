@@ -2,6 +2,7 @@ import { Inject, Injectable } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { createHmac, timingSafeEqual } from "crypto";
 import { and, asc, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
+import { hasDatabaseErrorCode } from "src/common/errors/database-error";
 import { CustomBadRequestException, CustomNotFoundException } from "src/common/errors/custom-exceptions";
 import { requireResult } from "src/common/invariants/require-result";
 import { Database, DRIZZLE } from "src/modules/database/database.module";
@@ -136,9 +137,6 @@ const decodeLikedStylePostCursor = (value: string, secret: string): LikedStylePo
 
 const unique = (values: string[]) => [...new Set(values)];
 
-const isDuplicateError = (error: unknown) =>
-  typeof error === "object" && error !== null && "code" in error && error.code === "23505";
-
 @Injectable()
 export class StylePostsService {
   constructor(
@@ -227,7 +225,7 @@ export class StylePostsService {
       });
       return this.get(post.stylePostId, authorId);
     } catch (error) {
-      if (!isDuplicateError(error)) throw error;
+      if (!hasDatabaseErrorCode(error, "23505")) throw error;
       const [duplicate] = await this.db
         .select()
         .from(stylePosts)

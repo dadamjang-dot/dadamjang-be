@@ -14,6 +14,8 @@ import { UserRole, type UserRoleValue } from "src/auth/role";
 
 type JwtExpiration = Exclude<JwtSignOptions["expiresIn"], undefined>;
 
+const invalidPasswordHash = "$2b$10$nmo8L8VvFVH2sB.e3T0hP.TQMDhHxk88WTtFBkDgnjAlnHDR4W/rW";
+
 const matchesRefreshToken = async (token: string, saved: string) => {
   if (saved.startsWith("$2")) return bcrypt.compare(token, saved);
   const digest = hashToken(token);
@@ -29,11 +31,18 @@ export class AuthService {
     private readonly emailService: EmailService,
   ) {}
   signin = async (input: SigninAuthInput, deviceId: string) => {
+    const signinStartedAt = await this.repository.signinStartedAt();
     const user = await this.repository.findByUserid(this.emailService.normalizeUserid(input.userid));
-    if (!user || !(await bcrypt.compare(input.password, user.password)))
+    if (!user) {
+      await bcrypt.compare(input.password, invalidPasswordHash);
       throw new CustomUnauthorizedException(AuthErrorMessage.AuthRequired);
-    this.assertPortalRole((user as User & { role?: UserRoleValue }).role ?? UserRole.User, input.portal);
-    return this.issueTokensForUser(user, deviceId);
+    }
+    return this.withSigninLock(user.userId, deviceId, async (store) => {
+      if (!(await bcrypt.compare(input.password, user.password)))
+        throw new CustomUnauthorizedException(AuthErrorMessage.AuthRequired);
+      this.assertPortalRole((user as User & { role?: UserRoleValue }).role ?? UserRole.User, input.portal);
+      return this.issueTokensForUser(user, deviceId, store, signinStartedAt);
+    });
   };
   refresh = async (userId: string, deviceId: string, refreshToken: string) => {
     const saved = await this.repository.findRefreshToken(userId, deviceId);
@@ -68,7 +77,13 @@ export class AuthService {
     return true;
   };
   getViewer = async (userId: string) => this.repository.findUser(userId);
-  issueTokensForUser = async (user: User, deviceId: string, store?: RefreshTokenStore) => {
+  withSigninLock = async <T>(userId: string, deviceId: string, action: (store: RefreshTokenStore) => Promise<T>) => {
+    const result = await this.repository.withSigninLock(userId, deviceId, action);
+    if (!result.acquired) throw new CustomConflictException(AuthErrorMessage.SessionChanged);
+    return result.value;
+  };
+  signinStartedAt = () => this.repository.signinStartedAt();
+  issueTokensForUser = async (user: User, deviceId: string, store?: RefreshTokenStore, signinStartedAt?: Date) => {
     const previous = await this.repository.findRefreshToken(user.userId, deviceId, store);
     const tokens = await this.createTokensForUser(user, deviceId);
     const saved = await this.repository.saveRefreshToken(
@@ -76,6 +91,7 @@ export class AuthService {
         userId: user.userId,
         deviceId,
         ...(previous === undefined ? {} : { previousRefreshToken: previous.refreshToken }),
+        ...(signinStartedAt === undefined ? {} : { signinStartedAt }),
         refreshToken: tokens.refreshTokenHash,
         refreshTokenExp: tokens.refreshTokenExp,
       },

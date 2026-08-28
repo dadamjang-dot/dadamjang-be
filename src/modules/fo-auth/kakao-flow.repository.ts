@@ -162,6 +162,7 @@ export class KakaoFlowRepository {
         )
         .returning();
       if (!identity?.ciHash || !identity.certificateProvider) throw new InvalidFoAuthProofError();
+      await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${identity.ciHash}, 1))`);
       const email = signup.emailVerified ? signup.email : input.email;
       if (!email) throw new InvalidFoAuthProofError();
       const emailProof = signup.emailVerified

@@ -20,7 +20,16 @@ describe("AuthService", () => {
   it("rejects signin through a portal that does not match the user role", async () => {
     const password = await bcrypt.hash("password", 4);
     const service = createService(
-      { findByUserid: jest.fn().mockResolvedValue({ ...user, password }) },
+      {
+        signinStartedAt: jest.fn().mockResolvedValue(new Date()),
+        findByUserid: jest.fn().mockResolvedValue({ ...user, password }),
+        withSigninLock: jest.fn(
+          async (_userId: string, _deviceId: string, action: (store: undefined) => Promise<unknown>) => ({
+            acquired: true,
+            value: await action(undefined),
+          }),
+        ),
+      },
       {
         normalizeUserid: (value: string) => value,
       },

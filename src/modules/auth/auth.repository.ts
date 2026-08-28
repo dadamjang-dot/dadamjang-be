@@ -1,14 +1,17 @@
 import { Inject, Injectable } from "@nestjs/common";
-import { and, eq, gt } from "drizzle-orm";
+import { and, eq, gt, lt, sql } from "drizzle-orm";
 import { Database, DRIZZLE } from "src/modules/database/database.module";
 import { refreshTokens, users, type RefreshToken, type User } from "src/modules/database/schema";
 
 export type RefreshTokenStore = Pick<Database, "insert" | "query" | "update">;
 
+const MIN_SIGNIN_REISSUE_INTERVAL_MS = 1000;
+
 type SaveRefreshTokenInput = {
   userId: string;
   deviceId: string;
   previousRefreshToken?: string;
+  signinStartedAt?: Date;
   refreshToken: string;
   refreshTokenExp: Date;
 };
@@ -16,6 +19,21 @@ type SaveRefreshTokenInput = {
 @Injectable()
 export class AuthRepository {
   constructor(@Inject(DRIZZLE) private readonly db: Database) {}
+  signinStartedAt = async () => {
+    const result = await this.db.execute<{ startedAt: Date | string }>(sql`SELECT clock_timestamp() AS "startedAt"`);
+    const value = result.rows[0]?.startedAt;
+    const startedAt = value instanceof Date ? value : new Date(value ?? "");
+    if (Number.isNaN(startedAt.getTime())) throw new Error("Failed to start sign-in");
+    return startedAt;
+  };
+  withSigninLock = <T>(userId: string, deviceId: string, action: (store: RefreshTokenStore) => Promise<T>) =>
+    this.db.transaction(async (tx) => {
+      const lock = await tx.execute<{ acquired: boolean }>(
+        sql`SELECT pg_try_advisory_xact_lock(hashtextextended(${`${userId}:${deviceId}`}, 2)) AS "acquired"`,
+      );
+      if (!lock.rows[0]?.acquired) return { acquired: false } as const;
+      return { acquired: true, value: await action(tx) } as const;
+    });
   findByUserid = (userid: string): Promise<User | undefined> =>
     this.db.query.users.findFirst({ where: eq(users.userid, userid) });
   findUser = (userId: string): Promise<User | undefined> =>
@@ -29,7 +47,7 @@ export class AuthRepository {
       where: and(eq(refreshTokens.userId, userId), eq(refreshTokens.deviceId, deviceId)),
     });
   saveRefreshToken = async (input: SaveRefreshTokenInput, store: RefreshTokenStore = this.db) => {
-    const { previousRefreshToken, ...session } = input;
+    const { previousRefreshToken, signinStartedAt, ...session } = input;
     if (previousRefreshToken === undefined) {
       const [created] = await store
         .insert(refreshTokens)
@@ -43,13 +61,16 @@ export class AuthRepository {
       .set({
         refreshToken: input.refreshToken,
         refreshTokenExp: input.refreshTokenExp,
-        updatedAt: new Date(),
+        updatedAt: sql`clock_timestamp()`,
       })
       .where(
         and(
           eq(refreshTokens.userId, input.userId),
           eq(refreshTokens.deviceId, input.deviceId),
           eq(refreshTokens.refreshToken, previousRefreshToken),
+          ...(signinStartedAt === undefined
+            ? []
+            : [lt(refreshTokens.updatedAt, new Date(signinStartedAt.getTime() - MIN_SIGNIN_REISSUE_INTERVAL_MS))]),
         ),
       )
       .returning({ id: refreshTokens.id });
@@ -67,7 +88,7 @@ export class AuthRepository {
       .set({
         refreshToken: input.refreshToken,
         refreshTokenExp: input.refreshTokenExp,
-        updatedAt: new Date(),
+        updatedAt: sql`clock_timestamp()`,
       })
       .where(
         and(
