@@ -57,14 +57,33 @@ export class KakaoFlowRepository {
         .limit(1);
       if (existing) return existing;
       await tx.execute(sql`
-        DELETE FROM "kakaoLoginFlows"
-        WHERE ctid IN (
-          SELECT ctid
+        WITH expired_candidates AS MATERIALIZED (
+          SELECT "flowId"
           FROM "kakaoLoginFlows"
-          WHERE "expiresAt" <= ${now} OR "consumedAt" IS NOT NULL
-          ORDER BY "expiresAt"
+          WHERE "expiresAt" <= ${now}
+          ORDER BY "expiresAt", "flowId"
+          FOR UPDATE SKIP LOCKED
           LIMIT 100
+        ), consumed_candidates AS MATERIALIZED (
+          SELECT "flowId"
+          FROM "kakaoLoginFlows"
+          WHERE "consumedAt" IS NOT NULL
+            AND NOT EXISTS (
+              SELECT 1
+              FROM expired_candidates
+              WHERE expired_candidates."flowId" = "kakaoLoginFlows"."flowId"
+            )
+          ORDER BY "consumedAt", "flowId"
+          FOR UPDATE SKIP LOCKED
+          LIMIT (SELECT 100 - count(*) FROM expired_candidates)
+        ), cleanup_candidates AS (
+          SELECT "flowId" FROM expired_candidates
+          UNION ALL
+          SELECT "flowId" FROM consumed_candidates
         )
+        DELETE FROM "kakaoLoginFlows"
+        USING cleanup_candidates
+        WHERE "kakaoLoginFlows"."flowId" = cleanup_candidates."flowId"
       `);
       return (await tx.insert(kakaoLoginFlows).values({ deviceIdHash, expiresAt }).returning())[0];
     });

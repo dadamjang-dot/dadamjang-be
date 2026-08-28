@@ -15,6 +15,22 @@ const documentIds = {
 
 const failedSessionDeviceId = "forced-session-write-failure";
 
+const wait = (milliseconds: number) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+const waitForAdvisoryWaiters = async (pool: Pool, expected: number) => {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const waiting = await pool.query<{ count: string }>(
+      `SELECT count(*)
+       FROM pg_stat_activity
+       WHERE pid <> pg_backend_pid()
+         AND wait_event = 'advisory'`,
+    );
+    if (Number(waiting.rows[0]?.count) >= expected) return;
+    await wait(10);
+  }
+  throw new Error(`Timed out waiting for ${expected} advisory lock waiters`);
+};
+
 const installRefreshSessionFailure = async (pool: Pool) => {
   await pool.query(`
     CREATE OR REPLACE FUNCTION reject_test_refresh_session() RETURNS trigger AS $$
@@ -459,6 +475,100 @@ describe("FO auth GraphQL integration", () => {
           WHERE "expiresAt" <= now() OR "consumedAt" IS NOT NULL) AS identity`,
     );
     expect(rows.rows[0]).toEqual({ identity: 2, kakao: 2 });
+  });
+
+  it.each([
+    {
+      name: "Kakao",
+      table: "kakaoLoginFlows",
+      trigger: "delay_test_kakao_cleanup",
+      function: "delay_test_kakao_cleanup",
+      lockKey: 91003,
+      seed: `INSERT INTO "kakaoLoginFlows" ("deviceIdHash", "expiresAt")
+        SELECT CASE WHEN value = 1 THEN 'cleanup-blocker' ELSE 'concurrent-kakao-' || value END,
+          now() - interval '1 day' + value * interval '1 second'
+        FROM generate_series(1, 201) AS value`,
+      start: (app: INestApplication, deviceId: string) =>
+        request(app.getHttpServer())
+          .post("/graphql")
+          .set("x-device-id", deviceId)
+          .send({ query: `mutation { startKakaoLogin { flowId } }` })
+          .then((response) => response),
+    },
+    {
+      name: "identity",
+      table: "identityVerificationSessions",
+      trigger: "delay_test_identity_cleanup",
+      function: "delay_test_identity_cleanup",
+      lockKey: 91004,
+      seed: `INSERT INTO "identityVerificationSessions"
+          ("purpose", "provider", "deviceIdHash", "merchantTransactionId", "expiresAt")
+        SELECT 'SIGNUP', 'KAKAO',
+          CASE WHEN value = 1 THEN 'cleanup-blocker' ELSE 'concurrent-identity-' || value END,
+          'cc' || lpad(value::text, 18, '0'),
+          now() - interval '1 day' + value * interval '1 second'
+        FROM generate_series(1, 201) AS value`,
+      start: (app: INestApplication, deviceId: string) =>
+        request(app.getHttpServer())
+          .post("/graphql")
+          .set("x-device-id", deviceId)
+          .send({
+            query: `mutation Start($input: StartIdentityVerificationInput!) {
+              startIdentityVerification(input: $input) { sessionId }
+            }`,
+            variables: { input: { purpose: "SIGNUP", provider: "KAKAO" } },
+          })
+          .then((response) => response),
+    },
+  ])("lets a concurrent $name cleaner skip a locked 100-row batch", async (cleanup) => {
+    await pool.query(cleanup.seed);
+    const blocker = await pool.connect();
+    const requests: Promise<request.Response>[] = [];
+    let released = false;
+    try {
+      await pool.query(`
+        CREATE FUNCTION ${cleanup.function}() RETURNS trigger AS $$
+        BEGIN
+          IF OLD."deviceIdHash" = 'cleanup-blocker' THEN
+            PERFORM pg_advisory_xact_lock(${cleanup.lockKey}, 1);
+          END IF;
+          RETURN OLD;
+        END;
+        $$ LANGUAGE plpgsql;
+        CREATE TRIGGER ${cleanup.trigger}
+        BEFORE DELETE ON "${cleanup.table}"
+        FOR EACH ROW EXECUTE FUNCTION ${cleanup.function}();
+      `);
+      await blocker.query(`SELECT pg_advisory_lock(${cleanup.lockKey}, 1)`);
+      const first = cleanup.start(app, `${cleanup.name}-cleaner-first`);
+      requests.push(first);
+      await waitForAdvisoryWaiters(pool, 1);
+      const second = cleanup.start(app, `${cleanup.name}-cleaner-second`);
+      requests.push(second);
+      const secondOutcome = await Promise.race([
+        second.then(() => "completed" as const),
+        wait(1_000).then(() => "blocked" as const),
+      ]);
+      expect(secondOutcome).toBe("completed");
+      await blocker.query(`SELECT pg_advisory_unlock(${cleanup.lockKey}, 1)`);
+      released = true;
+      const responses = await Promise.all(requests);
+      expect(responses.every((response) => response.body.errors === undefined)).toBe(true);
+      const retired = await pool.query<{ count: number }>(
+        `SELECT count(*)::int AS count
+         FROM "${cleanup.table}"
+         WHERE "expiresAt" <= now() OR "consumedAt" IS NOT NULL`,
+      );
+      expect(retired.rows[0]?.count).toBe(1);
+    } finally {
+      if (!released) await blocker.query(`SELECT pg_advisory_unlock(${cleanup.lockKey}, 1)`).catch(() => undefined);
+      await Promise.allSettled(requests);
+      blocker.release();
+      await pool.query(`
+        DROP TRIGGER IF EXISTS ${cleanup.trigger} ON "${cleanup.table}";
+        DROP FUNCTION IF EXISTS ${cleanup.function}();
+      `);
+    }
   });
 
   it("allows only one active Kakao flow per device session", async () => {

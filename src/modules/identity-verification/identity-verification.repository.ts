@@ -41,14 +41,33 @@ export class IdentityVerificationRepository {
         .limit(1);
       if (existing) return existing;
       await tx.execute(sql`
-        DELETE FROM "identityVerificationSessions"
-        WHERE ctid IN (
-          SELECT ctid
+        WITH expired_candidates AS MATERIALIZED (
+          SELECT "sessionId"
           FROM "identityVerificationSessions"
-          WHERE "expiresAt" <= ${now} OR "consumedAt" IS NOT NULL
-          ORDER BY "expiresAt"
+          WHERE "expiresAt" <= ${now}
+          ORDER BY "expiresAt", "sessionId"
+          FOR UPDATE SKIP LOCKED
           LIMIT 100
+        ), consumed_candidates AS MATERIALIZED (
+          SELECT "sessionId"
+          FROM "identityVerificationSessions"
+          WHERE "consumedAt" IS NOT NULL
+            AND NOT EXISTS (
+              SELECT 1
+              FROM expired_candidates
+              WHERE expired_candidates."sessionId" = "identityVerificationSessions"."sessionId"
+            )
+          ORDER BY "consumedAt", "sessionId"
+          FOR UPDATE SKIP LOCKED
+          LIMIT (SELECT 100 - count(*) FROM expired_candidates)
+        ), cleanup_candidates AS (
+          SELECT "sessionId" FROM expired_candidates
+          UNION ALL
+          SELECT "sessionId" FROM consumed_candidates
         )
+        DELETE FROM "identityVerificationSessions"
+        USING cleanup_candidates
+        WHERE "identityVerificationSessions"."sessionId" = cleanup_candidates."sessionId"
       `);
       return (await tx.insert(identityVerificationSessions).values(input).returning())[0];
     });

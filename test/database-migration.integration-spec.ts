@@ -200,6 +200,54 @@ describe("database migration PostgreSQL integration", () => {
     ]);
   });
 
+  it("uses dedicated indexes for bounded anonymous-flow cleanup candidates", async () => {
+    await migrate({ pool: migrationPool });
+    await migrationPool.query(`SET enable_seqscan = off`);
+    const scans = [
+      {
+        table: "kakaoLoginFlows",
+        id: "flowId",
+        timestamp: "expiresAt",
+        condition: `"expiresAt" <= now()`,
+        index: "kakao_login_flows_cleanup_expires_idx",
+      },
+      {
+        table: "kakaoLoginFlows",
+        id: "flowId",
+        timestamp: "consumedAt",
+        condition: `"consumedAt" IS NOT NULL`,
+        index: "kakao_login_flows_cleanup_consumed_idx",
+      },
+      {
+        table: "identityVerificationSessions",
+        id: "sessionId",
+        timestamp: "expiresAt",
+        condition: `"expiresAt" <= now()`,
+        index: "identity_verification_cleanup_expires_idx",
+      },
+      {
+        table: "identityVerificationSessions",
+        id: "sessionId",
+        timestamp: "consumedAt",
+        condition: `"consumedAt" IS NOT NULL`,
+        index: "identity_verification_cleanup_consumed_idx",
+      },
+    ] as const;
+
+    for (const scan of scans) {
+      const plan = await migrationPool.query<{ "QUERY PLAN": unknown }>(
+        `EXPLAIN (FORMAT JSON, COSTS OFF)
+         SELECT "${scan.id}"
+         FROM "${scan.table}"
+         WHERE ${scan.condition}
+         ORDER BY "${scan.timestamp}", "${scan.id}"
+         FOR UPDATE SKIP LOCKED
+         LIMIT 100`,
+      );
+      expect(JSON.stringify(plan.rows[0]?.["QUERY PLAN"])).toContain(scan.index);
+    }
+  });
+
   it("adds nullable callback-token hashes without losing pre-migration auth flows", async () => {
     const originalDirectory = process.cwd();
     const temporaryDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "dadamjang-callback-token-migration-"));

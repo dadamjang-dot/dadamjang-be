@@ -324,7 +324,13 @@ export const identityVerificationSessions = pgTable(
     createdAt: timestamp("createdAt").defaultNow().notNull(),
     updatedAt: timestamp("updatedAt").defaultNow().notNull(),
   },
-  (table) => [index("identity_verification_device_status_idx").on(table.deviceIdHash, table.status, table.expiresAt)],
+  (table) => [
+    index("identity_verification_device_status_idx").on(table.deviceIdHash, table.status, table.expiresAt),
+    index("identity_verification_cleanup_expires_idx").on(table.expiresAt, table.sessionId),
+    index("identity_verification_cleanup_consumed_idx")
+      .on(table.consumedAt, table.sessionId)
+      .where(sql`${table.consumedAt} IS NOT NULL`),
+  ],
 );
 
 export const verifiedIdentities = pgTable("verifiedIdentities", {
@@ -355,7 +361,13 @@ export const kakaoLoginFlows = pgTable(
     createdAt: timestamp("createdAt").defaultNow().notNull(),
     updatedAt: timestamp("updatedAt").defaultNow().notNull(),
   },
-  (table) => [index("kakao_login_flows_device_status_idx").on(table.deviceIdHash, table.status, table.expiresAt)],
+  (table) => [
+    index("kakao_login_flows_device_status_idx").on(table.deviceIdHash, table.status, table.expiresAt),
+    index("kakao_login_flows_cleanup_expires_idx").on(table.expiresAt, table.flowId),
+    index("kakao_login_flows_cleanup_consumed_idx")
+      .on(table.consumedAt, table.flowId)
+      .where(sql`${table.consumedAt} IS NOT NULL`),
+  ],
 );
 
 export const categories = pgTable(
