@@ -1,5 +1,6 @@
 import { Inject, Injectable } from "@nestjs/common";
 import { and, desc, eq, gt, inArray, isNull, ne, sql } from "drizzle-orm";
+import { hasBuyerCapability } from "src/auth/role";
 import { hashToken } from "src/common/security/token-hash";
 import type { RefreshTokenStore } from "src/modules/auth/auth.repository";
 import type { TokenPayload } from "src/modules/auth/auth.types";
@@ -246,7 +247,7 @@ export class KakaoFlowRepository {
             .returning()
         )[0];
       if (!user) throw new InvalidFoAuthProofError();
-      if (user.role !== "USER") throw new InvalidFoAuthProofError();
+      if (!hasBuyerCapability(user.role)) throw new InvalidFoAuthProofError();
       const linkedIdentity = await tx.query.authIdentities.findFirst({
         where: and(eq(authIdentities.provider, "kakao"), eq(authIdentities.providerUserId, signup.providerUserId)),
       });

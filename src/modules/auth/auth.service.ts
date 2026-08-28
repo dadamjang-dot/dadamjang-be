@@ -11,7 +11,7 @@ import { User } from "src/modules/database/schema";
 import { AuthErrorMessage } from "./auth.error";
 import { AuthRepository, type RefreshTokenStore } from "./auth.repository";
 import { AuthPortal, JWT_ACCESS_AUDIENCE, JWT_ISSUER, JWT_REFRESH_AUDIENCE, SigninAuthInput } from "./auth.types";
-import { UserRole, type UserRoleValue } from "src/auth/role";
+import { hasBuyerCapability, UserRole, type UserRoleValue } from "src/auth/role";
 
 type JwtExpiration = Exclude<JwtSignOptions["expiresIn"], undefined>;
 
@@ -145,7 +145,7 @@ export class AuthService {
   };
   private assertPortalRole = (role: UserRoleValue, portal: AuthPortal) => {
     const allowed =
-      (portal === AuthPortal.Fo && role === UserRole.User) ||
+      (portal === AuthPortal.Fo && hasBuyerCapability(role)) ||
       (portal === AuthPortal.Partner && role === UserRole.Partner) ||
       (portal === AuthPortal.Bo && role === UserRole.Admin);
     if (!allowed) throw new CustomUnauthorizedException(AuthErrorMessage.AuthRequired);

@@ -5,7 +5,7 @@ import { randomBytes, randomUUID } from "crypto";
 import { CustomBadRequestException, CustomUnauthorizedException } from "src/common/errors/custom-exceptions";
 import { hasDatabaseErrorCode } from "src/common/errors/database-error";
 import { hashToken } from "src/common/security/token-hash";
-import { UserRole } from "src/auth/role";
+import { hasBuyerCapability } from "src/auth/role";
 import { AdmissionLimiter, type RequestOrigin } from "src/modules/admission/admission-limiter";
 import type { KakaoProfile } from "src/modules/auth/auth.types";
 import { AuthService } from "src/modules/auth/auth.service";
@@ -65,7 +65,7 @@ export class KakaoFlowService {
         callbackToken,
         signupToken,
         async (user, store) => {
-          if (user.role !== UserRole.User) throw new InvalidFoAuthProofError();
+          if (!hasBuyerCapability(user.role)) throw new InvalidFoAuthProofError();
           return this.authService.issueTokensForUser(user, deviceId, store);
         },
       );
@@ -108,7 +108,7 @@ export class KakaoFlowService {
           consents: input.consents,
         },
         async (user, store) => {
-          if (user.role !== UserRole.User) throw new InvalidFoAuthProofError();
+          if (!hasBuyerCapability(user.role)) throw new InvalidFoAuthProofError();
           return this.authService.issueTokensForUser(user, deviceId, store);
         },
       );

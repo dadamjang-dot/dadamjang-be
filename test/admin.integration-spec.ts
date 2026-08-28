@@ -158,6 +158,109 @@ describe("Admin GraphQL integration", () => {
     expect(state.rows[0]).toEqual({ status: "APPROVED", role: "PARTNER", auditCount: 1 });
   });
 
+  it("preserves buyer and partner access after approval and token refresh", async () => {
+    const ownerDeviceId = "approved-partner-buyer";
+    const ownerSession = await request(app.getHttpServer())
+      .post("/graphql")
+      .set("x-device-id", ownerDeviceId)
+      .send({
+        query: `mutation Signin($input: SigninAuthInput!) {
+          signin(input: $input) { accessToken refreshToken role }
+        }`,
+        variables: {
+          input: {
+            userid: ADMIN_FIXTURE.partnerOwnerUserid,
+            password: ADMIN_FIXTURE.password,
+            portal: "Fo",
+          },
+        },
+      });
+    expect(ownerSession.body.errors).toBeUndefined();
+    const originalAccessToken = ownerSession.body.data.signin.accessToken as string;
+    const originalRefreshToken = ownerSession.body.data.signin.refreshToken as string;
+    const added = await graphql(
+      app,
+      originalAccessToken,
+      `mutation { upsertCartItem(input: { skuId: "${FIXTURE.skuId}", quantity: 1 }) { cartId } }`,
+    );
+    expect(added.body.errors).toBeUndefined();
+
+    const adminAccessToken = await adminToken(request.agent(app.getHttpServer()));
+    const approved = await graphql(
+      app,
+      adminAccessToken,
+      `
+        mutation Review($input: ReviewPartnerInput!) {
+          reviewPartner(input: $input) {
+            partnerId
+            status
+          }
+        }
+      `,
+      { input: { partnerId: ADMIN_FIXTURE.partnerId, approved: true } },
+    );
+    expect(approved.body.errors).toBeUndefined();
+
+    const refreshed = await request(app.getHttpServer())
+      .post("/graphql")
+      .set("Authorization", `Bearer ${originalRefreshToken}`)
+      .send({ query: `mutation { refresh { accessToken role } }` });
+    expect(refreshed.body.errors).toBeUndefined();
+    expect(refreshed.body.data.refresh.role).toBe("PARTNER");
+    const partnerAccessToken = refreshed.body.data.refresh.accessToken as string;
+    const buyerData = await graphql(
+      app,
+      partnerAccessToken,
+      `
+        {
+          cart {
+            items {
+              quantity
+            }
+          }
+          orders {
+            orderId
+          }
+          myPartnerDashboard {
+            draftCount
+          }
+        }
+      `,
+    );
+    expect(buyerData.body.errors).toBeUndefined();
+    expect(buyerData.body.data).toMatchObject({
+      cart: { items: [{ quantity: 1 }] },
+      orders: [],
+      myPartnerDashboard: { draftCount: 0 },
+    });
+
+    const signinFo = await request(app.getHttpServer())
+      .post("/graphql")
+      .set("x-device-id", "approved-partner-signin-fo")
+      .send({
+        query: `mutation SigninFo($input: SigninFoInput!) { signinFo(input: $input) { role } }`,
+        variables: { input: { email: ADMIN_FIXTURE.partnerOwnerEmail, password: ADMIN_FIXTURE.password } },
+      });
+    expect(signinFo.body.errors).toBeUndefined();
+    expect(signinFo.body.data.signinFo.role).toBe("PARTNER");
+
+    const legacyFoSignin = await request(app.getHttpServer())
+      .post("/graphql")
+      .set("x-device-id", "approved-partner-signin-legacy")
+      .send({
+        query: `mutation Signin($input: SigninAuthInput!) { signin(input: $input) { role } }`,
+        variables: {
+          input: {
+            userid: ADMIN_FIXTURE.partnerOwnerUserid,
+            password: ADMIN_FIXTURE.password,
+            portal: "Fo",
+          },
+        },
+      });
+    expect(legacyFoSignin.body.errors).toBeUndefined();
+    expect(legacyFoSignin.body.data.signin.role).toBe("PARTNER");
+  });
+
   it("reviews a product once and requires a bounded rejection reason", async () => {
     const token = await adminToken(request.agent(app.getHttpServer()));
     const mutation = `mutation Review($input: ReviewProductInput!) {

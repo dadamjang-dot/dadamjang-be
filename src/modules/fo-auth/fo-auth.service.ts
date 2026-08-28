@@ -5,7 +5,7 @@ import { CustomBadRequestException, CustomUnauthorizedException } from "src/comm
 import { hasDatabaseErrorCode } from "src/common/errors/database-error";
 import { hashToken } from "src/common/security/token-hash";
 import { AdmissionLimiter, type RequestOrigin } from "src/modules/admission/admission-limiter";
-import { UserRole } from "src/auth/role";
+import { hasBuyerCapability } from "src/auth/role";
 import { AuthService } from "src/modules/auth/auth.service";
 import { EmailService } from "src/modules/email/email.service";
 import { ExistingFoIdentityError, InvalidFoAuthProofError } from "./fo-auth.error";
@@ -43,7 +43,7 @@ export class FoAuthService {
     }
     return this.authService.withSigninLock(user.userId, deviceId, async (store) => {
       const validPassword = await bcrypt.compare(input.password, user.password);
-      if (!validPassword || user.role !== UserRole.User)
+      if (!validPassword || !hasBuyerCapability(user.role))
         throw new CustomUnauthorizedException("이메일 또는 비밀번호가 올바르지 않습니다.");
       return this.authService.issueTokensForUser(user, deviceId, store, signinStartedAt);
     });
