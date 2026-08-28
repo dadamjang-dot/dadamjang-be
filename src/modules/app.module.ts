@@ -4,6 +4,7 @@ import { GraphQLModule } from "@nestjs/graphql";
 import { ApolloDriver, ApolloDriverConfig } from "@nestjs/apollo";
 import type { ExpressContextFunctionArgument } from "@as-integrations/express5";
 import { GraphQLError } from "graphql";
+import { hasDatabaseErrorCode } from "src/common/errors/database-error";
 import { requestBudgetRule } from "src/common/graphql/request-budget";
 import { AuthModule } from "./auth/auth.module";
 import { DatabaseModule } from "./database/database.module";
@@ -58,6 +59,8 @@ const graphQlErrorCode = (status: number) => {
             ...formattedError,
             extensions: { ...extensions, code: graphQlErrorCode(originalError.getStatus()) },
           };
+        if (hasDatabaseErrorCode(originalError, "22P02"))
+          return { message: "Invalid identifier", extensions: { ...extensions, code: "BAD_USER_INPUT" } };
         return { message: "Internal server error", extensions: { code: "INTERNAL_SERVER_ERROR" } };
       },
     }),

@@ -8,6 +8,7 @@ import {
   CustomNotFoundException,
   CustomServiceUnavailableException,
 } from "src/common/errors/custom-exceptions";
+import { hasDatabaseErrorCode } from "src/common/errors/database-error";
 import { requireResult } from "src/common/invariants/require-result";
 import { hashToken } from "src/common/security/token-hash";
 import { CreateCategoryInput } from "src/modules/catalog/catalog.types";
@@ -83,12 +84,6 @@ const rejectionReason = (approved: boolean, value?: string) => {
   if (reason.length < 1 || reason.length > 500)
     throw new CustomBadRequestException(AdminErrorMessage.RejectionReasonRequired);
   return reason;
-};
-
-const isDatabaseError = (error: unknown, code: string, depth = 0): boolean => {
-  if (typeof error !== "object" || error === null || depth > 4) return false;
-  if ("code" in error && error.code === code) return true;
-  return "cause" in error && isDatabaseError(error.cause, code, depth + 1);
 };
 
 @Injectable()
@@ -524,7 +519,8 @@ export class AdminService {
         });
       });
     } catch (error) {
-      if (isDatabaseError(error, "23505")) throw new CustomBadRequestException(AdminErrorMessage.DuplicateCategorySlug);
+      if (hasDatabaseErrorCode(error, "23505"))
+        throw new CustomBadRequestException(AdminErrorMessage.DuplicateCategorySlug);
       throw error;
     }
     return this.getCategory(categoryId);
@@ -570,7 +566,8 @@ export class AdminService {
         });
       });
     } catch (error) {
-      if (isDatabaseError(error, "23505")) throw new CustomBadRequestException(AdminErrorMessage.DuplicateCategorySlug);
+      if (hasDatabaseErrorCode(error, "23505"))
+        throw new CustomBadRequestException(AdminErrorMessage.DuplicateCategorySlug);
       throw error;
     }
     return this.getCategory(input.categoryId);
@@ -715,7 +712,7 @@ export class AdminService {
         });
       });
     } catch (error) {
-      if (isDatabaseError(error, "23505")) throw new CustomBadRequestException("Userid is already in use");
+      if (hasDatabaseErrorCode(error, "23505")) throw new CustomBadRequestException("Userid is already in use");
       throw error;
     }
     return this.getInvite(inviteId);

@@ -86,6 +86,18 @@ describe("PostgreSQL GraphQL integration", () => {
     });
   });
 
+  it("classifies malformed database identifiers as client input errors", async () => {
+    const response = await request(app.getHttpServer())
+      .post("/graphql")
+      .send({ query: `query InvalidProduct { product(productId: "not-a-uuid") { productId } }` })
+      .expect(200);
+
+    expect(response.body.errors[0]).toMatchObject({
+      message: "Invalid identifier",
+      extensions: { code: "BAD_USER_INPUT" },
+    });
+  });
+
   it("filters and paginates catalog products with stable cursors", async () => {
     const first = await request(app.getHttpServer())
       .post("/graphql")
