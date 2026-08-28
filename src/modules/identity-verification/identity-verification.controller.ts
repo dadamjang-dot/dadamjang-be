@@ -23,7 +23,7 @@ export class IdentityVerificationController {
   @Get("start/:sessionId")
   async start(@Param("sessionId") sessionId: string, @Res() res: Response) {
     const page = await this.service.requestPage(sessionId);
-    if (page.kind === "mock") return res.redirect(this.redirectUrl(sessionId, "verified"));
+    if (page.kind === "mock") return res.redirect(this.redirectUrl(sessionId, "verified", page.callbackToken));
     const inputs = Object.entries(page.request.fields)
       .map(([name, value]) => `<input type="hidden" name="${escapeHtml(name)}" value="${escapeHtml(value)}">`)
       .join("");
@@ -36,13 +36,13 @@ export class IdentityVerificationController {
 
   @Post("success/:sessionId")
   async success(@Param("sessionId") sessionId: string, @Body() body: CallbackBody, @Res() res: Response) {
-    await this.service.callback(sessionId, {
+    const { callbackToken } = await this.service.callback(sessionId, {
       resultCode: body.resultCode ?? "",
       ...(body.authRequestUrl === undefined ? {} : { authRequestUrl: body.authRequestUrl }),
       ...(body.txId === undefined ? {} : { transactionId: body.txId }),
       ...(body.token === undefined ? {} : { token: body.token }),
     });
-    return res.redirect(this.redirectUrl(sessionId, "verified"));
+    return res.redirect(this.redirectUrl(sessionId, "verified", callbackToken));
   }
 
   @Post("fail/:sessionId")
@@ -51,12 +51,13 @@ export class IdentityVerificationController {
     return res.redirect(this.redirectUrl(sessionId, "failed"));
   }
 
-  private redirectUrl = (sessionId: string, status: "verified" | "failed") => {
+  private redirectUrl = (sessionId: string, status: "verified" | "failed", callbackToken?: string) => {
     const target = new URL(
       this.configService.get<string>("DADAMJANG_FO_IDENTITY_REDIRECT_URL") ?? "dadamjang://auth/identity-callback",
     );
     target.searchParams.set("sessionId", sessionId);
     target.searchParams.set("status", status);
+    if (callbackToken) target.searchParams.set("callbackToken", callbackToken);
     return target.toString();
   };
 }

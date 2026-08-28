@@ -50,9 +50,9 @@ export class IdentityVerificationService {
     return { sessionId, status, expiresAt: session.expiresAt };
   };
 
-  complete = async (sessionId: string, deviceId: string) => {
+  complete = async (sessionId: string, deviceId: string, callbackToken: string) => {
     const token = randomBytes(32).toString("base64url");
-    const completed = await this.repository.completeSession(sessionId, hashToken(deviceId), token);
+    const completed = await this.repository.completeSession(sessionId, hashToken(deviceId), callbackToken, token);
     if (!completed) throw new CustomUnauthorizedException("본인인증 완료 상태가 유효하지 않습니다.");
     return { identityVerificationToken: token };
   };
@@ -62,13 +62,15 @@ export class IdentityVerificationService {
     if (!session || session.status !== "PENDING" || session.expiresAt.getTime() <= Date.now())
       throw new CustomUnauthorizedException("본인인증 세션이 유효하지 않습니다.");
     if (this.isMockEnabled()) {
+      const callbackToken = randomBytes(32).toString("base64url");
       await this.repository.markVerified({
         sessionId,
         ciHash: this.hashCi(`local-ci-${session.deviceIdHash}`),
         certificateProvider: session.provider,
         isFourteenOrOlder: true,
+        callbackTokenHash: hashToken(callbackToken),
       });
-      return { kind: "mock" as const };
+      return { kind: "mock" as const, callbackToken };
     }
     return {
       kind: "inicis" as const,
@@ -83,7 +85,6 @@ export class IdentityVerificationService {
   callback = async (sessionId: string, input: InicisCallbackInput) => {
     const session = await this.repository.findSession(sessionId);
     if (!session) throw new CustomUnauthorizedException("본인인증 세션이 유효하지 않습니다.");
-    if (session.status === "VERIFIED") return session;
     if (session.status !== "PENDING" || session.expiresAt.getTime() <= Date.now())
       throw new CustomUnauthorizedException("본인인증 세션이 유효하지 않습니다.");
     try {
@@ -95,14 +96,16 @@ export class IdentityVerificationService {
         },
         input,
       );
+      const callbackToken = randomBytes(32).toString("base64url");
       const verified = await this.repository.markVerified({
         sessionId,
         ciHash: this.hashCi(result.ci),
         certificateProvider: result.certificateProvider,
         isFourteenOrOlder: this.isFourteenOrOlder(result.birthday),
+        callbackTokenHash: hashToken(callbackToken),
       });
       if (!verified) throw new CustomUnauthorizedException("본인인증 결과를 저장하지 못했습니다.");
-      return verified;
+      return { callbackToken };
     } catch (error) {
       await this.repository.markFailed(sessionId, input.resultCode || "INVALID_RESULT");
       throw error;

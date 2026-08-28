@@ -30,9 +30,9 @@ describe("KakaoFlowRepository", () => {
     const issueTokens = jest.fn().mockRejectedValue(new Error("session write failed"));
     const repository = new KakaoFlowRepository({ transaction } as never);
 
-    await expect(repository.completeLoginFlow(flow.flowId, "device-hash", "signup-token", issueTokens)).rejects.toThrow(
-      "session write failed",
-    );
+    await expect(
+      repository.completeLoginFlow(flow.flowId, "device-hash", "callback-token", "signup-token", issueTokens),
+    ).rejects.toThrow("session write failed");
     expect(issueTokens).toHaveBeenCalledWith(user, tx);
   });
 });

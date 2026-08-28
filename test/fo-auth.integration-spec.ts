@@ -335,6 +335,7 @@ describe("FO auth GraphQL integration", () => {
   it("starts a Kakao login with an opaque flow and consumes an existing-user flow once", async () => {
     const deviceId = "kakao-existing-device";
     const flowId = "d0000000-0000-4000-8000-000000000001";
+    const callbackToken = "kakao-existing-callback";
     const started = await request(app.getHttpServer()).post("/graphql").set("x-device-id", deviceId).send({
       query: `mutation StartKakaoLogin { startKakaoLogin { flowId authUrl expiresAt } }`,
     });
@@ -351,9 +352,9 @@ describe("FO auth GraphQL integration", () => {
     );
     await pool.query(
       `INSERT INTO "kakaoLoginFlows"
-        ("flowId", "deviceIdHash", "providerUserId", "email", "emailVerified", "userId", "status", "expiresAt", "callbackAt")
-       VALUES ($1, $2, 'kakao-existing', 'integration@example.test', true, $3, 'EXISTING_USER', now() + interval '10 minutes', now())`,
-      [flowId, hashToken(deviceId), FIXTURE.userId],
+        ("flowId", "deviceIdHash", "providerUserId", "email", "emailVerified", "userId", "status", "callbackTokenHash", "expiresAt", "callbackAt")
+       VALUES ($1, $2, 'kakao-existing', 'integration@example.test', true, $3, 'EXISTING_USER', $4, now() + interval '10 minutes', now())`,
+      [flowId, hashToken(deviceId), FIXTURE.userId, hashToken(callbackToken)],
     );
     const mutation = `mutation CompleteKakaoLogin($input: CompleteKakaoLoginInput!) {
       completeKakaoLogin(input: $input) {
@@ -367,7 +368,7 @@ describe("FO auth GraphQL integration", () => {
       request(app.getHttpServer())
         .post("/graphql")
         .set("x-device-id", deviceId)
-        .send({ query: mutation, variables: { input: { flowId } } });
+        .send({ query: mutation, variables: { input: { flowId, callbackToken } } });
     const responses = await Promise.all([complete(), complete()]);
     const completed = responses.find(({ body }) => body.errors === undefined);
     const rejected = responses.find(({ body }) => body.errors !== undefined);
@@ -390,11 +391,12 @@ describe("FO auth GraphQL integration", () => {
       [FIXTURE.userId],
     );
     for (const flowId of flowIds) {
+      const callbackToken = `${flowId}-callback`;
       await pool.query(
         `INSERT INTO "kakaoLoginFlows"
-          ("flowId", "deviceIdHash", "providerUserId", "email", "emailVerified", "userId", "status", "expiresAt", "callbackAt")
-         VALUES ($1, $2, 'kakao-concurrent', 'integration@example.test', true, $3, 'EXISTING_USER', now() + interval '10 minutes', now())`,
-        [flowId, hashToken(deviceId), FIXTURE.userId],
+          ("flowId", "deviceIdHash", "providerUserId", "email", "emailVerified", "userId", "status", "callbackTokenHash", "expiresAt", "callbackAt")
+         VALUES ($1, $2, 'kakao-concurrent', 'integration@example.test', true, $3, 'EXISTING_USER', $4, now() + interval '10 minutes', now())`,
+        [flowId, hashToken(deviceId), FIXTURE.userId, hashToken(callbackToken)],
       );
     }
     const complete = (flowId: string) =>
@@ -405,7 +407,7 @@ describe("FO auth GraphQL integration", () => {
           query: `mutation CompleteKakaoLogin($input: CompleteKakaoLoginInput!) {
             completeKakaoLogin(input: $input) { status tokenPayload { refreshToken } }
           }`,
-          variables: { input: { flowId } },
+          variables: { input: { flowId, callbackToken: `${flowId}-callback` } },
         });
 
     const responses = await Promise.all(flowIds.map(complete));
@@ -423,6 +425,7 @@ describe("FO auth GraphQL integration", () => {
 
   it("rolls back Kakao flow consumption when refresh-session persistence fails", async () => {
     const flowId = "d0000000-0000-4000-8000-000000000005";
+    const callbackToken = "kakao-session-failure-callback";
     await pool.query(
       `INSERT INTO "authIdentity" ("userId", "provider", "providerUserId")
        VALUES ($1, 'kakao', 'kakao-session-failure')`,
@@ -430,9 +433,9 @@ describe("FO auth GraphQL integration", () => {
     );
     await pool.query(
       `INSERT INTO "kakaoLoginFlows"
-        ("flowId", "deviceIdHash", "providerUserId", "email", "emailVerified", "userId", "status", "expiresAt", "callbackAt")
-       VALUES ($1, $2, 'kakao-session-failure', 'integration@example.test', true, $3, 'EXISTING_USER', now() + interval '10 minutes', now())`,
-      [flowId, hashToken(failedSessionDeviceId), FIXTURE.userId],
+        ("flowId", "deviceIdHash", "providerUserId", "email", "emailVerified", "userId", "status", "callbackTokenHash", "expiresAt", "callbackAt")
+       VALUES ($1, $2, 'kakao-session-failure', 'integration@example.test', true, $3, 'EXISTING_USER', $4, now() + interval '10 minutes', now())`,
+      [flowId, hashToken(failedSessionDeviceId), FIXTURE.userId, hashToken(callbackToken)],
     );
     const complete = () =>
       request(app.getHttpServer())
@@ -442,7 +445,7 @@ describe("FO auth GraphQL integration", () => {
           query: `mutation CompleteKakaoLogin($input: CompleteKakaoLoginInput!) {
             completeKakaoLogin(input: $input) { status tokenPayload { accessToken } }
           }`,
-          variables: { input: { flowId } },
+          variables: { input: { flowId, callbackToken } },
         });
 
     await installRefreshSessionFailure(pool);
@@ -466,11 +469,12 @@ describe("FO auth GraphQL integration", () => {
   it("binds a Kakao signup flow to its device and reports email fallback", async () => {
     const flowId = "d0000000-0000-4000-8000-000000000002";
     const deviceId = "kakao-signup-device";
+    const callbackToken = "kakao-signup-callback";
     await pool.query(
       `INSERT INTO "kakaoLoginFlows"
-        ("flowId", "deviceIdHash", "providerUserId", "status", "expiresAt", "callbackAt")
-       VALUES ($1, $2, 'kakao-new', 'SIGNUP_REQUIRED', now() + interval '10 minutes', now())`,
-      [flowId, hashToken(deviceId)],
+        ("flowId", "deviceIdHash", "providerUserId", "status", "callbackTokenHash", "expiresAt", "callbackAt")
+       VALUES ($1, $2, 'kakao-new', 'SIGNUP_REQUIRED', $3, now() + interval '10 minutes', now())`,
+      [flowId, hashToken(deviceId), hashToken(callbackToken)],
     );
     const mutation = `mutation CompleteKakaoLogin($input: CompleteKakaoLoginInput!) {
       completeKakaoLogin(input: $input) {
@@ -483,13 +487,13 @@ describe("FO auth GraphQL integration", () => {
     const wrongDevice = await request(app.getHttpServer())
       .post("/graphql")
       .set("x-device-id", "another-device")
-      .send({ query: mutation, variables: { input: { flowId } } });
+      .send({ query: mutation, variables: { input: { flowId, callbackToken } } });
     expect(wrongDevice.body.errors[0].message).toBe("카카오 로그인 흐름이 유효하지 않습니다.");
 
     const completed = await request(app.getHttpServer())
       .post("/graphql")
       .set("x-device-id", deviceId)
-      .send({ query: mutation, variables: { input: { flowId } } });
+      .send({ query: mutation, variables: { input: { flowId, callbackToken } } });
     expect(completed.body.errors).toBeUndefined();
     expect(completed.body.data.completeKakaoLogin).toEqual({
       status: "SIGNUP_REQUIRED",

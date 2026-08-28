@@ -24,7 +24,11 @@ export class IdentityVerificationResolver {
   }
 
   @Mutation(() => IdentityVerificationProofPayload)
-  completeIdentityVerification(@Args("sessionId", { type: () => ID }) sessionId: string, @Context("req") req: Request) {
-    return this.service.complete(sessionId, deviceIdFromRequest(req));
+  completeIdentityVerification(
+    @Args("sessionId", { type: () => ID }) sessionId: string,
+    @Args("callbackToken") callbackToken: string,
+    @Context("req") req: Request,
+  ) {
+    return this.service.complete(sessionId, deviceIdFromRequest(req), callbackToken);
   }
 }

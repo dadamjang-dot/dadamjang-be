@@ -115,6 +115,9 @@ export class KakaoLoginStartPayload {
 export class CompleteKakaoLoginInput {
   @Field(() => ID)
   flowId!: string;
+
+  @Field()
+  callbackToken!: string;
 }
 
 @ObjectType()

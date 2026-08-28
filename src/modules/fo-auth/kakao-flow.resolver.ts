@@ -25,7 +25,7 @@ export class KakaoFlowResolver {
     @Context("req") req: Request,
     @Context("res") res: Response,
   ) {
-    const result = await this.service.completeLogin(input.flowId, deviceIdFromRequest(req));
+    const result = await this.service.completeLogin(input.flowId, deviceIdFromRequest(req), input.callbackToken);
     if (result.tokenPayload) setTokenCookies(res, result.tokenPayload);
     return result;
   }

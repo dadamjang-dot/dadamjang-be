@@ -30,6 +30,7 @@ export class IdentityVerificationRepository {
     ciHash: string;
     certificateProvider: string;
     isFourteenOrOlder: boolean;
+    callbackTokenHash: string;
   }) =>
     (
       await this.db
@@ -39,6 +40,7 @@ export class IdentityVerificationRepository {
           ciHash: input.ciHash,
           certificateProvider: input.certificateProvider,
           isFourteenOrOlder: input.isFourteenOrOlder,
+          callbackTokenHash: input.callbackTokenHash,
           verifiedAt: new Date(),
           updatedAt: new Date(),
         })
@@ -61,15 +63,21 @@ export class IdentityVerificationRepository {
       );
   };
 
-  completeSession = async (sessionId: string, deviceIdHash: string, token: string) =>
+  completeSession = async (sessionId: string, deviceIdHash: string, callbackToken: string, token: string) =>
     (
       await this.db
         .update(identityVerificationSessions)
-        .set({ proofTokenHash: hashToken(token), completedAt: new Date(), updatedAt: new Date() })
+        .set({
+          callbackTokenHash: null,
+          proofTokenHash: hashToken(token),
+          completedAt: new Date(),
+          updatedAt: new Date(),
+        })
         .where(
           and(
             eq(identityVerificationSessions.sessionId, sessionId),
             eq(identityVerificationSessions.deviceIdHash, deviceIdHash),
+            eq(identityVerificationSessions.callbackTokenHash, hashToken(callbackToken)),
             eq(identityVerificationSessions.status, "VERIFIED"),
             isNull(identityVerificationSessions.completedAt),
             gt(identityVerificationSessions.expiresAt, new Date()),

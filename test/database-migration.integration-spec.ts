@@ -183,9 +183,64 @@ describe("database migration PostgreSQL integration", () => {
     const extensions = await migrationPool.query<{ extname: string }>(
       `SELECT extname FROM pg_extension WHERE extname = 'pgcrypto'`,
     );
+    const callbackTokenColumns = await migrationPool.query<{ column_name: string; is_nullable: string }>(
+      `SELECT column_name, is_nullable
+       FROM information_schema.columns
+       WHERE table_schema = 'public'
+         AND table_name IN ('kakaoLoginFlows', 'identityVerificationSessions')
+         AND column_name = 'callbackTokenHash'
+       ORDER BY table_name`,
+    );
 
     expect(catalog.rows).toEqual([{ products: "0", skus: "0" }]);
     expect(extensions.rows).toEqual([{ extname: "pgcrypto" }]);
+    expect(callbackTokenColumns.rows).toEqual([
+      { column_name: "callbackTokenHash", is_nullable: "YES" },
+      { column_name: "callbackTokenHash", is_nullable: "YES" },
+    ]);
+  });
+
+  it("adds nullable callback-token hashes without losing pre-migration auth flows", async () => {
+    const originalDirectory = process.cwd();
+    const temporaryDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "dadamjang-callback-token-migration-"));
+    try {
+      await fs.cp(path.join(originalDirectory, "migrations"), path.join(temporaryDirectory, "migrations"), {
+        recursive: true,
+      });
+      await fs.cp(
+        path.join(originalDirectory, "retired-migrations"),
+        path.join(temporaryDirectory, "retired-migrations"),
+        { recursive: true },
+      );
+      await fs.rm(path.join(temporaryDirectory, "migrations/0020_callback_tokens.sql"));
+      process.chdir(temporaryDirectory);
+      await migrate({ pool: migrationPool });
+      await migrationPool.query(
+        `INSERT INTO "kakaoLoginFlows" ("flowId", "deviceIdHash", "expiresAt")
+         VALUES ('d0000000-0000-4000-8000-000000000020', 'device-hash', now() + interval '10 minutes')`,
+      );
+      await migrationPool.query(
+        `INSERT INTO "identityVerificationSessions"
+          ("sessionId", "purpose", "provider", "deviceIdHash", "merchantTransactionId", "expiresAt")
+         VALUES ('c0000000-0000-4000-8000-000000000020', 'SIGNUP', 'KAKAO', 'device-hash', 'callbackmigration001', now() + interval '10 minutes')`,
+      );
+      await fs.copyFile(
+        path.join(originalDirectory, "migrations/0020_callback_tokens.sql"),
+        path.join(temporaryDirectory, "migrations/0020_callback_tokens.sql"),
+      );
+
+      await migrate({ pool: migrationPool });
+
+      const flows = await migrationPool.query<{ kakao: string | null; identity: string | null }>(
+        `SELECT
+          (SELECT "callbackTokenHash" FROM "kakaoLoginFlows" WHERE "flowId" = 'd0000000-0000-4000-8000-000000000020') AS kakao,
+          (SELECT "callbackTokenHash" FROM "identityVerificationSessions" WHERE "sessionId" = 'c0000000-0000-4000-8000-000000000020') AS identity`,
+      );
+      expect(flows.rows).toEqual([{ kakao: null, identity: null }]);
+    } finally {
+      process.chdir(originalDirectory);
+      await fs.rm(temporaryDirectory, { recursive: true, force: true });
+    }
   });
 
   it("records artifact checksums in deterministic order and tombstones the retired migration", async () => {

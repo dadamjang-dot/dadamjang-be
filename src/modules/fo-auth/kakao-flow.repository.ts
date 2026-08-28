@@ -1,5 +1,5 @@
 import { Inject, Injectable } from "@nestjs/common";
-import { and, eq, gt, isNull, ne, sql } from "drizzle-orm";
+import { and, eq, gt, inArray, isNull, ne, sql } from "drizzle-orm";
 import { hashToken } from "src/common/security/token-hash";
 import type { RefreshTokenStore } from "src/modules/auth/auth.repository";
 import type { TokenPayload } from "src/modules/auth/auth.types";
@@ -40,7 +40,12 @@ export class KakaoFlowRepository {
   createFlow = async (deviceIdHash: string, expiresAt: Date) =>
     (await this.db.insert(kakaoLoginFlows).values({ deviceIdHash, expiresAt }).returning())[0];
 
-  acceptCallback = async (flowId: string, profile: KakaoProfile, email?: string) => {
+  acceptCallback = async (
+    flowId: string,
+    profile: KakaoProfile,
+    email: string | undefined,
+    callbackTokenHash: string,
+  ) => {
     const [existing] = await this.db
       .select({ userId: users.userId })
       .from(authIdentities)
@@ -56,6 +61,7 @@ export class KakaoFlowRepository {
           emailVerified: profile.emailVerified,
           userId: existing?.userId,
           status: existing ? "EXISTING_USER" : "SIGNUP_REQUIRED",
+          callbackTokenHash,
           callbackAt: new Date(),
           updatedAt: new Date(),
         })
@@ -71,17 +77,25 @@ export class KakaoFlowRepository {
     )[0];
   };
 
-  completeLoginFlow = (flowId: string, deviceIdHash: string, signupToken: string, issueTokens: IssueTokens) =>
+  completeLoginFlow = (
+    flowId: string,
+    deviceIdHash: string,
+    callbackToken: string,
+    signupToken: string,
+    issueTokens: IssueTokens,
+  ) =>
     this.db.transaction(async (tx) => {
       const now = new Date();
       await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${deviceIdHash}, 0))`);
       const [flow] = await tx
         .update(kakaoLoginFlows)
-        .set({ consumedAt: now, updatedAt: now })
+        .set({ callbackTokenHash: null, consumedAt: now, updatedAt: now })
         .where(
           and(
             eq(kakaoLoginFlows.flowId, flowId),
             eq(kakaoLoginFlows.deviceIdHash, deviceIdHash),
+            eq(kakaoLoginFlows.callbackTokenHash, hashToken(callbackToken)),
+            inArray(kakaoLoginFlows.status, ["EXISTING_USER", "SIGNUP_REQUIRED"]),
             isNull(kakaoLoginFlows.consumedAt),
             gt(kakaoLoginFlows.expiresAt, now),
           ),

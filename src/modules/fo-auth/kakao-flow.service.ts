@@ -40,17 +40,19 @@ export class KakaoFlowService {
 
   acceptCallback = async (flowId: string, profile: KakaoProfile) => {
     const email = profile.email ? this.emailService.normalizeEmail(profile.email) : undefined;
-    const flow = await this.repository.acceptCallback(flowId, profile, email);
+    const callbackToken = randomBytes(32).toString("base64url");
+    const flow = await this.repository.acceptCallback(flowId, profile, email, hashToken(callbackToken));
     if (!flow) throw new CustomUnauthorizedException("카카오 로그인 흐름이 유효하지 않습니다.");
-    return flow;
+    return { callbackToken };
   };
 
-  completeLogin = async (flowId: string, deviceId: string) => {
+  completeLogin = async (flowId: string, deviceId: string, callbackToken: string) => {
     const signupToken = randomBytes(32).toString("base64url");
     try {
       const result = await this.repository.completeLoginFlow(
         flowId,
         hashToken(deviceId),
+        callbackToken,
         signupToken,
         async (user, store) => {
           if (user.role !== UserRole.User) throw new InvalidFoAuthProofError();

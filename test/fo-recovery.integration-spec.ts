@@ -492,6 +492,9 @@ describe("FO account recovery GraphQL integration", () => {
     const launched = await request(app.getHttpServer()).get(`/api/auth/identity/inicis/start/${sessionId}`);
     expect(launched.status).toBe(302);
     expect(launched.headers.location).toContain("status=verified");
+    const callbackToken = new URL(requireResult(launched.headers.location)).searchParams.get("callbackToken");
+    expect(callbackToken).toEqual(expect.any(String));
+    expect(launched.headers.location).not.toContain(hashToken(callbackToken ?? ""));
 
     const statusQuery = `query IdentityVerificationStatus($sessionId: ID!) {
       identityVerificationStatus(sessionId: $sessionId) { sessionId status expiresAt }
@@ -502,27 +505,26 @@ describe("FO account recovery GraphQL integration", () => {
       .send({ query: statusQuery, variables: { sessionId } });
     expect(wrongDevice.body.errors[0].message).toBe("본인인증 세션이 유효하지 않습니다.");
 
+    const completionMutation = `mutation CompleteIdentityVerification($sessionId: ID!, $callbackToken: String!) {
+      completeIdentityVerification(sessionId: $sessionId, callbackToken: $callbackToken) { identityVerificationToken }
+    }`;
+    const relayed = await request(app.getHttpServer())
+      .post("/graphql")
+      .set("x-device-id", "wrong-device")
+      .send({ query: completionMutation, variables: { sessionId, callbackToken } });
+    expect(relayed.body.errors[0].message).toBe("본인인증 완료 상태가 유효하지 않습니다.");
+
     const completed = await request(app.getHttpServer())
       .post("/graphql")
       .set("x-device-id", deviceId)
-      .send({
-        query: `mutation CompleteIdentityVerification($sessionId: ID!) {
-          completeIdentityVerification(sessionId: $sessionId) { identityVerificationToken }
-        }`,
-        variables: { sessionId },
-      });
+      .send({ query: completionMutation, variables: { sessionId, callbackToken } });
     expect(completed.body.errors).toBeUndefined();
     expect(completed.body.data.completeIdentityVerification.identityVerificationToken).toEqual(expect.any(String));
 
     const reused = await request(app.getHttpServer())
       .post("/graphql")
       .set("x-device-id", deviceId)
-      .send({
-        query: `mutation CompleteIdentityVerification($sessionId: ID!) {
-          completeIdentityVerification(sessionId: $sessionId) { identityVerificationToken }
-        }`,
-        variables: { sessionId },
-      });
+      .send({ query: completionMutation, variables: { sessionId, callbackToken } });
     expect(reused.body.errors[0].message).toBe("본인인증 완료 상태가 유효하지 않습니다.");
   });
 });
