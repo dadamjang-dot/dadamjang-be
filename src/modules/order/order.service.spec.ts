@@ -3,6 +3,53 @@ import { OrderErrorMessage } from "./order.error";
 import { OrderService } from "./order.service";
 
 describe("OrderService", () => {
+  it("loads an order list and all items in two queries", async () => {
+    const createdAt = new Date("2026-08-29T00:00:00Z");
+    const orderRows = [
+      {
+        orderId: "order-2",
+        orderNumber: "DJ-2",
+        userId: "user-1",
+        status: "PAID",
+        paymentStatus: "APPROVED",
+        totalAmount: 2000,
+        paymentFailureReason: null,
+        createdAt,
+        updatedAt: createdAt,
+      },
+      {
+        orderId: "order-1",
+        orderNumber: "DJ-1",
+        userId: "user-1",
+        status: "PAID",
+        paymentStatus: "APPROVED",
+        totalAmount: 1000,
+        paymentFailureReason: null,
+        createdAt,
+        updatedAt: createdAt,
+      },
+    ];
+    const itemRows = [
+      { orderItemId: "item-1", orderId: "order-1" },
+      { orderItemId: "item-2", orderId: "order-2" },
+    ];
+    const select = jest
+      .fn()
+      .mockReturnValueOnce({
+        from: () => ({ where: () => ({ orderBy: async () => orderRows }) }),
+      })
+      .mockReturnValueOnce({
+        from: () => ({ where: async () => itemRows }),
+      });
+    const service = new OrderService({ select } as never);
+
+    await expect(service.listOrders("user-1")).resolves.toEqual([
+      { ...orderRows[0], items: [itemRows[1]] },
+      { ...orderRows[1], items: [itemRows[0]] },
+    ]);
+    expect(select).toHaveBeenCalledTimes(2);
+  });
+
   it("requires an idempotency key", async () => {
     const db = {
       transaction: async (callback: (tx: unknown) => Promise<unknown>) => callback({}),

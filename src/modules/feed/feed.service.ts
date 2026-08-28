@@ -3,7 +3,8 @@ import { desc, eq, inArray } from "drizzle-orm";
 import { FeedErrorMessage } from "./feed.error";
 import { MAX_PAGE_SIZE } from "./feed.constant";
 import { CatalogService } from "src/modules/catalog/catalog.service";
-import { CustomBadRequestException } from "src/common/errors/custom-exceptions";
+import { CatalogErrorMessage } from "src/modules/catalog/catalog.error";
+import { CustomBadRequestException, CustomNotFoundException } from "src/common/errors/custom-exceptions";
 import { Database, DRIZZLE } from "src/modules/database/database.module";
 import { activityEvents, products, wishes } from "src/modules/database/schema";
 
@@ -54,7 +55,7 @@ export class FeedService {
       : [];
     const categoryIds = new Set(preferenceRows.map((row) => row.categoryId));
     const candidates = await this.db
-      .select()
+      .select({ productId: products.productId, categoryId: products.categoryId, createdAt: products.createdAt })
       .from(products)
       .where(eq(products.status, "PUBLISHED"))
       .orderBy(desc(products.createdAt))
@@ -66,7 +67,17 @@ export class FeedService {
       }))
       .sort((left, right) => right.score - left.score || left.product.productId.localeCompare(right.product.productId));
     const slice = ranked.slice(offset, offset + pageSize);
-    const nodes = await Promise.all(slice.map(({ product }) => this.catalogService.getProduct(product.productId)));
+    const productById = new Map(
+      (await this.catalogService.getProductsByIds(slice.map(({ product }) => product.productId))).map((product) => [
+        product.productId,
+        product,
+      ]),
+    );
+    const nodes = slice.map(({ product }) => {
+      const hydrated = productById.get(product.productId);
+      if (!hydrated) throw new CustomNotFoundException(CatalogErrorMessage.ProductNotFound);
+      return hydrated;
+    });
     const nextOffset = offset + nodes.length;
     return {
       nodes,

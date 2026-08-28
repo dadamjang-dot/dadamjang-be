@@ -1,11 +1,10 @@
 import { Inject, Injectable } from "@nestjs/common";
 import { and, desc, eq } from "drizzle-orm";
 import { CustomNotFoundException } from "src/common/errors/custom-exceptions";
-import { requireResult } from "src/common/invariants/require-result";
 import { ComparisonErrorMessage } from "./comparison.error";
 import { CatalogService } from "src/modules/catalog/catalog.service";
 import { Database, DRIZZLE } from "src/modules/database/database.module";
-import { activityEvents, comparisonItems, products } from "src/modules/database/schema";
+import { activityEvents, comparisonItems } from "src/modules/database/schema";
 
 @Injectable()
 export class ComparisonService {
@@ -18,18 +17,20 @@ export class ComparisonService {
     const rows = await this.db
       .select()
       .from(comparisonItems)
-      .innerJoin(products, eq(comparisonItems.productId, products.productId))
       .where(eq(comparisonItems.userId, userId))
       .orderBy(desc(comparisonItems.createdAt));
-    const productList = (
-      await Promise.all(rows.map(({ products: product }) => this.catalogService.getProduct(product.productId)))
-    ).map((product) => [product.productId, product] as const);
-    const productById = new Map(productList);
+    const productById = new Map(
+      (await this.catalogService.getProductsByIds(rows.map(({ productId }) => productId))).map((product) => [
+        product.productId,
+        product,
+      ]),
+    );
 
-    return rows.map(({ comparisonItems: item }) => ({
-      ...item,
-      product: requireResult(productById.get(item.productId)),
-    }));
+    return rows.map((item) => {
+      const product = productById.get(item.productId);
+      if (!product) throw new CustomNotFoundException(ComparisonErrorMessage.ProductNotFound);
+      return { ...item, product };
+    });
   };
 
   listPriceSummaries = async (userId: string) => {
@@ -39,7 +40,7 @@ export class ComparisonService {
       .where(eq(comparisonItems.userId, userId))
       .orderBy(desc(comparisonItems.createdAt));
 
-    return Promise.all(rows.map((row) => this.catalogService.getProductPriceSummary(row.productId)));
+    return this.catalogService.getProductPriceSummariesByIds(rows.map((row) => row.productId));
   };
 
   add = async (userId: string, productId: string) => {

@@ -1,5 +1,5 @@
 import { CatalogErrorMessage } from "./catalog.error";
-import { decodeProductCursor, encodeProductCursor } from "./catalog.service";
+import { CatalogService, decodeProductCursor, encodeProductCursor } from "./catalog.service";
 import { ProductSort } from "./catalog.types";
 
 const rawCursor = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url");
@@ -152,5 +152,63 @@ describe("catalog cursor", () => {
     });
 
     expect(() => decodeProductCursor(cursor, ProductSort.HIGH_PRICE)).toThrow(CatalogErrorMessage.InvalidCursor);
+  });
+});
+
+describe("catalog product batches", () => {
+  it("returns price summaries in requested product order", async () => {
+    const createdAt = new Date("2026-08-29T00:00:00Z");
+    const service = new CatalogService({} as never);
+    jest.spyOn(service, "getProductsByIds").mockResolvedValue([
+      {
+        productId: "product-b",
+        title: "B",
+        imageUrls: [],
+        isOnSale: false,
+        isExpressDelivery: true,
+        skus: [{ price: 2000 }],
+        createdAt,
+      },
+      {
+        productId: "product-a",
+        title: "A",
+        imageUrls: ["https://images.test/a.png"],
+        isOnSale: true,
+        isExpressDelivery: false,
+        skus: [{ price: 3000 }, { price: 1000 }],
+        createdAt,
+      },
+    ] as never);
+
+    await expect(
+      (
+        service as CatalogService & {
+          getProductPriceSummariesByIds: (productIds: string[]) => Promise<unknown>;
+        }
+      ).getProductPriceSummariesByIds(["product-a", "product-b"]),
+    ).resolves.toEqual([
+      {
+        productId: "product-a",
+        name: "A",
+        thumbnail: "https://images.test/a.png",
+        isOnSale: true,
+        isExpressDelivery: false,
+        basePrice: 3000,
+        finalPrice: 1000,
+        priceRevision: "product-a:1787961600000:1000",
+        lowestPriceEvidenceSummary: "최저 옵션 기준 2,000원 차이",
+      },
+      {
+        productId: "product-b",
+        name: "B",
+        thumbnail: null,
+        isOnSale: false,
+        isExpressDelivery: true,
+        basePrice: 2000,
+        finalPrice: 2000,
+        priceRevision: "product-b:1787961600000:2000",
+        lowestPriceEvidenceSummary: "현재 옵션 최저가 기준",
+      },
+    ]);
   });
 });

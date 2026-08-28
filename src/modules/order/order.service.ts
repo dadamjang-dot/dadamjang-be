@@ -1,5 +1,5 @@
 import { Inject, Injectable } from "@nestjs/common";
-import { and, desc, eq } from "drizzle-orm";
+import { and, desc, eq, inArray } from "drizzle-orm";
 import { CustomBadRequestException, CustomNotFoundException } from "src/common/errors/custom-exceptions";
 import { requireResult } from "src/common/invariants/require-result";
 import { OrderErrorMessage, getInsufficientStockMessage } from "./order.error";
@@ -101,7 +101,23 @@ export class OrderService {
       .from(orders)
       .where(eq(orders.userId, userId))
       .orderBy(desc(orders.createdAt));
-    return Promise.all(userOrders.map((order) => this.getOrder(userId, order.orderId)));
+    if (!userOrders.length) return [];
+    const items = await this.db
+      .select()
+      .from(orderItems)
+      .where(
+        inArray(
+          orderItems.orderId,
+          userOrders.map(({ orderId }) => orderId),
+        ),
+      );
+    const itemsByOrder = new Map<string, typeof items>();
+    for (const item of items) {
+      const orderItemRows = itemsByOrder.get(item.orderId) ?? [];
+      orderItemRows.push(item);
+      itemsByOrder.set(item.orderId, orderItemRows);
+    }
+    return userOrders.map((order) => ({ ...order, items: itemsByOrder.get(order.orderId) ?? [] }));
   };
 
   getOrder = async (userId: string, orderId: string) => {

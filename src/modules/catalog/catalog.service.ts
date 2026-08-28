@@ -150,6 +150,17 @@ export class CatalogService {
 
   getProductPriceSummary = async (productId: string) => this.toPriceSummary(await this.getProduct(productId));
 
+  getProductPriceSummariesByIds = async (productIds: string[]) => {
+    const productById = new Map(
+      (await this.getProductsByIds(productIds)).map((product) => [product.productId, product]),
+    );
+    return productIds.map((productId) => {
+      const product = productById.get(productId);
+      if (!product) throw new CustomNotFoundException(CatalogErrorMessage.ProductNotFound);
+      return this.toPriceSummary(product);
+    });
+  };
+
   getProductPriceEvidence = async (productId: string, priceRevision?: string): Promise<ProductPriceEvidenceType> => {
     const product = await this.getProduct(productId);
     const summary = this.toPriceSummary(product);
