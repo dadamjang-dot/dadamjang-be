@@ -1,10 +1,13 @@
 import { Pool, type PoolClient } from "pg";
 import { createDatabasePool } from "src/database/connection";
-import { seedMigrationPrerequisite } from "src/database/fixtures";
 import { migrate } from "src/database/migrate";
 import { testPool } from "./support/database";
 
 const SCHEMA_NAME = "catalog_migration_safety_test";
+const RETIRED_DEMO_MIGRATION = {
+  name: "0005_catalog_demo_products.sql",
+  checksum: "44d98c294ac8c2afa502f7bdb2c65411df7d4879dad39cd5b4fbc8cf9c94059f",
+} as const;
 
 const scopedPool = () => createDatabasePool(process.env, `-c search_path=${SCHEMA_NAME},public`);
 
@@ -43,6 +46,52 @@ describe("database migration PostgreSQL integration", () => {
     await adminPool.end();
   });
 
+  it("migrates an empty schema without temporary catalog data", async () => {
+    await migrate({ pool: migrationPool });
+
+    const journal = await migrationPool.query<{ name: string }>(`SELECT "name" FROM "_migrations" ORDER BY "name"`);
+    const catalog = await migrationPool.query<{ products: string; skus: string }>(
+      `SELECT
+         (SELECT count(*) FROM "products") AS products,
+         (SELECT count(*) FROM "productSkus") AS skus`,
+    );
+
+    expect(journal.rows.map(({ name }) => name)).toEqual([
+      "0000_initial_schema.sql",
+      "0001_commerce_domain.sql",
+      "0002_style_posts_partner.sql",
+      "0003_rename_wishlists.sql",
+      "0004_catalog_filters.sql",
+      "0006_assign_demo_product_categories.sql",
+      "0007_style_posts_feed.sql",
+      "0008_style_post_like_snapshots.sql",
+      "0009_wish_library_collections.sql",
+      "0010_auth_account_recovery.sql",
+      "0011_admin_backoffice.sql",
+      "0012_partner_catalog_portal.sql",
+      "0013_partner_product_image_keys_array.sql",
+      "0014_partner_catalog_integrity.sql",
+      "0015_catalog_keyset_indexes.sql",
+    ]);
+    expect(catalog.rows).toEqual([{ products: "0", skus: "0" }]);
+  });
+
+  it("accepts an existing journal entry for the retired demo migration", async () => {
+    await migrate({ pool: migrationPool });
+    await migrationPool.query('INSERT INTO "_migrations" ("name", "checksum") VALUES ($1, $2)', [
+      RETIRED_DEMO_MIGRATION.name,
+      RETIRED_DEMO_MIGRATION.checksum,
+    ]);
+
+    await migrate({ pool: migrationPool });
+
+    const retired = await migrationPool.query<{ name: string; checksum: string }>(
+      'SELECT "name", "checksum" FROM "_migrations" WHERE "name" = $1',
+      [RETIRED_DEMO_MIGRATION.name],
+    );
+    expect(retired.rows).toEqual([RETIRED_DEMO_MIGRATION]);
+  });
+
   it("serializes concurrent runners and preserves an idempotent journal rerun", async () => {
     let releaseFirst: () => void = () => undefined;
     let reachedFirst: () => void = () => undefined;
@@ -57,7 +106,7 @@ describe("database migration PostgreSQL integration", () => {
       reachedSecond = resolve;
     });
     let entrants = 0;
-    const beforeMigration = async (name: string, pool: Pool) => {
+    const beforeMigration = async (name: string) => {
       if (name === "0000_initial_schema.sql") {
         entrants += 1;
         if (entrants === 1) {
@@ -67,7 +116,6 @@ describe("database migration PostgreSQL integration", () => {
           reachedSecond();
         }
       }
-      if (name === "0005_catalog_demo_products.sql") await seedMigrationPrerequisite(pool);
     };
 
     const first = migrate({ pool: migrationPool, beforeMigration });
@@ -92,7 +140,7 @@ describe("database migration PostgreSQL integration", () => {
     const rerunJournal = await migrationPool.query<{ name: string; checksum: string }>(
       `SELECT "name", "checksum" FROM "_migrations" ORDER BY "name"`,
     );
-    expect(firstJournal.rows).toHaveLength(16);
+    expect(firstJournal.rows).toHaveLength(15);
     expect(rerunJournal.rows).toEqual(firstJournal.rows);
   });
 
@@ -105,12 +153,11 @@ describe("database migration PostgreSQL integration", () => {
     const firstRelease = new Promise<void>((resolve) => {
       releaseFirst = resolve;
     });
-    const beforeMigration = async (name: string, pool: Pool) => {
+    const beforeMigration = async (name: string) => {
       if (name === "0000_initial_schema.sql") {
         reachedFirst();
         await firstRelease;
       }
-      if (name === "0005_catalog_demo_products.sql") await seedMigrationPrerequisite(pool);
     };
     const first = migrate({ pool: migrationPool, beforeMigration });
     await firstPaused;
@@ -137,8 +184,7 @@ describe("database migration PostgreSQL integration", () => {
     const blocked = new Promise<void>((resolve) => {
       blockerReady = resolve;
     });
-    const beforeMigration = async (name: string, pool: Pool) => {
-      if (name === "0005_catalog_demo_products.sql") await seedMigrationPrerequisite(pool);
+    const beforeMigration = async (name: string) => {
       if (name === "0015_catalog_keyset_indexes.sql") {
         blocker = await migrationPool.connect();
         await blocker.query("BEGIN");
@@ -173,9 +219,6 @@ describe("database migration PostgreSQL integration", () => {
 
     await migrate({
       pool: migrationPool,
-      beforeMigration: async (name, pool) => {
-        if (name === "0005_catalog_demo_products.sql") await seedMigrationPrerequisite(pool);
-      },
       lockTimeoutMs: 100,
       statementTimeoutMs: 2_000,
     });
