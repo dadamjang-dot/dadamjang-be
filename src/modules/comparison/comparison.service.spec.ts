@@ -15,13 +15,25 @@ const comparisonRows = [
   },
 ];
 
-const listDatabase = () => ({
-  select: jest.fn().mockReturnValue({
-    from: () => ({
-      where: () => ({ orderBy: async () => comparisonRows }),
-    }),
-  }),
-});
+const listQuery = (rows: readonly unknown[]) => {
+  const result = Promise.resolve(rows);
+  const chain = {
+    from: jest.fn(),
+    where: jest.fn(),
+    orderBy: jest.fn(),
+    limit: jest.fn().mockResolvedValue(rows),
+    then: result.then.bind(result),
+  };
+  chain.from.mockReturnValue(chain);
+  chain.where.mockReturnValue(chain);
+  chain.orderBy.mockReturnValue(chain);
+  return chain;
+};
+
+const listDatabase = (rows: readonly unknown[] = comparisonRows) => {
+  const query = listQuery(rows);
+  return { db: { select: jest.fn().mockReturnValue(query) }, query };
+};
 
 const query = (result: readonly unknown[]) => {
   const chain = { from: jest.fn(), where: jest.fn(), limit: jest.fn().mockResolvedValue(result) };
@@ -36,7 +48,8 @@ describe("ComparisonService", () => {
       { productId: "product-b", title: "B" },
       { productId: "product-a", title: "A" },
     ]);
-    const service = new ComparisonService(listDatabase() as never, { getProductsByIds } as never);
+    const { db } = listDatabase();
+    const service = new ComparisonService(db as never, { getProductsByIds } as never);
 
     const items = await service.list("user-1");
 
@@ -48,11 +61,50 @@ describe("ComparisonService", () => {
   it("loads every comparison price summary in one batch", async () => {
     const summaries = [{ productId: "product-a" }, { productId: "product-b" }];
     const getProductPriceSummariesByIds = jest.fn().mockResolvedValue(summaries);
-    const service = new ComparisonService(listDatabase() as never, { getProductPriceSummariesByIds } as never);
+    const { db } = listDatabase();
+    const service = new ComparisonService(db as never, { getProductPriceSummariesByIds } as never);
 
     await expect(service.listPriceSummaries("user-1")).resolves.toEqual(summaries);
     expect(getProductPriceSummariesByIds).toHaveBeenCalledTimes(1);
     expect(getProductPriceSummariesByIds).toHaveBeenCalledWith(["product-a", "product-b"]);
+  });
+
+  it("limits legacy comparison hydration to 100 newest products", async () => {
+    const rows = Array.from({ length: 101 }, (_, index) => ({
+      comparisonItemId: `comparison-${index}`,
+      userId: "user-1",
+      productId: `product-${index}`,
+      createdAt: new Date(101 - index),
+    }));
+    const { db, query } = listDatabase(rows);
+    const getProductsByIds = jest.fn(async (productIds: string[]) => productIds.map((productId) => ({ productId })));
+    const service = new ComparisonService(db as never, { getProductsByIds } as never);
+
+    const result = await service.list("user-1");
+
+    expect(result).toHaveLength(100);
+    expect(query.limit).toHaveBeenCalledWith(100);
+    expect(getProductsByIds.mock.calls[0]?.[0]).toHaveLength(100);
+  });
+
+  it("limits legacy comparison price summaries to 100 newest products", async () => {
+    const rows = Array.from({ length: 101 }, (_, index) => ({
+      comparisonItemId: `comparison-${index}`,
+      userId: "user-1",
+      productId: `product-${index}`,
+      createdAt: new Date(101 - index),
+    }));
+    const { db, query } = listDatabase(rows);
+    const getProductPriceSummariesByIds = jest.fn(async (productIds: string[]) =>
+      productIds.map((productId) => ({ productId })),
+    );
+    const service = new ComparisonService(db as never, { getProductPriceSummariesByIds } as never);
+
+    const result = await service.listPriceSummaries("user-1");
+
+    expect(result).toHaveLength(100);
+    expect(query.limit).toHaveBeenCalledWith(100);
+    expect(getProductPriceSummariesByIds.mock.calls[0]?.[0]).toHaveLength(100);
   });
 
   it("returns an existing item without recording duplicate activity", async () => {

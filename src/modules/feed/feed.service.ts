@@ -9,6 +9,7 @@ import { Database, DRIZZLE } from "src/modules/database/database.module";
 import { activityEvents, products, wishes } from "src/modules/database/schema";
 
 type FeedCursor = { offset: number };
+const MAX_PREFERENCE_PRODUCT_COUNT = 100;
 
 const stableHash = (value: string) =>
   [...value].reduce((hash, character) => ((hash << 5) - hash + character.charCodeAt(0)) | 0, 0) >>> 0;
@@ -33,10 +34,14 @@ export class FeedService {
   personalizedFeed = async (userId: string, first = 20, after?: string) => {
     const pageSize = Math.min(Math.max(first, 1), MAX_PAGE_SIZE);
     const offset = after ? decodeCursor(after).offset : 0;
-    const likedProducts = await this.db
-      .select({ productId: wishes.productId })
-      .from(wishes)
-      .where(eq(wishes.userId, userId));
+    const likedProducts = (
+      await this.db
+        .select({ productId: wishes.productId })
+        .from(wishes)
+        .where(eq(wishes.userId, userId))
+        .orderBy(desc(wishes.createdAt))
+        .limit(MAX_PREFERENCE_PRODUCT_COUNT)
+    ).slice(0, MAX_PREFERENCE_PRODUCT_COUNT);
     const viewed = await this.db
       .select({ subjectId: activityEvents.subjectId })
       .from(activityEvents)
@@ -45,6 +50,7 @@ export class FeedService {
       .limit(100);
     const preferenceProductIds = new Set(likedProducts.map(({ productId }) => productId));
     for (const { subjectId } of viewed) {
+      if (preferenceProductIds.size >= MAX_PREFERENCE_PRODUCT_COUNT) break;
       if (subjectId.length === 36) preferenceProductIds.add(subjectId);
     }
     const preferenceRows = preferenceProductIds.size

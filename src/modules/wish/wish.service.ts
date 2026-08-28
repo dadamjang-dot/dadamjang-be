@@ -6,6 +6,8 @@ import { CustomNotFoundException } from "src/common/errors/custom-exceptions";
 import { Database, DRIZZLE } from "src/modules/database/database.module";
 import { activityEvents, products, wishes } from "src/modules/database/schema";
 
+const MAX_LEGACY_COLLECTION_SIZE = 100;
+
 @Injectable()
 export class WishService {
   constructor(
@@ -14,7 +16,14 @@ export class WishService {
   ) {}
 
   list = async (userId: string) => {
-    const rows = await this.db.select().from(wishes).where(eq(wishes.userId, userId)).orderBy(desc(wishes.createdAt));
+    const rows = (
+      await this.db
+        .select()
+        .from(wishes)
+        .where(eq(wishes.userId, userId))
+        .orderBy(desc(wishes.createdAt))
+        .limit(MAX_LEGACY_COLLECTION_SIZE)
+    ).slice(0, MAX_LEGACY_COLLECTION_SIZE);
     const productById = new Map(
       (await this.catalogService.getProductsByIds(rows.map((wish) => wish.productId))).map((product) => [
         product.productId,

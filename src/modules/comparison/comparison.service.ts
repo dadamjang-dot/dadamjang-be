@@ -6,6 +6,8 @@ import { CatalogService } from "src/modules/catalog/catalog.service";
 import { Database, DRIZZLE } from "src/modules/database/database.module";
 import { activityEvents, comparisonItems } from "src/modules/database/schema";
 
+const MAX_LEGACY_COLLECTION_SIZE = 100;
+
 @Injectable()
 export class ComparisonService {
   constructor(
@@ -14,11 +16,14 @@ export class ComparisonService {
   ) {}
 
   list = async (userId: string) => {
-    const rows = await this.db
-      .select()
-      .from(comparisonItems)
-      .where(eq(comparisonItems.userId, userId))
-      .orderBy(desc(comparisonItems.createdAt));
+    const rows = (
+      await this.db
+        .select()
+        .from(comparisonItems)
+        .where(eq(comparisonItems.userId, userId))
+        .orderBy(desc(comparisonItems.createdAt))
+        .limit(MAX_LEGACY_COLLECTION_SIZE)
+    ).slice(0, MAX_LEGACY_COLLECTION_SIZE);
     const productById = new Map(
       (await this.catalogService.getProductsByIds(rows.map(({ productId }) => productId))).map((product) => [
         product.productId,
@@ -34,11 +39,14 @@ export class ComparisonService {
   };
 
   listPriceSummaries = async (userId: string) => {
-    const rows = await this.db
-      .select()
-      .from(comparisonItems)
-      .where(eq(comparisonItems.userId, userId))
-      .orderBy(desc(comparisonItems.createdAt));
+    const rows = (
+      await this.db
+        .select()
+        .from(comparisonItems)
+        .where(eq(comparisonItems.userId, userId))
+        .orderBy(desc(comparisonItems.createdAt))
+        .limit(MAX_LEGACY_COLLECTION_SIZE)
+    ).slice(0, MAX_LEGACY_COLLECTION_SIZE);
 
     return this.catalogService.getProductPriceSummariesByIds(rows.map((row) => row.productId));
   };

@@ -16,6 +16,7 @@ import {
 } from "src/modules/database/schema";
 
 type CheckoutInput = { idempotencyKey?: string };
+const MAX_LEGACY_COLLECTION_SIZE = 100;
 const orderNumber = () =>
   `DJ-${new Date().toISOString().slice(0, 10).replaceAll("-", "")}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
 
@@ -96,11 +97,14 @@ export class OrderService {
     });
 
   listOrders = async (userId: string) => {
-    const userOrders = await this.db
-      .select()
-      .from(orders)
-      .where(eq(orders.userId, userId))
-      .orderBy(desc(orders.createdAt));
+    const userOrders = (
+      await this.db
+        .select()
+        .from(orders)
+        .where(eq(orders.userId, userId))
+        .orderBy(desc(orders.createdAt))
+        .limit(MAX_LEGACY_COLLECTION_SIZE)
+    ).slice(0, MAX_LEGACY_COLLECTION_SIZE);
     if (!userOrders.length) return [];
     const items = await this.db
       .select()

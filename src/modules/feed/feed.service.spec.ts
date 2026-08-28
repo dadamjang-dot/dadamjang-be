@@ -6,7 +6,7 @@ const query = (rows: readonly unknown[]) => {
     from: jest.fn(),
     where: jest.fn(),
     orderBy: jest.fn(),
-    limit: jest.fn().mockReturnValue(result),
+    limit: jest.fn().mockResolvedValue(rows),
     then: result.then.bind(result),
   };
   chain.from.mockReturnValue(chain);
@@ -38,5 +38,30 @@ describe("FeedService", () => {
     expect(page.nodes.map(({ productId }) => productId)).toEqual(["product-b", "product-a"]);
     expect(getProductsByIds).toHaveBeenCalledTimes(1);
     expect(getProductsByIds).toHaveBeenCalledWith(["product-b", "product-a"]);
+  });
+
+  it("limits wish history and the preference product query to 100 newest IDs", async () => {
+    const wishQuery = query(Array.from({ length: 101 }, (_, index) => ({ productId: `wish-product-${index}` })));
+    const viewedQuery = query([{ subjectId: "00000000-0000-4000-8000-000000000001" }]);
+    const preferenceQuery = query([]);
+    const candidateQuery = query([]);
+    const select = jest
+      .fn()
+      .mockReturnValueOnce(wishQuery)
+      .mockReturnValueOnce(viewedQuery)
+      .mockReturnValueOnce(preferenceQuery)
+      .mockReturnValueOnce(candidateQuery);
+    const service = new FeedService(
+      { select } as never,
+      { getProductsByIds: jest.fn().mockResolvedValue([]) } as never,
+    );
+
+    await service.personalizedFeed("user-1");
+
+    const preferenceCondition = preferenceQuery.where.mock.calls[0]?.[0] as { queryChunks?: unknown[] };
+    const preferenceIds = preferenceCondition.queryChunks?.find(Array.isArray) as unknown[] | undefined;
+    expect(wishQuery.orderBy).toHaveBeenCalledTimes(1);
+    expect(wishQuery.limit).toHaveBeenCalledWith(100);
+    expect(preferenceIds).toHaveLength(100);
   });
 });

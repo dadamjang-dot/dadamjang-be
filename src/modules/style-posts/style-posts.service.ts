@@ -34,6 +34,7 @@ import {
 } from "./style-posts.types";
 
 const PURCHASED_ORDER_STATUSES = ["PAID", "FULFILLING", "COMPLETED"] as const;
+const MAX_LEGACY_COLLECTION_SIZE = 100;
 const STYLE_POST_CATEGORIES = new Set<string>(Object.values(StylePostCategory));
 const STYLE_POST_SORTS = new Set<string>(Object.values(StylePostSort));
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -183,7 +184,7 @@ export class StylePostsService {
     if (hashtags.some((tag) => !/^[가-힣A-Za-z0-9_]{1,20}$/.test(tag)))
       throw new CustomBadRequestException(StylePostErrorMessage.InvalidHashtag);
 
-    const purchasedProducts = await this.getPurchasedProductRows(authorId);
+    const purchasedProducts = await this.getPurchasedProductRows(authorId, productIds);
     const purchasedById = new Map(purchasedProducts.map((product) => [product.productId, product]));
     if (productIds.some((productId) => !purchasedById.has(productId)))
       throw new CustomBadRequestException(StylePostErrorMessage.ProductNotPurchased);
@@ -444,7 +445,11 @@ export class StylePostsService {
     return this.get(stylePostId, userId);
   };
 
-  private getPurchasedProductRows = async (userId: string): Promise<PurchasedStyleProductRow[]> => {
+  private getPurchasedProductRows = async (
+    userId: string,
+    productIds?: string[],
+  ): Promise<PurchasedStyleProductRow[]> => {
+    const lastPurchasedAt = sql<Date>`max(${orders.createdAt})`.mapWith(orders.createdAt);
     const rows = await this.db
       .select({
         productId: products.productId,
@@ -453,19 +458,23 @@ export class StylePostsService {
         brandId: brands.brandId,
         brandName: brands.name,
         categoryId: products.categoryId,
-        lastPurchasedAt: orders.createdAt,
+        lastPurchasedAt,
       })
       .from(orderItems)
       .innerJoin(orders, eq(orderItems.orderId, orders.orderId))
       .innerJoin(products, eq(orderItems.productId, products.productId))
       .leftJoin(brands, eq(products.brandId, brands.brandId))
-      .where(and(eq(orders.userId, userId), inArray(orders.status, [...PURCHASED_ORDER_STATUSES])))
-      .orderBy(desc(orders.createdAt));
-    const latest = new Map<string, PurchasedStyleProductRow>();
-    for (const row of rows) {
-      if (!latest.has(row.productId)) latest.set(row.productId, row);
-    }
-    return [...latest.values()];
+      .where(
+        and(
+          eq(orders.userId, userId),
+          inArray(orders.status, [...PURCHASED_ORDER_STATUSES]),
+          productIds ? inArray(orderItems.productId, productIds) : undefined,
+        ),
+      )
+      .groupBy(products.productId, products.title, products.imageUrls, brands.brandId, brands.name, products.categoryId)
+      .orderBy(desc(lastPurchasedAt))
+      .limit(MAX_LEGACY_COLLECTION_SIZE);
+    return rows.slice(0, MAX_LEGACY_COLLECTION_SIZE);
   };
 
   private hydrate = async (
