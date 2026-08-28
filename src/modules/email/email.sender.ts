@@ -32,11 +32,11 @@ export class ResendEmailSender implements EmailSender {
     const response = await fetch("https://api.resend.com/emails", {
       method: "POST",
       headers: {
-        authorization: `Bearer ${this.configService.getOrThrow<string>("RESEND_API_KEY")}`,
+        authorization: `Bearer ${this.configService.getOrThrow<string>("RESEND_API_KEY").trim()}`,
         "content-type": "application/json",
       },
       body: JSON.stringify({
-        from: this.configService.getOrThrow<string>("RESEND_FROM_EMAIL"),
+        from: this.configService.getOrThrow<string>("RESEND_FROM_EMAIL").trim(),
         to: [to],
         subject,
         html,

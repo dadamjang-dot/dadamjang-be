@@ -1,6 +1,6 @@
 import { Logger } from "@nestjs/common";
 import type { ConfigService } from "@nestjs/config";
-import { DevEmailSender } from "./email.sender";
+import { DevEmailSender, ResendEmailSender } from "./email.sender";
 
 describe("DevEmailSender", () => {
   it("does not write email secrets to logs", async () => {
@@ -15,6 +15,33 @@ describe("DevEmailSender", () => {
       expect(output).not.toContain("reset-secret");
     } finally {
       log.mockRestore();
+    }
+  });
+});
+
+describe("ResendEmailSender", () => {
+  it("trims configured credentials before delivery", async () => {
+    const send = jest.spyOn(global, "fetch").mockResolvedValue({ ok: true } as Response);
+    const values: Record<string, string> = {
+      RESEND_API_KEY: "  resend-api-key  ",
+      RESEND_FROM_EMAIL: "  sender@example.test  ",
+    };
+    const sender = new ResendEmailSender({
+      getOrThrow: jest.fn((key: string) => values[key]),
+    } as unknown as ConfigService);
+
+    try {
+      await sender.sendCode("recipient@example.test", "123456");
+      const request = send.mock.calls[0][1];
+      expect(request?.headers).toEqual({
+        authorization: "Bearer resend-api-key",
+        "content-type": "application/json",
+      });
+      expect(JSON.parse(String(request?.body))).toEqual(
+        expect.objectContaining({ from: "sender@example.test", to: ["recipient@example.test"] }),
+      );
+    } finally {
+      send.mockRestore();
     }
   });
 });

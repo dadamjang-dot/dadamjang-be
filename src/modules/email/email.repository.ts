@@ -92,39 +92,66 @@ export class EmailRepository {
   };
   resetPasswordWithToken = (token: string, password: string) =>
     this.db.transaction(async (tx) => {
-      const now = new Date();
+      const lookupAt = new Date();
       const tokenHash = hashToken(token);
       const [linkProof] = await tx
-        .update(passwordResetTokens)
-        .set({ usedAt: now })
+        .select({ userId: passwordResetTokens.userId })
+        .from(passwordResetTokens)
         .where(
           and(
             eq(passwordResetTokens.tokenHash, tokenHash),
             isNull(passwordResetTokens.usedAt),
-            gt(passwordResetTokens.expiresAt, now),
+            gt(passwordResetTokens.expiresAt, lookupAt),
           ),
         )
-        .returning();
+        .limit(1);
       const [emailProof] = linkProof
         ? []
+        : await tx
+            .select({ userId: users.userId })
+            .from(emailVerificationTokens)
+            .innerJoin(users, eq(users.email, emailVerificationTokens.email))
+            .where(
+              and(
+                eq(emailVerificationTokens.tokenHash, tokenHash),
+                eq(emailVerificationTokens.purpose, "PASSWORD_RESET"),
+                isNull(emailVerificationTokens.usedAt),
+                gt(emailVerificationTokens.expiresAt, lookupAt),
+              ),
+            )
+            .limit(1);
+      const userId = linkProof?.userId ?? emailProof?.userId;
+      if (!userId) return false;
+      const [user] = await tx.select().from(users).where(eq(users.userId, userId)).for("update");
+      if (!user) return false;
+      const now = new Date();
+      const [consumedProof] = linkProof
+        ? await tx
+            .update(passwordResetTokens)
+            .set({ usedAt: now })
+            .where(
+              and(
+                eq(passwordResetTokens.tokenHash, tokenHash),
+                eq(passwordResetTokens.userId, user.userId),
+                isNull(passwordResetTokens.usedAt),
+                gt(passwordResetTokens.expiresAt, now),
+              ),
+            )
+            .returning({ tokenHash: passwordResetTokens.tokenHash })
         : await tx
             .update(emailVerificationTokens)
             .set({ usedAt: now })
             .where(
               and(
                 eq(emailVerificationTokens.tokenHash, tokenHash),
+                eq(emailVerificationTokens.email, user.email),
                 eq(emailVerificationTokens.purpose, "PASSWORD_RESET"),
                 isNull(emailVerificationTokens.usedAt),
                 gt(emailVerificationTokens.expiresAt, now),
               ),
             )
-            .returning();
-      const user = linkProof
-        ? await tx.query.users.findFirst({ where: eq(users.userId, linkProof.userId) })
-        : emailProof
-          ? await tx.query.users.findFirst({ where: eq(users.email, emailProof.email) })
-          : undefined;
-      if (!user) return false;
+            .returning({ tokenHash: emailVerificationTokens.tokenHash });
+      if (!consumedProof) return false;
       await tx.update(users).set({ password, updatedAt: now }).where(eq(users.userId, user.userId));
       await tx
         .update(passwordResetTokens)

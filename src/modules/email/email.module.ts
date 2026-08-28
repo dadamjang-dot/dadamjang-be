@@ -14,9 +14,15 @@ import { EmailService } from "./email.service";
       provide: "EmailSender",
       inject: [ConfigService],
       useFactory: (config: ConfigService) => {
-        if (config.get<string>("RESEND_API_KEY")?.trim()) return new ResendEmailSender(config);
-        if (config.get<string>("NODE_ENV") === "production")
-          throw new Error("RESEND_API_KEY is required in production");
+        const apiKey = config.get<string>("RESEND_API_KEY")?.trim();
+        const fromEmail = config.get<string>("RESEND_FROM_EMAIL")?.trim();
+        if (apiKey && fromEmail) return new ResendEmailSender(config);
+        if (config.get<string>("NODE_ENV") === "production") {
+          const missing = [apiKey ? undefined : "RESEND_API_KEY", fromEmail ? undefined : "RESEND_FROM_EMAIL"].filter(
+            (name): name is string => name !== undefined,
+          );
+          throw new Error(`${missing.join(", ")} ${missing.length === 1 ? "is" : "are"} required in production`);
+        }
         return new DevEmailSender(config);
       },
     },

@@ -5,6 +5,7 @@ import request from "supertest";
 import { createApp } from "src/app";
 import { hashToken } from "src/common/security/token-hash";
 import { FIXTURE } from "src/database/fixtures";
+import { EmailErrorMessage } from "src/modules/email/email.error";
 import { resetTestFixtures, testPool } from "./support/database";
 
 const resetPassword = (app: INestApplication, token: string, password: string) =>
@@ -14,6 +15,61 @@ const resetPassword = (app: INestApplication, token: string, password: string) =
       query: `mutation ResetPassword($input: ResetPasswordInput!) { resetPassword(input: $input) { ok } }`,
       variables: { input: { token, password } },
     });
+
+const installResetRaceDelay = async (pool: Pool) => {
+  await pool.query(`
+    CREATE OR REPLACE FUNCTION delay_reset_proof_use() RETURNS trigger AS $$
+    BEGIN
+      IF OLD."usedAt" IS NULL AND NEW."usedAt" IS NOT NULL THEN
+        PERFORM pg_sleep(0.25);
+      END IF;
+      RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql
+  `);
+  await pool.query(`
+    CREATE TRIGGER delay_link_reset_proof_use
+    BEFORE UPDATE OF "usedAt" ON "passwordResetToken"
+    FOR EACH ROW EXECUTE FUNCTION delay_reset_proof_use()
+  `);
+  await pool.query(`
+    CREATE TRIGGER delay_email_reset_proof_use
+    BEFORE UPDATE OF "usedAt" ON "emailVerificationToken"
+    FOR EACH ROW EXECUTE FUNCTION delay_reset_proof_use()
+  `);
+};
+
+const removeResetRaceDelay = async (pool: Pool) => {
+  await pool.query(`DROP TRIGGER IF EXISTS delay_link_reset_proof_use ON "passwordResetToken"`);
+  await pool.query(`DROP TRIGGER IF EXISTS delay_email_reset_proof_use ON "emailVerificationToken"`);
+  await pool.query(`DROP FUNCTION IF EXISTS delay_reset_proof_use()`);
+};
+
+const seedResetRace = async (pool: Pool) => {
+  await pool.query(
+    `INSERT INTO "passwordResetToken" ("tokenHash", "userId", "expiresAt")
+     VALUES ($1, $3, now() + interval '10 minutes'), ($2, $3, now() + interval '10 minutes')`,
+    [hashToken("race-link-a"), hashToken("race-link-b"), FIXTURE.userId],
+  );
+  await pool.query(
+    `INSERT INTO "emailVerification" ("id", "email", "purpose", "codeHash", "expiresAt", "verifiedAt")
+     VALUES
+       ('e0000000-0000-4000-8000-000000000010', 'integration@example.test', 'PASSWORD_RESET', 'hash-a', now() + interval '10 minutes', now()),
+       ('e0000000-0000-4000-8000-000000000011', 'integration@example.test', 'PASSWORD_RESET', 'hash-b', now() + interval '10 minutes', now())`,
+  );
+  await pool.query(
+    `INSERT INTO "emailVerificationToken" ("tokenHash", "email", "purpose", "verificationId", "expiresAt")
+     VALUES
+       ($1, 'integration@example.test', 'PASSWORD_RESET', 'e0000000-0000-4000-8000-000000000010', now() + interval '10 minutes'),
+       ($2, 'integration@example.test', 'PASSWORD_RESET', 'e0000000-0000-4000-8000-000000000011', now() + interval '10 minutes')`,
+    [hashToken("race-email-a"), hashToken("race-email-b")],
+  );
+  await pool.query(
+    `INSERT INTO "refreshToken" ("userId", "deviceId", "refreshToken", "refreshTokenExp")
+     VALUES ($1, 'race-device', 'race-session', now() + interval '1 day')`,
+    [FIXTURE.userId],
+  );
+};
 
 describe("FO account recovery GraphQL integration", () => {
   let app: INestApplication;
@@ -156,6 +212,127 @@ describe("FO account recovery GraphQL integration", () => {
     ]);
     await expect(bcrypt.compare("PrimaryPassword123!", password.rows[0].password)).resolves.toBe(true);
   });
+
+  it.each([
+    { caseName: "link-link", tokens: ["race-link-a", "race-link-b"] },
+    { caseName: "link-email", tokens: ["race-link-a", "race-email-a"] },
+    { caseName: "email-email", tokens: ["race-email-a", "race-email-b"] },
+  ])(
+    "serializes $caseName password resets for one account",
+    async ({ tokens }) => {
+      await seedResetRace(pool);
+      const passwords = ["ConcurrentPasswordA123!", "ConcurrentPasswordB123!"];
+      let responses: Awaited<ReturnType<typeof resetPassword>>[];
+
+      try {
+        await installResetRaceDelay(pool);
+        responses = await Promise.all(tokens.map((token, index) => resetPassword(app, token, passwords[index])));
+      } finally {
+        await removeResetRaceDelay(pool);
+      }
+
+      const successIndexes = responses
+        .map((response, index) => (response.body.data?.resetPassword?.ok === true ? index : -1))
+        .filter((index) => index >= 0);
+      const failures = responses.filter((response) => response.body.errors !== undefined);
+      expect(successIndexes).toHaveLength(1);
+      expect(failures).toHaveLength(1);
+      expect(failures[0].body.errors).toEqual([
+        expect.objectContaining({
+          message: EmailErrorMessage.InvalidRecoveryToken,
+          extensions: expect.objectContaining({ code: "UNAUTHENTICATED" }),
+        }),
+      ]);
+
+      const state = await pool.query<{
+        password: string;
+        linkProofs: number;
+        emailProofs: number;
+        refreshTokens: number;
+      }>(
+        `SELECT
+           u."password",
+           (SELECT count(*)::int FROM "passwordResetToken" WHERE "userId" = u."userId" AND "usedAt" IS NULL) AS "linkProofs",
+           (SELECT count(*)::int FROM "emailVerificationToken" WHERE "email" = u."email" AND "purpose" = 'PASSWORD_RESET' AND "usedAt" IS NULL) AS "emailProofs",
+           (SELECT count(*)::int FROM "refreshToken" WHERE "userId" = u."userId") AS "refreshTokens"
+         FROM "users" u
+         WHERE u."userId" = $1`,
+        [FIXTURE.userId],
+      );
+      expect(state.rows[0]).toEqual(expect.objectContaining({ linkProofs: 0, emailProofs: 0, refreshTokens: 0 }));
+      await expect(bcrypt.compare(passwords[successIndexes[0]], state.rows[0].password)).resolves.toBe(true);
+    },
+    15_000,
+  );
+
+  it("rejects a recovery proof that expires while waiting for the account lock", async () => {
+    await pool.query(
+      `INSERT INTO "passwordResetToken" ("tokenHash", "userId", "expiresAt")
+         VALUES ($1, $2, now() + interval '1 second')`,
+      [hashToken("expiring-lock-proof"), FIXTURE.userId],
+    );
+    await pool.query(
+      `INSERT INTO "refreshToken" ("userId", "deviceId", "refreshToken", "refreshTokenExp")
+         VALUES ($1, 'expiring-lock-device', 'expiring-lock-session', now() + interval '1 day')`,
+      [FIXTURE.userId],
+    );
+    const before = await pool.query<{ password: string }>(`SELECT "password" FROM "users" WHERE "userId" = $1`, [
+      FIXTURE.userId,
+    ]);
+    const lock = await pool.connect();
+    let transactionOpen = true;
+
+    try {
+      await lock.query("BEGIN");
+      await lock.query(`SELECT 1 FROM "users" WHERE "userId" = $1 FOR UPDATE`, [FIXTURE.userId]);
+      const responsePromise = Promise.resolve(resetPassword(app, "expiring-lock-proof", "ExpiredProofPassword123!"));
+      const deadline = Date.now() + 2_000;
+      let waitingForLock = false;
+
+      while (!waitingForLock && Date.now() < deadline) {
+        const waiting = await pool.query<{ waiting: boolean }>(
+          `SELECT EXISTS (
+               SELECT 1
+               FROM pg_stat_activity
+               WHERE datname = current_database()
+                 AND wait_event_type = 'Lock'
+                 AND query ILIKE '%from "users"%for update%'
+             ) AS "waiting"`,
+        );
+        waitingForLock = waiting.rows[0].waiting;
+        if (!waitingForLock) await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 1_100));
+      await lock.query("COMMIT");
+      transactionOpen = false;
+      const response = await responsePromise;
+      expect(waitingForLock).toBe(true);
+      expect(response.body.errors).toEqual([
+        expect.objectContaining({
+          message: EmailErrorMessage.InvalidRecoveryToken,
+          extensions: expect.objectContaining({ code: "UNAUTHENTICATED" }),
+        }),
+      ]);
+    } finally {
+      if (transactionOpen) await lock.query("ROLLBACK");
+      lock.release();
+    }
+
+    const after = await pool.query<{ password: string; proofUsedAt: Date | null; refreshTokens: number }>(
+      `SELECT
+           u."password",
+           p."usedAt" AS "proofUsedAt",
+           (SELECT count(*)::int FROM "refreshToken" WHERE "userId" = u."userId") AS "refreshTokens"
+         FROM "users" u
+         JOIN "passwordResetToken" p ON p."userId" = u."userId"
+         WHERE u."userId" = $1 AND p."tokenHash" = $2`,
+      [FIXTURE.userId, hashToken("expiring-lock-proof")],
+    );
+    expect(after.rows[0]).toEqual(
+      expect.objectContaining({ password: before.rows[0].password, proofUsedAt: null, refreshTokens: 1 }),
+    );
+  }, 10_000);
 
   it("rolls back proof consumption when the password change fails", async () => {
     await pool.query(
