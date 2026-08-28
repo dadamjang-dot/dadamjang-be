@@ -1,4 +1,4 @@
-import { Args, Context, Mutation, Query, Resolver } from "@nestjs/graphql";
+import { Context, Query, Resolver } from "@nestjs/graphql";
 import { UseGuards } from "@nestjs/common";
 import { UserRole } from "src/auth/role";
 import { Roles } from "src/auth/roles.decorator";
@@ -7,7 +7,7 @@ import { JwtAccessTokenGuard } from "src/guards/access-token.guard";
 import { RolesGuard } from "src/guards/roles.guard";
 import { EventErrorMessage } from "./event.error";
 import { EventService } from "./event.service";
-import { ActivityEventType, RecordActivityEventInput } from "./event.types";
+import { ActivityEventType } from "./event.types";
 
 const currentUserId = (context: { req?: { user?: { userId?: string } } }) => {
   const userId = context.req?.user?.userId;
@@ -23,17 +23,5 @@ export class EventResolver {
   @Query(() => [ActivityEventType])
   myActivity(@Context() context: { req?: { user?: { userId?: string } } }) {
     return this.eventService.listUserActivity(currentUserId(context));
-  }
-  @Mutation(() => ActivityEventType)
-  recordActivity(
-    @Args("input") input: RecordActivityEventInput,
-    @Context() context: { req?: { user?: { userId?: string } } },
-  ) {
-    return this.eventService.recordActivity(
-      currentUserId(context),
-      input.eventType,
-      input.subjectType,
-      input.subjectId,
-    );
   }
 }

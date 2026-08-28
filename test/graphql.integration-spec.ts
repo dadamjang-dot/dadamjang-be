@@ -86,6 +86,15 @@ describe("PostgreSQL GraphQL integration", () => {
     });
   });
 
+  it("does not expose client-authored activity events", async () => {
+    const response = await request(app.getHttpServer()).post("/graphql").send({
+      query: `query MutationFields { __schema { mutationType { fields { name } } } }`,
+    });
+    const fieldNames = response.body.data.__schema.mutationType.fields.map((field: { name: string }) => field.name);
+
+    expect(fieldNames).not.toContain("recordActivity");
+  });
+
   it("classifies malformed database identifiers as client input errors", async () => {
     const response = await request(app.getHttpServer())
       .post("/graphql")
