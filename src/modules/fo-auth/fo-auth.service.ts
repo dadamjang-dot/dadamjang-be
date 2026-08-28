@@ -4,6 +4,7 @@ import { randomBytes, randomUUID } from "crypto";
 import { CustomBadRequestException, CustomUnauthorizedException } from "src/common/errors/custom-exceptions";
 import { hasDatabaseErrorCode } from "src/common/errors/database-error";
 import { hashToken } from "src/common/security/token-hash";
+import { AdmissionLimiter, type RequestOrigin } from "src/modules/admission/admission-limiter";
 import { UserRole } from "src/auth/role";
 import { AuthService } from "src/modules/auth/auth.service";
 import { EmailService } from "src/modules/email/email.service";
@@ -20,11 +21,21 @@ export class FoAuthService {
     private readonly repository: FoAuthRepository,
     private readonly authService: AuthService,
     private readonly emailService: EmailService,
+    private readonly admissionLimiter: AdmissionLimiter,
   ) {}
 
-  signin = async (input: SigninFoInput, deviceId: string) => {
-    const signinStartedAt = await this.authService.signinStartedAt();
+  signin = async (input: SigninFoInput, deviceId: string, origin: RequestOrigin) => {
     const email = this.emailService.normalizeEmail(input.email);
+    await this.admissionLimiter.assertAllowed(
+      "AUTH_SIGNIN_FO",
+      [
+        { scopeType: "signin-ip", value: origin.ip, limit: 20, windowMs: 15 * 60_000 },
+        { scopeType: "signin-account", value: email, limit: 20, windowMs: 15 * 60_000 },
+        { scopeType: "signin-device", value: origin.deviceId ?? deviceId, limit: 20, windowMs: 15 * 60_000 },
+      ],
+      "이메일 또는 비밀번호가 올바르지 않습니다.",
+    );
+    const signinStartedAt = await this.authService.signinStartedAt();
     const user = await this.repository.findByEmail(email);
     if (!user) {
       await bcrypt.compare(input.password, invalidPasswordHash);

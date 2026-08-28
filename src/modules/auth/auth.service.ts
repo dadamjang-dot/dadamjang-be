@@ -5,6 +5,7 @@ import * as bcrypt from "bcrypt";
 import { randomUUID, timingSafeEqual } from "crypto";
 import { CustomConflictException, CustomUnauthorizedException } from "src/common/errors/custom-exceptions";
 import { hashToken } from "src/common/security/token-hash";
+import { AdmissionLimiter, type RequestOrigin } from "src/modules/admission/admission-limiter";
 import { EmailService } from "src/modules/email/email.service";
 import { User } from "src/modules/database/schema";
 import { AuthErrorMessage } from "./auth.error";
@@ -29,10 +30,22 @@ export class AuthService {
     private readonly jwtService: JwtService,
     private readonly configService: ConfigService,
     private readonly emailService: EmailService,
+    private readonly admissionLimiter: AdmissionLimiter,
   ) {}
-  signin = async (input: SigninAuthInput, deviceId: string) => {
+  signin = async (input: SigninAuthInput, deviceId: string, origin: RequestOrigin) => {
+    const userid = this.emailService.normalizeUserid(input.userid);
+    const limit = input.portal === AuthPortal.Fo ? 20 : 5;
+    await this.admissionLimiter.assertAllowed(
+      `AUTH_SIGNIN_${input.portal}`,
+      [
+        { scopeType: "signin-ip", value: origin.ip, limit, windowMs: 15 * 60_000 },
+        { scopeType: "signin-account", value: userid, limit, windowMs: 15 * 60_000 },
+        { scopeType: "signin-device", value: origin.deviceId ?? deviceId, limit, windowMs: 15 * 60_000 },
+      ],
+      AuthErrorMessage.AuthRequired,
+    );
     const signinStartedAt = await this.repository.signinStartedAt();
-    const user = await this.repository.findByUserid(this.emailService.normalizeUserid(input.userid));
+    const user = await this.repository.findByUserid(userid);
     if (!user) {
       await bcrypt.compare(input.password, invalidPasswordHash);
       throw new CustomUnauthorizedException(AuthErrorMessage.AuthRequired);

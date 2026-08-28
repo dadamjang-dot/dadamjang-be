@@ -1,7 +1,15 @@
 import * as bcrypt from "bcrypt";
+import { AdmissionLimiter, type RequestOrigin } from "src/modules/admission/admission-limiter";
 import { AuthErrorMessage } from "./auth.error";
 import { AuthService } from "./auth.service";
 import { AuthPortal } from "./auth.types";
+
+jest.mock("bcrypt", () => {
+  const actual = jest.requireActual<typeof import("bcrypt")>("bcrypt");
+  return { ...actual, compare: jest.fn(actual.compare) };
+});
+
+const actualCompare = jest.requireActual<typeof import("bcrypt")>("bcrypt").compare;
 
 const user = {
   userId: "user-1",
@@ -14,9 +22,129 @@ const user = {
 };
 
 const createService = (repository: object, emailService: object = {}) =>
-  new AuthService(repository as never, {} as never, {} as never, emailService as never);
+  new AuthService(
+    repository as never,
+    {} as never,
+    {} as never,
+    emailService as never,
+    {
+      assertAllowed: jest.fn().mockResolvedValue(undefined),
+    } as never,
+  );
+
+const createAdmissionService = (repository: object, emailService: object, admissionLimiter: object) => {
+  const Service = AuthService as unknown as new (
+    repository: never,
+    jwtService: never,
+    configService: never,
+    emailService: never,
+    admissionLimiter: never,
+  ) => AuthService;
+  return new Service(repository as never, {} as never, {} as never, emailService as never, admissionLimiter as never);
+};
 
 describe("AuthService", () => {
+  it("runs admission before userid lookup and password comparison", async () => {
+    const order: string[] = [];
+    const compare = jest.mocked(bcrypt.compare).mockImplementation(async () => {
+      order.push("bcrypt");
+      return true;
+    });
+    const repository = {
+      signinStartedAt: jest.fn().mockResolvedValue(new Date()),
+      findByUserid: jest.fn().mockImplementation(async () => {
+        order.push("lookup");
+        return { ...user, role: "ADMIN" };
+      }),
+      withSigninLock: jest.fn(
+        async (_userId: string, _deviceId: string, action: (store: undefined) => Promise<unknown>) => ({
+          acquired: true,
+          value: await action(undefined),
+        }),
+      ),
+      findRefreshToken: jest.fn().mockResolvedValue(undefined),
+      saveRefreshToken: jest.fn().mockResolvedValue(true),
+    };
+    const admissionLimiter = {
+      assertAllowed: jest.fn().mockImplementation(async () => {
+        order.push("admission");
+      }),
+    } as unknown as AdmissionLimiter;
+    const service = createAdmissionService(
+      repository,
+      { normalizeUserid: (value: string) => value.trim().toLowerCase() },
+      admissionLimiter,
+    );
+    service.issueTokensForUser = jest.fn().mockResolvedValue({ role: "ADMIN" }) as never;
+    const signin = service.signin as unknown as (
+      input: { userid: string; password: string; portal: AuthPortal },
+      deviceId: string,
+      origin: RequestOrigin,
+    ) => Promise<object>;
+
+    try {
+      await signin({ userid: " ADMIN ", password: "password", portal: AuthPortal.Bo }, "device-1", {
+        ip: "203.0.113.10",
+        deviceId: "device-1",
+      });
+      expect(order).toEqual(["admission", "lookup", "bcrypt"]);
+    } finally {
+      compare.mockImplementation(actualCompare);
+    }
+  });
+
+  it("uses literal IP, normalized account, and device scopes with lower privileged-portal limits", async () => {
+    const assertAllowed = jest.fn().mockResolvedValue(undefined);
+    const admissionLimiter = {
+      assertAllowed,
+    } as unknown as AdmissionLimiter;
+    const repository = {
+      signinStartedAt: jest.fn().mockResolvedValue(new Date()),
+      findByUserid: jest.fn().mockResolvedValue(undefined),
+    };
+    const service = createAdmissionService(
+      repository,
+      { normalizeUserid: (value: string) => value.trim().toLowerCase() },
+      admissionLimiter,
+    );
+    const signin = service.signin as unknown as (
+      input: { userid: string; password: string; portal: AuthPortal },
+      deviceId: string,
+      origin: RequestOrigin,
+    ) => Promise<object>;
+    const origin = { ip: "203.0.113.10", deviceId: "device-1" };
+
+    await expect(
+      signin({ userid: " MEMBER ", password: "wrong", portal: AuthPortal.Fo }, "device-1", origin),
+    ).rejects.toThrow(AuthErrorMessage.AuthRequired);
+    await expect(
+      signin({ userid: " MEMBER ", password: "wrong", portal: AuthPortal.Partner }, "device-1", origin),
+    ).rejects.toThrow(AuthErrorMessage.AuthRequired);
+    await expect(
+      signin({ userid: " MEMBER ", password: "wrong", portal: AuthPortal.Bo }, "device-1", origin),
+    ).rejects.toThrow(AuthErrorMessage.AuthRequired);
+
+    expect(admissionLimiter.assertAllowed).toHaveBeenNthCalledWith(
+      1,
+      "AUTH_SIGNIN_FO",
+      [
+        { scopeType: "signin-ip", value: "203.0.113.10", limit: 20, windowMs: 900_000 },
+        { scopeType: "signin-account", value: "member", limit: 20, windowMs: 900_000 },
+        { scopeType: "signin-device", value: "device-1", limit: 20, windowMs: 900_000 },
+      ],
+      AuthErrorMessage.AuthRequired,
+    );
+    for (const [index, portal] of ["PARTNER", "BO"].entries()) {
+      const [action, rules] = assertAllowed.mock.calls[index + 1] ?? [];
+      expect(action).toBe(`AUTH_SIGNIN_${portal}`);
+      expect(rules).toEqual([
+        { scopeType: "signin-ip", value: "203.0.113.10", limit: 5, windowMs: 900_000 },
+        { scopeType: "signin-account", value: "member", limit: 5, windowMs: 900_000 },
+        { scopeType: "signin-device", value: "device-1", limit: 5, windowMs: 900_000 },
+      ]);
+    }
+  });
+
   it("rejects signin through a portal that does not match the user role", async () => {
     const password = await bcrypt.hash("password", 4);
     const service = createService(
@@ -35,7 +163,10 @@ describe("AuthService", () => {
       },
     );
     await expect(
-      service.signin({ userid: "user", password: "password", portal: AuthPortal.Partner }, "device"),
+      service.signin({ userid: "user", password: "password", portal: AuthPortal.Partner }, "device", {
+        ip: "unknown",
+        deviceId: "device",
+      }),
     ).rejects.toThrow(AuthErrorMessage.AuthRequired);
   });
 
@@ -79,7 +210,15 @@ describe("AuthService", () => {
     const configService = {
       getOrThrow: jest.fn((name: string) => (name.endsWith("EXP") ? "1h" : "secret")),
     };
-    const service = new AuthService(repository as never, jwtService as never, configService as never, {} as never);
+    const service = new AuthService(
+      repository as never,
+      jwtService as never,
+      configService as never,
+      {} as never,
+      {
+        assertAllowed: jest.fn().mockResolvedValue(undefined),
+      } as never,
+    );
 
     const [first, second] = await Promise.all([
       service.issueTokensForUser(user, "device"),

@@ -9,6 +9,7 @@ import { deviceIdFromRequest, setTokenCookies } from "./auth-http";
 import { AuthService } from "./auth.service";
 import { AuthRequest, AuthViewer, RefreshAuthRequest, SigninAuthInput, TokenPayload } from "./auth.types";
 import { JwtAccessTokenGuard } from "src/guards/access-token.guard";
+import { requestOriginFromRequest } from "src/modules/admission/admission-limiter";
 
 @Resolver()
 export class AuthResolver {
@@ -18,7 +19,7 @@ export class AuthResolver {
     @Context("req") req: Request,
     @Context("res") res: Response,
   ) {
-    const result = await this.authService.signin(input, deviceIdFromRequest(req));
+    const result = await this.authService.signin(input, deviceIdFromRequest(req), requestOriginFromRequest(req));
     setTokenCookies(res, result);
     return result;
   }
