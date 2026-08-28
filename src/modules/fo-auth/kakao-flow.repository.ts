@@ -216,10 +216,14 @@ export class KakaoFlowRepository {
           verifiedAt: identity.verifiedAt ?? new Date(),
         });
       }
-      await tx
-        .insert(authIdentities)
-        .values({ userId: user.userId, provider: "kakao", providerUserId: signup.providerUserId })
-        .onConflictDoNothing({ target: [authIdentities.provider, authIdentities.providerUserId] });
+      if (!linkedIdentity) {
+        const [createdIdentity] = await tx
+          .insert(authIdentities)
+          .values({ userId: user.userId, provider: "kakao", providerUserId: signup.providerUserId })
+          .onConflictDoNothing({ target: [authIdentities.provider, authIdentities.providerUserId] })
+          .returning({ userId: authIdentities.userId });
+        if (!createdIdentity) throw new InvalidFoAuthProofError();
+      }
       for (const consent of input.consents) {
         const agreedAt = consent.agreed ? new Date() : null;
         await tx
