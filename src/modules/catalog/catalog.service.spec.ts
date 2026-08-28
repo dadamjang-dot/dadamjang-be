@@ -195,7 +195,7 @@ describe("catalog product batches", () => {
         isExpressDelivery: false,
         basePrice: 3000,
         finalPrice: 1000,
-        priceRevision: "product-a:1787961600000:1000",
+        priceRevision: "product-a:1787961600000:3000:1000",
         lowestPriceEvidenceSummary: "최저 옵션 기준 2,000원 차이",
       },
       {
@@ -206,7 +206,7 @@ describe("catalog product batches", () => {
         isExpressDelivery: true,
         basePrice: 2000,
         finalPrice: 2000,
-        priceRevision: "product-b:1787961600000:2000",
+        priceRevision: "product-b:1787961600000:2000:2000",
         lowestPriceEvidenceSummary: "현재 옵션 최저가 기준",
       },
     ]);
@@ -214,6 +214,27 @@ describe("catalog product batches", () => {
 });
 
 describe("catalog price evidence", () => {
+  it("changes the revision when the evidence base price changes", async () => {
+    const service = new CatalogService({} as never);
+    const getProduct = jest.spyOn(service, "getProduct");
+    const product = {
+      productId: "product-a",
+      title: "A",
+      imageUrls: [],
+      isOnSale: true,
+      isExpressDelivery: false,
+      createdAt: new Date("2026-08-29T00:00:00Z"),
+    };
+    getProduct
+      .mockResolvedValueOnce({ ...product, skus: [{ price: 1000 }, { price: 2000 }] } as never)
+      .mockResolvedValueOnce({ ...product, skus: [{ price: 1000 }, { price: 3000 }] } as never);
+
+    const before = await service.getProductPriceSummary("product-a");
+    const after = await service.getProductPriceSummary("product-a");
+
+    expect(after.priceRevision).not.toBe(before.priceRevision);
+  });
+
   it("rejects evidence for a stale price revision", async () => {
     const service = new CatalogService({} as never);
     jest.spyOn(service, "getProduct").mockResolvedValue({

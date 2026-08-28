@@ -487,7 +487,7 @@ export class CatalogService {
       isExpressDelivery: product.isExpressDelivery,
       basePrice,
       finalPrice,
-      priceRevision: `${product.productId}:${product.createdAt.getTime()}:${finalPrice}`,
+      priceRevision: `${product.productId}:${product.createdAt.getTime()}:${basePrice}:${finalPrice}`,
       lowestPriceEvidenceSummary:
         discountAmount > 0 ? `최저 옵션 기준 ${discountAmount.toLocaleString()}원 차이` : "현재 옵션 최저가 기준",
     };
