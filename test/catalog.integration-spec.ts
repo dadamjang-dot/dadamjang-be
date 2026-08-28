@@ -160,6 +160,45 @@ describe("catalog PostgreSQL integration", () => {
     expect(detail.body.data.product.imageUrls).toEqual([fullSizeUrl]);
   });
 
+  it("caps every public metadata array at 100 rows", async () => {
+    await pool.query(`
+      INSERT INTO categories ("categoryId", name, slug, "sortOrder")
+      SELECT gen_random_uuid(), 'Metadata Category ' || value, 'metadata-category-' || value, value
+      FROM generate_series(1, 101) value;
+      INSERT INTO brands ("brandId", name, slug)
+      SELECT gen_random_uuid(), 'Metadata Brand ' || value, 'metadata-brand-' || value
+      FROM generate_series(1, 101) value;
+      INSERT INTO colors ("colorId", name, slug)
+      SELECT gen_random_uuid(), 'Metadata Color ' || value, 'metadata-color-' || value
+      FROM generate_series(1, 101) value;
+      INSERT INTO sizes ("sizeId", name, slug, "sortOrder")
+      SELECT gen_random_uuid(), 'Metadata Size ' || value, 'metadata-size-' || value, value
+      FROM generate_series(1, 101) value;
+    `);
+
+    const response = await request(app.getHttpServer())
+      .post("/graphql")
+      .send({
+        query: `{
+          categories { categoryId }
+          catalogFilterOptions {
+            categories { categoryId }
+            brands { brandId }
+            colors { colorId }
+            sizes { sizeId }
+          }
+        }`,
+      })
+      .expect(200);
+
+    expect(response.body.errors).toBeUndefined();
+    expect(response.body.data.categories).toHaveLength(100);
+    expect(response.body.data.catalogFilterOptions.categories).toHaveLength(100);
+    expect(response.body.data.catalogFilterOptions.brands).toHaveLength(100);
+    expect(response.body.data.catalogFilterOptions.colors).toHaveLength(100);
+    expect(response.body.data.catalogFilterOptions.sizes).toHaveLength(100);
+  });
+
   it.each([
     ["RECOMMENDED", [CURSOR_PRODUCTS.second, CURSOR_PRODUCTS.first, CURSOR_PRODUCTS.third, CURSOR_PRODUCTS.fourth]],
     ["LATEST", [CURSOR_PRODUCTS.second, CURSOR_PRODUCTS.first, CURSOR_PRODUCTS.third, CURSOR_PRODUCTS.fourth]],

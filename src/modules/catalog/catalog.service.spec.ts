@@ -31,6 +31,41 @@ const catalogQuery = (rows: readonly unknown[]) => {
   return chain;
 };
 
+const metadataQuery = (rows: readonly unknown[]) => {
+  const result = Promise.resolve(rows);
+  const chain = {
+    from: jest.fn(),
+    where: jest.fn(),
+    orderBy: jest.fn(),
+    limit: jest.fn((limit: number) => Promise.resolve(rows.slice(0, limit))),
+    then: result.then.bind(result),
+  };
+  chain.from.mockReturnValue(chain);
+  chain.where.mockReturnValue(chain);
+  chain.orderBy.mockReturnValue(chain);
+  return chain;
+};
+
+describe("catalog metadata boundaries", () => {
+  it("applies a database limit of 100 to every public metadata array", async () => {
+    const rows = Array.from({ length: 101 }, (_, index) => ({ id: index }));
+    const queries = Array.from({ length: 5 }, () => metadataQuery(rows));
+    const select = jest.fn();
+    for (const query of queries) select.mockReturnValueOnce(query);
+    const service = new CatalogService({ select } as never, {} as never);
+
+    const categoryRows = await service.listCategories();
+    const filterRows = await service.listCatalogFilterOptions();
+
+    expect(categoryRows).toHaveLength(100);
+    expect(filterRows.categories).toHaveLength(100);
+    expect(filterRows.brands).toHaveLength(100);
+    expect(filterRows.colors).toHaveLength(100);
+    expect(filterRows.sizes).toHaveLength(100);
+    for (const query of queries) expect(query.limit).toHaveBeenCalledWith(100);
+  });
+});
+
 describe("catalog cursor", () => {
   it.each([
     {

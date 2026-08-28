@@ -51,6 +51,7 @@ const CURSOR_TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.(\d{6})Z
 const DATE_CURSOR_KEYS = ["v", "sort", "createdAt", "productId"];
 const METRIC_CURSOR_KEYS = [...DATE_CURSOR_KEYS, "sortValue"];
 const ANONYMOUS_RANKING_TIMEOUT = "5000ms";
+const MAX_LEGACY_COLLECTION_SIZE = 100;
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
@@ -115,7 +116,8 @@ export class CatalogService {
       .select()
       .from(categories)
       .where(eq(categories.isActive, true))
-      .orderBy(categories.sortOrder, categories.name);
+      .orderBy(asc(categories.sortOrder), asc(categories.name), asc(categories.categoryId))
+      .limit(MAX_LEGACY_COLLECTION_SIZE);
 
   listCatalogFilterOptions = async (): Promise<CatalogFilterOptionsType> => {
     const [categoryRows, brandRows, colorRows, sizeRows] = await Promise.all([
@@ -123,10 +125,26 @@ export class CatalogService {
         .select()
         .from(categories)
         .where(eq(categories.isActive, true))
-        .orderBy(asc(categories.sortOrder), asc(categories.name)),
-      this.db.select().from(brands).where(eq(brands.isActive, true)).orderBy(asc(brands.name)),
-      this.db.select().from(colors).where(eq(colors.isActive, true)).orderBy(asc(colors.name)),
-      this.db.select().from(sizes).where(eq(sizes.isActive, true)).orderBy(asc(sizes.sortOrder), asc(sizes.name)),
+        .orderBy(asc(categories.sortOrder), asc(categories.name), asc(categories.categoryId))
+        .limit(MAX_LEGACY_COLLECTION_SIZE),
+      this.db
+        .select()
+        .from(brands)
+        .where(eq(brands.isActive, true))
+        .orderBy(asc(brands.name), asc(brands.brandId))
+        .limit(MAX_LEGACY_COLLECTION_SIZE),
+      this.db
+        .select()
+        .from(colors)
+        .where(eq(colors.isActive, true))
+        .orderBy(asc(colors.name), asc(colors.colorId))
+        .limit(MAX_LEGACY_COLLECTION_SIZE),
+      this.db
+        .select()
+        .from(sizes)
+        .where(eq(sizes.isActive, true))
+        .orderBy(asc(sizes.sortOrder), asc(sizes.name), asc(sizes.sizeId))
+        .limit(MAX_LEGACY_COLLECTION_SIZE),
     ]);
     return {
       categories: categoryRows,
