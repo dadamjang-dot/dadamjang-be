@@ -386,6 +386,95 @@ describe("FO account recovery GraphQL integration", () => {
     expect(unknown.body.data).toEqual({ requestPasswordResetCode: { ok: true } });
   });
 
+  it("admits only one concurrent recovery code request for one normalized email window", async () => {
+    const mutation = `mutation RequestPasswordResetCode($input: RequestEmailCodeInput!) { requestPasswordResetCode(input: $input) { ok } }`;
+    const responses = await Promise.all(
+      [
+        " integration@example.test ",
+        "INTEGRATION@example.test",
+        "integration@EXAMPLE.test",
+        "Integration@example.test",
+        "integration@example.TEST",
+        "integration@example.test",
+      ].map((email) =>
+        request(app.getHttpServer())
+          .post("/graphql")
+          .set("x-device-id", "recovery-rate-device")
+          .send({ query: mutation, variables: { input: { email } } }),
+      ),
+    );
+    const successes = responses.filter((response) => response.body.data?.requestPasswordResetCode?.ok === true);
+    const limited = responses.filter((response) => response.body.errors?.[0]?.extensions?.code === "TOO_MANY_REQUESTS");
+
+    expect(successes).toHaveLength(1);
+    expect(limited).toHaveLength(5);
+    const scopes = await pool.query<{ scopeType: string; requestCount: number }>(
+      `SELECT "scopeType", "requestCount"
+       FROM "requestAdmission"
+       WHERE "action" = 'EMAIL_DELIVERY'
+       ORDER BY "scopeType"`,
+    );
+    expect(scopes.rows).toEqual([
+      { scopeType: "delivery-device", requestCount: 1 },
+      { scopeType: "delivery-email", requestCount: 1 },
+      { scopeType: "delivery-ip", requestCount: 1 },
+      { scopeType: "email-cooldown", requestCount: 1 },
+    ]);
+  }, 15_000);
+
+  it("starts a new recovery admission window after the prior window expires", async () => {
+    const mutation = `mutation RequestPasswordResetCode($input: RequestEmailCodeInput!) { requestPasswordResetCode(input: $input) { ok } }`;
+    const requestCode = () =>
+      request(app.getHttpServer())
+        .post("/graphql")
+        .set("x-device-id", "window-device")
+        .send({ query: mutation, variables: { input: { email: "integration@example.test" } } });
+
+    const first = await requestCode();
+    await pool.query(`UPDATE "requestAdmission" SET "expiresAt" = '2000-01-01T00:00:00Z'`);
+    const nextWindow = await requestCode();
+
+    expect(first.body).toEqual({ data: { requestPasswordResetCode: { ok: true } } });
+    expect(nextWindow.body).toEqual({ data: { requestPasswordResetCode: { ok: true } } });
+  });
+
+  it("preserves the recovery code cooldown response", async () => {
+    const mutation = `mutation RequestPasswordResetCode($input: RequestEmailCodeInput!) { requestPasswordResetCode(input: $input) { ok } }`;
+    const requestCode = () =>
+      request(app.getHttpServer())
+        .post("/graphql")
+        .send({ query: mutation, variables: { input: { email: "integration@example.test" } } });
+
+    const first = await requestCode();
+    const repeated = await requestCode();
+
+    expect(first.body).toEqual({ data: { requestPasswordResetCode: { ok: true } } });
+    expect(repeated.body).toEqual({
+      errors: [
+        expect.objectContaining({
+          message: EmailErrorMessage.CodeRetryTooSoon,
+          extensions: expect.objectContaining({ code: "TOO_MANY_REQUESTS" }),
+        }),
+      ],
+      data: null,
+    });
+  });
+
+  it("returns the same password reset link response for known and unknown emails", async () => {
+    const mutation = `mutation RequestPasswordReset($input: RequestPasswordResetInput!) { requestPasswordReset(input: $input) { ok } }`;
+    const known = await request(app.getHttpServer())
+      .post("/graphql")
+      .set("x-device-id", "known-link-device")
+      .send({ query: mutation, variables: { input: { email: "integration@example.test" } } });
+    const unknown = await request(app.getHttpServer())
+      .post("/graphql")
+      .set("x-device-id", "unknown-link-device")
+      .send({ query: mutation, variables: { input: { email: "unknown@example.test" } } });
+
+    expect(known.body).toEqual({ data: { requestPasswordReset: { ok: true } } });
+    expect(unknown.body).toEqual({ data: { requestPasswordReset: { ok: true } } });
+  });
+
   it("binds identity completion to the starting device and permits completion once", async () => {
     const deviceId = "identity-device";
     const started = await request(app.getHttpServer())

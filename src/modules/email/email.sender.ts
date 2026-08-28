@@ -29,19 +29,29 @@ export class ResendEmailSender implements EmailSender {
   sendLink = async (email: string, subject: string, url: string) =>
     this.send(email, subject, `<p><a href="${url}">계속하기</a></p>`);
   private send = async (to: string, subject: string, html: string) => {
-    const response = await fetch("https://api.resend.com/emails", {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${this.configService.getOrThrow<string>("RESEND_API_KEY").trim()}`,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({
-        from: this.configService.getOrThrow<string>("RESEND_FROM_EMAIL").trim(),
-        to: [to],
-        subject,
-        html,
-      }),
-    });
+    let response: Response;
+    try {
+      response = await fetch("https://api.resend.com/emails", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${this.configService.getOrThrow<string>("RESEND_API_KEY").trim()}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          from: this.configService.getOrThrow<string>("RESEND_FROM_EMAIL").trim(),
+          to: [to],
+          subject,
+          html,
+        }),
+        signal: AbortSignal.timeout(10_000),
+      });
+    } catch (error) {
+      if (error instanceof Error && error.name === "TimeoutError") {
+        const timeoutError = Object.assign(new Error("Resend request timed out"), { cause: error });
+        throw timeoutError;
+      }
+      throw error;
+    }
     if (!response.ok) throw new Error(`Resend failed: ${response.status}`);
   };
 }

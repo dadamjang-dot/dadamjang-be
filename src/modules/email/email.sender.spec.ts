@@ -44,4 +44,24 @@ describe("ResendEmailSender", () => {
       send.mockRestore();
     }
   });
+
+  it("bounds Resend delivery time and maps timeout failures", async () => {
+    const timeoutSignal = new AbortController().signal;
+    const timeout = jest.spyOn(AbortSignal, "timeout").mockReturnValue(timeoutSignal);
+    const timeoutError = new Error("request aborted");
+    timeoutError.name = "TimeoutError";
+    const send = jest.spyOn(global, "fetch").mockRejectedValue(timeoutError);
+    const sender = new ResendEmailSender({
+      getOrThrow: jest.fn((key: string) => (key === "RESEND_API_KEY" ? "resend-api-key" : "sender@example.test")),
+    } as unknown as ConfigService);
+
+    try {
+      await expect(sender.sendCode("recipient@example.test", "123456")).rejects.toThrow("Resend request timed out");
+      expect(timeout).toHaveBeenCalledWith(10_000);
+      expect(send.mock.calls[0]?.[1]?.signal).toBe(timeoutSignal);
+    } finally {
+      send.mockRestore();
+      timeout.mockRestore();
+    }
+  });
 });

@@ -1,10 +1,12 @@
 import { sql } from "drizzle-orm";
 import {
   boolean,
+  check,
   index,
   integer,
   jsonb,
   pgTable,
+  primaryKey,
   text,
   timestamp,
   unique,
@@ -87,6 +89,27 @@ export const passwordResetTokens = pgTable("passwordResetToken", {
   requestIpHash: text("requestIpHash"),
   createdAt: timestamp("createdAt").defaultNow().notNull(),
 });
+
+export const requestAdmissions = pgTable(
+  "requestAdmission",
+  {
+    action: varchar("action", { length: 80 }).notNull(),
+    scopeType: varchar("scopeType", { length: 40 }).notNull(),
+    scopeHash: varchar("scopeHash", { length: 64 }).notNull(),
+    requestCount: integer("requestCount").notNull().default(1),
+    windowStartedAt: timestamp("windowStartedAt", { withTimezone: true }).notNull(),
+    expiresAt: timestamp("expiresAt", { withTimezone: true }).notNull(),
+    updatedAt: timestamp("updatedAt", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    primaryKey({
+      columns: [table.action, table.scopeType, table.scopeHash],
+      name: "request_admission_scope_pk",
+    }),
+    check("request_admission_count_positive", sql`${table.requestCount} > 0`),
+    index("request_admission_expires_idx").on(table.expiresAt),
+  ],
+);
 
 export const kakaoSignupTokens = pgTable("kakaoSignupToken", {
   tokenHash: text("tokenHash").primaryKey(),

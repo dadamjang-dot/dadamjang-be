@@ -1,11 +1,13 @@
 import { Module } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
+import { AdmissionModule } from "src/modules/admission/admission.module";
 import { EmailRepository } from "./email.repository";
 import { DevEmailSender, ResendEmailSender } from "./email.sender";
 import { EmailResolver } from "./email.resolver";
 import { EmailService } from "./email.service";
 
 @Module({
+  imports: [AdmissionModule],
   providers: [
     EmailResolver,
     EmailService,

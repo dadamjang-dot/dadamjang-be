@@ -1,5 +1,5 @@
 import { Inject, Injectable } from "@nestjs/common";
-import { and, desc, eq, gte, gt, isNull, sql } from "drizzle-orm";
+import { and, desc, eq, gt, isNull, sql } from "drizzle-orm";
 import { requireResult } from "src/common/invariants/require-result";
 import { hashToken } from "src/common/security/token-hash";
 import { Database, DRIZZLE } from "src/modules/database/database.module";
@@ -34,16 +34,6 @@ export class EmailRepository {
       where: and(eq(emailVerifications.email, email), eq(emailVerifications.purpose, purpose)),
       orderBy: desc(emailVerifications.createdAt),
     });
-  verificationsSince = (email: string, since: Date) =>
-    this.db
-      .select()
-      .from(emailVerifications)
-      .where(and(eq(emailVerifications.email, email), gte(emailVerifications.createdAt, since)));
-  ipVerificationsSince = (requestIpHash: string, since: Date) =>
-    this.db
-      .select()
-      .from(emailVerifications)
-      .where(and(eq(emailVerifications.requestIpHash, requestIpHash), gte(emailVerifications.createdAt, since)));
   incrementAttempt = async (id: string) => {
     const [result] = await this.db
       .update(emailVerifications)
@@ -88,8 +78,40 @@ export class EmailRepository {
         .returning()
     )[0];
   findUserByEmail = (email: string) => this.db.query.users.findFirst({ where: eq(users.email, email) });
+  hasValidRecoveryToken = async (token: string) => {
+    const tokenHash = hashToken(token);
+    const now = new Date();
+    const [linkProof] = await this.db
+      .select({ tokenHash: passwordResetTokens.tokenHash })
+      .from(passwordResetTokens)
+      .where(
+        and(
+          eq(passwordResetTokens.tokenHash, tokenHash),
+          isNull(passwordResetTokens.usedAt),
+          gt(passwordResetTokens.expiresAt, now),
+        ),
+      )
+      .limit(1);
+    if (linkProof) return true;
+    const [emailProof] = await this.db
+      .select({ tokenHash: emailVerificationTokens.tokenHash })
+      .from(emailVerificationTokens)
+      .where(
+        and(
+          eq(emailVerificationTokens.tokenHash, tokenHash),
+          eq(emailVerificationTokens.purpose, "PASSWORD_RESET"),
+          isNull(emailVerificationTokens.usedAt),
+          gt(emailVerificationTokens.expiresAt, now),
+        ),
+      )
+      .limit(1);
+    return !!emailProof;
+  };
   createPasswordResetToken = async (token: string, userId: string, expiresAt: Date, requestIpHash: string) => {
     await this.db.insert(passwordResetTokens).values({ tokenHash: hashToken(token), userId, expiresAt, requestIpHash });
+  };
+  deletePasswordResetToken = async (token: string) => {
+    await this.db.delete(passwordResetTokens).where(eq(passwordResetTokens.tokenHash, hashToken(token)));
   };
   resetPasswordWithToken = (token: string, password: string) =>
     this.db.transaction(async (tx) => {
