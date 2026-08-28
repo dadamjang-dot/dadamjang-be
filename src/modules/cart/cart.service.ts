@@ -4,6 +4,7 @@ import { CustomBadRequestException, CustomNotFoundException } from "src/common/e
 import { Database, DRIZZLE } from "src/modules/database/database.module";
 import { activityEvents, brands, cartItems, carts, productSkus, products } from "src/modules/database/schema";
 import { CartErrorMessage, getInsufficientStockMessage } from "./cart.error";
+import { assertCartItemCount, calculateCartTotal, MAX_CART_ITEMS } from "./cart-invariants";
 import { CartType, UpsertCartItemInput } from "./cart.types";
 
 @Injectable()
@@ -18,7 +19,9 @@ export class CartService {
       .innerJoin(productSkus, eq(cartItems.skuId, productSkus.skuId))
       .innerJoin(products, eq(productSkus.productId, products.productId))
       .leftJoin(brands, eq(products.brandId, brands.brandId))
-      .where(eq(cartItems.cartId, cart.cartId));
+      .where(eq(cartItems.cartId, cart.cartId))
+      .limit(MAX_CART_ITEMS + 1);
+    assertCartItemCount(rows.length);
     const items = rows.map(({ brands: brand, cartItems: item, productSkus: sku, products: product }) => ({
       ...item,
       sku,
@@ -31,7 +34,7 @@ export class CartService {
     return {
       cartId: cart.cartId,
       items,
-      totalAmount: items.reduce((sum, item) => sum + item.sku.price * item.quantity, 0),
+      totalAmount: calculateCartTotal(items.map((item) => ({ price: item.sku.price, quantity: item.quantity }))),
     };
   };
 
@@ -49,6 +52,22 @@ export class CartService {
       throw new CustomBadRequestException(getInsufficientStockMessage(row.productSkus.code));
     await this.db.transaction(async (tx) => {
       const cart = await this.getOrCreateLockedCart(tx, userId);
+      const currentItems = await tx
+        .select({ skuId: cartItems.skuId, quantity: cartItems.quantity, price: productSkus.price })
+        .from(cartItems)
+        .innerJoin(productSkus, eq(cartItems.skuId, productSkus.skuId))
+        .where(eq(cartItems.cartId, cart.cartId))
+        .limit(MAX_CART_ITEMS + 1);
+      assertCartItemCount(currentItems.length);
+      const existingItem = currentItems.find((item) => item.skuId === input.skuId);
+      if (!existingItem) assertCartItemCount(currentItems.length + 1);
+      calculateCartTotal(
+        existingItem
+          ? currentItems.map((item) =>
+              item.skuId === input.skuId ? { price: item.price, quantity: input.quantity } : item,
+            )
+          : [...currentItems, { price: row.productSkus.price, quantity: input.quantity }],
+      );
       await tx
         .insert(cartItems)
         .values({ cartId: cart.cartId, skuId: input.skuId, quantity: input.quantity })

@@ -2,6 +2,7 @@ import { Inject, Injectable } from "@nestjs/common";
 import { and, desc, eq, inArray } from "drizzle-orm";
 import { CustomBadRequestException, CustomNotFoundException } from "src/common/errors/custom-exceptions";
 import { requireResult } from "src/common/invariants/require-result";
+import { assertCartItemCount, calculateCartTotal, MAX_CART_ITEMS } from "src/modules/cart/cart-invariants";
 import { OrderErrorMessage, getInsufficientStockMessage } from "./order.error";
 import { Database, DRIZZLE } from "src/modules/database/database.module";
 import {
@@ -59,14 +60,18 @@ export class OrderService {
         .from(cartItems)
         .innerJoin(productSkus, eq(cartItems.skuId, productSkus.skuId))
         .innerJoin(products, eq(productSkus.productId, products.productId))
-        .where(eq(cartItems.cartId, cart.cartId));
+        .where(eq(cartItems.cartId, cart.cartId))
+        .limit(MAX_CART_ITEMS + 1);
+      assertCartItemCount(rows.length);
       if (rows.length === 0) throw new CustomBadRequestException(OrderErrorMessage.CartEmpty);
       if (rows.some(({ productSkus: sku, products: product }) => !sku.isActive || product.status !== "PUBLISHED"))
         throw new CustomBadRequestException(OrderErrorMessage.CartContainsUnavailableItem);
       const insufficientStock = rows.find(({ cartItems: item, productSkus: sku }) => sku.stock < item.quantity);
       if (insufficientStock)
         throw new CustomBadRequestException(getInsufficientStockMessage(insufficientStock.productSkus.code));
-      const totalAmount = rows.reduce((sum, row) => sum + row.productSkus.price * row.cartItems.quantity, 0);
+      const totalAmount = calculateCartTotal(
+        rows.map(({ cartItems: item, productSkus: sku }) => ({ price: sku.price, quantity: item.quantity })),
+      );
       const order = requireResult(
         (await tx.insert(orders).values({ orderNumber: orderNumber(), userId, totalAmount }).returning())[0],
       );
