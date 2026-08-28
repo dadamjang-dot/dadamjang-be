@@ -1,6 +1,10 @@
 import { Inject, Injectable } from "@nestjs/common";
 import { SQL, and, asc, desc, eq, getTableColumns, gte, ilike, inArray, lte, or, sql } from "drizzle-orm";
-import { CustomBadRequestException, CustomNotFoundException } from "src/common/errors/custom-exceptions";
+import {
+  CustomBadRequestException,
+  CustomConflictException,
+  CustomNotFoundException,
+} from "src/common/errors/custom-exceptions";
 import { requireResult } from "src/common/invariants/require-result";
 import { Database, DRIZZLE } from "src/modules/database/database.module";
 import { brands, categories, colors, productSkus, products, sizes } from "src/modules/database/schema";
@@ -164,10 +168,11 @@ export class CatalogService {
   getProductPriceEvidence = async (productId: string, priceRevision?: string): Promise<ProductPriceEvidenceType> => {
     const product = await this.getProduct(productId);
     const summary = this.toPriceSummary(product);
-    const revision = priceRevision ?? summary.priceRevision;
+    if (priceRevision && priceRevision !== summary.priceRevision)
+      throw new CustomConflictException(CatalogErrorMessage.PriceRevisionChanged);
     return {
       productId: product.productId,
-      priceRevision: revision,
+      priceRevision: summary.priceRevision,
       priceHistory: [
         {
           label: "기준가",

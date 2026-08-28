@@ -212,3 +212,22 @@ describe("catalog product batches", () => {
     ]);
   });
 });
+
+describe("catalog price evidence", () => {
+  it("rejects evidence for a stale price revision", async () => {
+    const service = new CatalogService({} as never);
+    jest.spyOn(service, "getProduct").mockResolvedValue({
+      productId: "product-a",
+      title: "A",
+      imageUrls: [],
+      isOnSale: true,
+      isExpressDelivery: false,
+      skus: [{ price: 1000 }],
+      createdAt: new Date("2026-08-29T00:00:00Z"),
+    } as never);
+
+    await expect(service.getProductPriceEvidence("product-a", "stale-revision")).rejects.toThrow(
+      "Product price has changed",
+    );
+  });
+});
