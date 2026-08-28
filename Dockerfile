@@ -17,4 +17,5 @@ RUN pnpm install --prod --frozen-lockfile
 COPY --from=build /app/dist ./dist
 COPY --from=build /tmp/aws-rds-global-bundle.pem /etc/ssl/certs/aws-rds-global-bundle.pem
 COPY migrations ./migrations
+COPY retired-migrations ./retired-migrations
 CMD ["pnpm", "start:prod"]

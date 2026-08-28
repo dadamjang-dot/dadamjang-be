@@ -40,28 +40,48 @@ export const migrate = async ({
         "appliedAt" timestamp NOT NULL DEFAULT now()
       )
     `);
-    const migrationsDir = path.join(process.cwd(), "migrations");
-    const files = (await fs.readdir(migrationsDir)).filter((file) => file.endsWith(".sql")).sort();
-    for (const file of files) {
-      const migrationSql = await fs.readFile(path.join(migrationsDir, file), "utf8");
+    const migrations = (
+      await Promise.all(
+        [
+          { directory: path.join(process.cwd(), "migrations"), retired: false },
+          { directory: path.join(process.cwd(), "retired-migrations"), retired: true },
+        ].map(async ({ directory, retired }) =>
+          (await fs.readdir(directory))
+            .filter((name) => name.endsWith(".sql"))
+            .map((name) => ({ directory, name, retired })),
+        ),
+      )
+    )
+      .flat()
+      .sort((left, right) => left.name.localeCompare(right.name));
+    for (let index = 1; index < migrations.length; index += 1) {
+      if (migrations[index - 1]?.name === migrations[index]?.name)
+        throw new Error(`duplicate migration: ${migrations[index]?.name}`);
+    }
+    for (const { directory, name, retired } of migrations) {
+      const migrationSql = await fs.readFile(path.join(directory, name), "utf8");
       const checksum = sha256(migrationSql);
       const applied = await client.query<{ checksum: string }>(
         'SELECT "checksum" FROM "_migrations" WHERE "name" = $1',
-        [file],
+        [name],
       );
       if (applied.rowCount) {
-        if (applied.rows[0]?.checksum !== checksum) throw new Error(`migration checksum changed: ${file}`);
+        if (applied.rows[0]?.checksum !== checksum) throw new Error(`migration checksum changed: ${name}`);
         continue;
       }
-      await beforeMigration?.(file, pool);
+      if (retired) {
+        await client.query('INSERT INTO "_migrations" ("name", "checksum") VALUES ($1, $2)', [name, checksum]);
+        continue;
+      }
+      await beforeMigration?.(name, pool);
       await client.query("BEGIN");
       try {
         await client.query(`SELECT set_config('lock_timeout', $1, true)`, [`${lockTimeoutMs}ms`]);
         await client.query(`SELECT set_config('statement_timeout', $1, true)`, [`${statementTimeoutMs}ms`]);
         await client.query(migrationSql);
-        await client.query('INSERT INTO "_migrations" ("name", "checksum") VALUES ($1, $2)', [file, checksum]);
+        await client.query('INSERT INTO "_migrations" ("name", "checksum") VALUES ($1, $2)', [name, checksum]);
         await client.query("COMMIT");
-        process.stdout.write(`applied ${file}\n`);
+        process.stdout.write(`applied ${name}\n`);
       } catch (error) {
         await client.query("ROLLBACK");
         throw error;
