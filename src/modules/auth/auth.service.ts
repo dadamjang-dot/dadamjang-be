@@ -2,7 +2,9 @@ import { Injectable } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { JwtService, JwtSignOptions } from "@nestjs/jwt";
 import * as bcrypt from "bcrypt";
+import { randomUUID, timingSafeEqual } from "crypto";
 import { CustomUnauthorizedException } from "src/common/errors/custom-exceptions";
+import { hashToken } from "src/common/security/token-hash";
 import { EmailService } from "src/modules/email/email.service";
 import { User } from "src/modules/database/schema";
 import { AuthErrorMessage } from "./auth.error";
@@ -11,6 +13,12 @@ import { AuthPortal, SigninAuthInput } from "./auth.types";
 import { UserRole, type UserRoleValue } from "src/auth/role";
 
 type JwtExpiration = Exclude<JwtSignOptions["expiresIn"], undefined>;
+
+const matchesRefreshToken = async (token: string, saved: string) => {
+  if (saved.startsWith("$2")) return bcrypt.compare(token, saved);
+  const digest = hashToken(token);
+  return saved.length === digest.length && timingSafeEqual(Buffer.from(saved), Buffer.from(digest));
+};
 
 @Injectable()
 export class AuthService {
@@ -32,23 +40,45 @@ export class AuthService {
     if (
       !saved ||
       saved.refreshTokenExp.getTime() <= Date.now() ||
-      !(await bcrypt.compare(refreshToken, saved.refreshToken))
+      !(await matchesRefreshToken(refreshToken, saved.refreshToken))
     )
       throw new CustomUnauthorizedException(AuthErrorMessage.AuthRequired);
     const user = await this.repository.findUser(userId);
     if (!user) throw new CustomUnauthorizedException(AuthErrorMessage.AuthRequired);
-    return this.issueTokensForUser(user, deviceId);
+    const tokens = await this.createTokensForUser(user, deviceId);
+    const rotated = await this.repository.rotateRefreshToken({
+      userId,
+      deviceId,
+      previousRefreshToken: saved.refreshToken,
+      refreshToken: tokens.refreshTokenHash,
+      refreshTokenExp: tokens.refreshTokenExp,
+    });
+    if (!rotated) throw new CustomUnauthorizedException(AuthErrorMessage.AuthRequired);
+    return tokens.payload;
   };
-  logout = async (userId: string, deviceId: string) => {
-    await this.repository.deleteRefreshToken(userId, deviceId);
-    return true;
-  };
-  compareUserRefreshToken = async (userId: string, deviceId: string, token: string) => {
+  logout = async (userId: string, deviceId: string, refreshToken: string) => {
     const saved = await this.repository.findRefreshToken(userId, deviceId);
-    return !!saved && saved.refreshTokenExp.getTime() > Date.now() && bcrypt.compare(token, saved.refreshToken);
+    if (
+      !saved ||
+      saved.refreshTokenExp.getTime() <= Date.now() ||
+      !(await matchesRefreshToken(refreshToken, saved.refreshToken)) ||
+      !(await this.repository.deleteRefreshToken(userId, deviceId, saved.refreshToken))
+    )
+      throw new CustomUnauthorizedException(AuthErrorMessage.AuthRequired);
+    return true;
   };
   getViewer = async (userId: string) => this.repository.findUser(userId);
   issueTokensForUser = async (user: User, deviceId: string) => {
+    const tokens = await this.createTokensForUser(user, deviceId);
+    await this.repository.saveRefreshToken({
+      userId: user.userId,
+      deviceId,
+      refreshToken: tokens.refreshTokenHash,
+      refreshTokenExp: tokens.refreshTokenExp,
+    });
+    return tokens.payload;
+  };
+  private createTokensForUser = async (user: User, deviceId: string) => {
     const role = (user as User & { role?: UserRoleValue }).role ?? UserRole.User;
     const accessToken = await this.jwtService.signAsync(
       { userId: user.userId, role },
@@ -58,7 +88,7 @@ export class AuthService {
       },
     );
     const refreshToken = await this.jwtService.signAsync(
-      { userId: user.userId, role, deviceId },
+      { userId: user.userId, role, deviceId, jti: randomUUID() },
       {
         secret: this.configService.getOrThrow<string>("JWT_REFRESH_TOKEN_SECRET"),
         expiresIn: this.configService.getOrThrow<string>("JWT_REFRESH_TOKEN_EXP") as JwtExpiration,
@@ -66,13 +96,11 @@ export class AuthService {
     );
     const decoded = this.jwtService.decode(refreshToken) as { exp?: number } | null;
     if (!decoded?.exp) throw new CustomUnauthorizedException(AuthErrorMessage.RefreshTokenExpUndefined);
-    await this.repository.saveRefreshToken({
-      userId: user.userId,
-      deviceId,
-      refreshToken: await bcrypt.hash(refreshToken, 10),
+    return {
+      payload: { accessToken, refreshToken, role },
+      refreshTokenHash: hashToken(refreshToken),
       refreshTokenExp: new Date(decoded.exp * 1000),
-    });
-    return { accessToken, refreshToken, role };
+    };
   };
   private assertPortalRole = (role: UserRoleValue, portal: AuthPortal) => {
     const allowed =

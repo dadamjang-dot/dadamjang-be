@@ -94,6 +94,44 @@ describe("FO auth GraphQL integration", () => {
     expect(rejected.body.errors[0].message).toBe("이메일 또는 비밀번호가 올바르지 않습니다.");
   });
 
+  it("rotates a refresh token exactly once under concurrent requests", async () => {
+    const deviceId = "fo-refresh-device";
+    const signedIn = await request(app.getHttpServer())
+      .post("/graphql")
+      .set("x-device-id", deviceId)
+      .send({
+        query: `mutation SigninFo($input: SigninFoInput!) { signinFo(input: $input) { refreshToken } }`,
+        variables: { input: { email: "integration@example.test", password: "IntegrationPassword123!" } },
+      });
+    const refreshToken = signedIn.body.data.signinFo.refreshToken as string;
+    const refresh = () =>
+      request(app.getHttpServer())
+        .post("/graphql")
+        .set("authorization", `Bearer ${refreshToken}`)
+        .send({ query: `mutation Refresh { refresh { refreshToken } }` });
+
+    const responses = await Promise.all([refresh(), refresh()]);
+    const succeeded = responses.filter(({ body }) => body.errors === undefined);
+    const rejected = responses.filter(({ body }) => body.errors !== undefined);
+
+    expect(succeeded).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    const currentRefreshToken = succeeded[0]?.body.data.refresh.refreshToken as string;
+    expect(currentRefreshToken).not.toBe(refreshToken);
+
+    const staleLogout = await request(app.getHttpServer())
+      .post("/graphql")
+      .set("authorization", `Bearer ${refreshToken}`)
+      .send({ query: `mutation Logout { logout }` });
+    expect(staleLogout.body.errors[0].message).toBe("아이디 또는 비밀번호가 올바르지 않습니다.");
+
+    const currentRefresh = await request(app.getHttpServer())
+      .post("/graphql")
+      .set("authorization", `Bearer ${currentRefreshToken}`)
+      .send({ query: `mutation Refresh { refresh { refreshToken } }` });
+    expect(currentRefresh.body.errors).toBeUndefined();
+  });
+
   it("returns active versioned signup consent documents", async () => {
     await pool.query(
       `INSERT INTO "consentDocuments" ("type", "title", "body", "version", "required", "activeFrom")
@@ -172,23 +210,22 @@ describe("FO auth GraphQL integration", () => {
         emailVerificationRequired
       }
     }`;
-    const completed = await request(app.getHttpServer())
-      .post("/graphql")
-      .set("x-device-id", deviceId)
-      .send({ query: mutation, variables: { input: { flowId } } });
-    expect(completed.body.errors).toBeUndefined();
-    expect(completed.body.data.completeKakaoLogin).toMatchObject({
+    const complete = () =>
+      request(app.getHttpServer())
+        .post("/graphql")
+        .set("x-device-id", deviceId)
+        .send({ query: mutation, variables: { input: { flowId } } });
+    const responses = await Promise.all([complete(), complete()]);
+    const completed = responses.find(({ body }) => body.errors === undefined);
+    const rejected = responses.find(({ body }) => body.errors !== undefined);
+
+    expect(completed?.body.data.completeKakaoLogin).toMatchObject({
       status: "SIGNED_IN",
       kakaoSignupToken: null,
       emailVerificationRequired: false,
       tokenPayload: { role: "USER" },
     });
-
-    const reused = await request(app.getHttpServer())
-      .post("/graphql")
-      .set("x-device-id", deviceId)
-      .send({ query: mutation, variables: { input: { flowId } } });
-    expect(reused.body.errors[0].message).toBe("카카오 로그인 흐름이 유효하지 않습니다.");
+    expect(rejected?.body.errors[0].message).toBe("카카오 로그인 흐름이 유효하지 않습니다.");
   });
 
   it("binds a Kakao signup flow to its device and reports email fallback", async () => {
@@ -248,26 +285,31 @@ describe("FO auth GraphQL integration", () => {
       [hashToken("kakao-signup-proof"), hashToken(deviceId)],
     );
 
-    const response = await request(app.getHttpServer())
-      .post("/graphql")
-      .set("x-device-id", deviceId)
-      .send({
-        query: `mutation CompleteKakaoSignupFo($input: CompleteKakaoSignupFoInput!) {
+    const complete = () =>
+      request(app.getHttpServer())
+        .post("/graphql")
+        .set("x-device-id", deviceId)
+        .send({
+          query: `mutation CompleteKakaoSignupFo($input: CompleteKakaoSignupFoInput!) {
           completeKakaoSignupFo(input: $input) { accessToken role }
         }`,
-        variables: {
-          input: {
-            kakaoSignupToken: "kakao-signup-proof",
-            identityVerificationToken: "kakao-identity-proof",
-            consents: Object.values(documentIds).map((documentId) => ({
-              documentId,
-              agreed: documentId !== documentIds.marketing,
-            })),
+          variables: {
+            input: {
+              kakaoSignupToken: "kakao-signup-proof",
+              identityVerificationToken: "kakao-identity-proof",
+              consents: Object.values(documentIds).map((documentId) => ({
+                documentId,
+                agreed: documentId !== documentIds.marketing,
+              })),
+            },
           },
-        },
-      });
-    expect(response.body.errors).toBeUndefined();
-    expect(response.body.data.completeKakaoSignupFo.role).toBe("USER");
+        });
+    const responses = await Promise.all([complete(), complete()]);
+    const completed = responses.find(({ body }) => body.errors === undefined);
+    const rejected = responses.find(({ body }) => body.errors !== undefined);
+
+    expect(completed?.body.data.completeKakaoSignupFo.role).toBe("USER");
+    expect(rejected?.body.errors[0].message).toBe("카카오 가입 인증이 유효하지 않습니다.");
     const linked = await pool.query<{ userId: string }>(
       `SELECT "userId" FROM "authIdentity" WHERE "provider" = 'kakao' AND "providerUserId" = 'kakao-ci-link'`,
     );

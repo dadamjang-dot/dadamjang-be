@@ -44,10 +44,17 @@ describe("AuthService", () => {
     await expect(invalid.refresh("user-1", "device", "token")).rejects.toThrow(AuthErrorMessage.AuthRequired);
   });
 
-  it("deletes the device refresh token on logout", async () => {
-    const deleteRefreshToken = jest.fn().mockResolvedValue(undefined);
-    const service = createService({ deleteRefreshToken });
-    await expect(service.logout("user-1", "device")).resolves.toBe(true);
-    expect(deleteRefreshToken).toHaveBeenCalledWith("user-1", "device");
+  it("deletes the current device refresh token on logout", async () => {
+    const refreshToken = "current-token";
+    const refreshTokenHash = await bcrypt.hash(refreshToken, 4);
+    const deleteRefreshToken = jest.fn().mockResolvedValue(true);
+    const service = createService({
+      deleteRefreshToken,
+      findRefreshToken: jest
+        .fn()
+        .mockResolvedValue({ refreshToken: refreshTokenHash, refreshTokenExp: new Date(Date.now() + 60_000) }),
+    });
+    await expect(service.logout("user-1", "device", refreshToken)).resolves.toBe(true);
+    expect(deleteRefreshToken).toHaveBeenCalledWith("user-1", "device", refreshTokenHash);
   });
 });

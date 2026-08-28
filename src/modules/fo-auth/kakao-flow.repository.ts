@@ -68,22 +68,23 @@ export class KakaoFlowRepository {
 
   completeLoginFlow = (flowId: string, deviceIdHash: string, signupToken: string) =>
     this.db.transaction(async (tx) => {
-      const flow = await tx.query.kakaoLoginFlows.findFirst({
-        where: and(
-          eq(kakaoLoginFlows.flowId, flowId),
-          eq(kakaoLoginFlows.deviceIdHash, deviceIdHash),
-          isNull(kakaoLoginFlows.consumedAt),
-          gt(kakaoLoginFlows.expiresAt, new Date()),
-        ),
-      });
+      const now = new Date();
+      const [flow] = await tx
+        .update(kakaoLoginFlows)
+        .set({ consumedAt: now, updatedAt: now })
+        .where(
+          and(
+            eq(kakaoLoginFlows.flowId, flowId),
+            eq(kakaoLoginFlows.deviceIdHash, deviceIdHash),
+            isNull(kakaoLoginFlows.consumedAt),
+            gt(kakaoLoginFlows.expiresAt, now),
+          ),
+        )
+        .returning();
       if (!flow?.providerUserId) throw new InvalidFoAuthProofError();
       if (flow.status === "EXISTING_USER" && flow.userId) {
         const user = await tx.query.users.findFirst({ where: eq(users.userId, flow.userId) });
         if (!user) throw new InvalidFoAuthProofError();
-        await tx
-          .update(kakaoLoginFlows)
-          .set({ consumedAt: new Date(), updatedAt: new Date() })
-          .where(eq(kakaoLoginFlows.flowId, flowId));
         return { kind: "existing" as const, user };
       }
       if (flow.status !== "SIGNUP_REQUIRED") throw new InvalidFoAuthProofError();
@@ -95,10 +96,6 @@ export class KakaoFlowRepository {
         deviceIdHash,
         expiresAt: new Date(Date.now() + 15 * 60 * 1000),
       });
-      await tx
-        .update(kakaoLoginFlows)
-        .set({ consumedAt: new Date(), updatedAt: new Date() })
-        .where(eq(kakaoLoginFlows.flowId, flowId));
       return {
         kind: "signup" as const,
         email: flow.email ?? undefined,
@@ -108,40 +105,55 @@ export class KakaoFlowRepository {
 
   completeSignup = (input: KakaoSignupInput) =>
     this.db.transaction(async (tx) => {
-      const signup = await tx.query.kakaoSignupTokens.findFirst({
-        where: and(
-          eq(kakaoSignupTokens.tokenHash, hashToken(input.kakaoSignupToken)),
-          eq(kakaoSignupTokens.deviceIdHash, input.deviceIdHash),
-          isNull(kakaoSignupTokens.usedAt),
-          gt(kakaoSignupTokens.expiresAt, new Date()),
-        ),
-      });
+      const now = new Date();
+      const [signup] = await tx
+        .update(kakaoSignupTokens)
+        .set({ usedAt: now })
+        .where(
+          and(
+            eq(kakaoSignupTokens.tokenHash, hashToken(input.kakaoSignupToken)),
+            eq(kakaoSignupTokens.deviceIdHash, input.deviceIdHash),
+            isNull(kakaoSignupTokens.usedAt),
+            gt(kakaoSignupTokens.expiresAt, now),
+          ),
+        )
+        .returning();
       if (!signup) throw new InvalidFoAuthProofError();
-      const identity = await tx.query.identityVerificationSessions.findFirst({
-        where: and(
-          eq(identityVerificationSessions.proofTokenHash, hashToken(input.identityVerificationToken)),
-          eq(identityVerificationSessions.purpose, "SIGNUP"),
-          eq(identityVerificationSessions.deviceIdHash, input.deviceIdHash),
-          eq(identityVerificationSessions.status, "VERIFIED"),
-          eq(identityVerificationSessions.isFourteenOrOlder, true),
-          isNull(identityVerificationSessions.consumedAt),
-          gt(identityVerificationSessions.expiresAt, new Date()),
-        ),
-      });
+      const [identity] = await tx
+        .update(identityVerificationSessions)
+        .set({ consumedAt: now, updatedAt: now })
+        .where(
+          and(
+            eq(identityVerificationSessions.proofTokenHash, hashToken(input.identityVerificationToken)),
+            eq(identityVerificationSessions.purpose, "SIGNUP"),
+            eq(identityVerificationSessions.deviceIdHash, input.deviceIdHash),
+            eq(identityVerificationSessions.status, "VERIFIED"),
+            eq(identityVerificationSessions.isFourteenOrOlder, true),
+            isNull(identityVerificationSessions.consumedAt),
+            gt(identityVerificationSessions.expiresAt, now),
+          ),
+        )
+        .returning();
       if (!identity?.ciHash || !identity.certificateProvider) throw new InvalidFoAuthProofError();
       const email = signup.emailVerified ? signup.email : input.email;
       if (!email) throw new InvalidFoAuthProofError();
       const emailProof = signup.emailVerified
         ? undefined
-        : await tx.query.emailVerificationTokens.findFirst({
-            where: and(
-              eq(emailVerificationTokens.tokenHash, hashToken(input.emailVerificationToken ?? "")),
-              eq(emailVerificationTokens.email, email),
-              eq(emailVerificationTokens.purpose, "SIGNUP"),
-              isNull(emailVerificationTokens.usedAt),
-              gt(emailVerificationTokens.expiresAt, new Date()),
-            ),
-          });
+        : (
+            await tx
+              .update(emailVerificationTokens)
+              .set({ usedAt: now })
+              .where(
+                and(
+                  eq(emailVerificationTokens.tokenHash, hashToken(input.emailVerificationToken ?? "")),
+                  eq(emailVerificationTokens.email, email),
+                  eq(emailVerificationTokens.purpose, "SIGNUP"),
+                  isNull(emailVerificationTokens.usedAt),
+                  gt(emailVerificationTokens.expiresAt, now),
+                ),
+              )
+              .returning()
+          )[0];
       if (!signup.emailVerified && !emailProof) throw new InvalidFoAuthProofError();
       const [existing] = await tx
         .select({ user: users })
@@ -190,20 +202,6 @@ export class KakaoFlowRepository {
             target: [userConsentAcceptances.userId, userConsentAcceptances.documentId],
             set: { agreed: consent.agreed, agreedAt, recordedAt: new Date() },
           });
-      }
-      await tx
-        .update(kakaoSignupTokens)
-        .set({ usedAt: new Date() })
-        .where(eq(kakaoSignupTokens.tokenHash, signup.tokenHash));
-      await tx
-        .update(identityVerificationSessions)
-        .set({ consumedAt: new Date(), updatedAt: new Date() })
-        .where(eq(identityVerificationSessions.sessionId, identity.sessionId));
-      if (emailProof) {
-        await tx
-          .update(emailVerificationTokens)
-          .set({ usedAt: new Date() })
-          .where(eq(emailVerificationTokens.tokenHash, emailProof.tokenHash));
       }
       return user;
     });

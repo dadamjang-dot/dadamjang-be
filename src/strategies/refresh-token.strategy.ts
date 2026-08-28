@@ -5,7 +5,6 @@ import type { Request } from "express";
 import { ExtractJwt, Strategy, type StrategyOptions } from "passport-jwt";
 import { CustomUnauthorizedException } from "src/common/errors/custom-exceptions";
 import { AuthErrorMessage } from "src/modules/auth/auth.error";
-import { AuthService } from "src/modules/auth/auth.service";
 import { AuthRequest, JwtPayload } from "src/modules/auth/auth.types";
 
 type RefreshRequest = AuthRequest & { refreshToken?: string };
@@ -19,10 +18,7 @@ const refreshTokenFromRequest = (request: Request) => {
 
 @Injectable()
 export class JwtRefreshTokenStrategy extends PassportStrategy(Strategy, "refresh_token") {
-  constructor(
-    configService: ConfigService,
-    private readonly authService: AuthService,
-  ) {
+  constructor(configService: ConfigService) {
     super({
       jwtFromRequest: ExtractJwt.fromExtractors([refreshTokenFromRequest]),
       secretOrKey: configService.getOrThrow<string>("JWT_REFRESH_TOKEN_SECRET"),
@@ -38,11 +34,6 @@ export class JwtRefreshTokenStrategy extends PassportStrategy(Strategy, "refresh
       throw new CustomUnauthorizedException(AuthErrorMessage.RefreshTokenUndefined);
     }
 
-    const result = await this.authService.compareUserRefreshToken(payload.userId, payload.deviceId, refreshToken);
-
-    if (!result) {
-      throw new CustomUnauthorizedException(AuthErrorMessage.RefreshTokenWrong);
-    }
     req.user = payload;
     req.refreshToken = refreshToken;
 

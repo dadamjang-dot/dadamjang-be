@@ -33,7 +33,7 @@ export class AuthResolver {
     @Context("req") req: RefreshAuthRequest,
     @Context("res") res: Response,
   ) {
-    await this.authService.logout(req.user.userId, req.user.deviceId);
+    await this.authService.logout(req.user.userId, req.user.deviceId, req.refreshToken);
     res.clearCookie("access_token", authCookieOptions);
     res.clearCookie("refresh_token", authCookieOptions);
     return true;
