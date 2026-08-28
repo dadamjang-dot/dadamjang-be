@@ -19,21 +19,74 @@ describe("EmailService", () => {
         verifiedAt: null,
         attemptCount: 0,
       }),
-      markVerified: jest.fn().mockResolvedValue({ id: "verification" }),
-      createVerificationToken: jest.fn().mockResolvedValue(undefined),
+      verifyAndCreateProof: jest.fn().mockResolvedValue({ verificationId: "verification" }),
     } as unknown as EmailRepository;
     const service = new EmailService(repository, config, allow());
 
     await expect(service.verifySignupCode("USER@example.com", "123456")).resolves.toEqual({
       emailVerificationToken: expect.any(String),
     });
-    expect(repository.createVerificationToken).toHaveBeenCalledWith(
-      expect.any(String),
-      "user@example.com",
-      "SIGNUP",
-      "verification",
-      expect.any(Date),
-    );
+  });
+
+  it("rolls back verification consumption when proof creation fails", async () => {
+    const codeHash = await bcrypt.hash("user@example.com:123456:SIGNUP:pepper", 10);
+    const verification = {
+      id: "verification",
+      codeHash,
+      expiresAt: new Date(Date.now() + 60_000),
+      verifiedAt: null as Date | null,
+      attemptCount: 0,
+    };
+    let proofCreationFails = true;
+    const repository = {
+      latestVerification: jest.fn(async () => verification),
+      verifyAndCreateProof: jest.fn(async () => {
+        const previousVerifiedAt = verification.verifiedAt;
+        verification.verifiedAt = new Date();
+        if (proofCreationFails) {
+          verification.verifiedAt = previousVerifiedAt;
+          throw new Error("proof insert failed");
+        }
+        return { verificationId: verification.id };
+      }),
+    } as unknown as EmailRepository;
+    const service = new EmailService(repository, config, allow());
+
+    await expect(service.verifySignupCode("user@example.com", "123456")).rejects.toThrow("proof insert failed");
+    expect(verification.verifiedAt).toBeNull();
+    proofCreationFails = false;
+
+    await expect(service.verifySignupCode("user@example.com", "123456")).resolves.toEqual({
+      emailVerificationToken: expect.any(String),
+    });
+  });
+
+  it("returns the same valid proof when verification is retried after response loss", async () => {
+    const codeHash = await bcrypt.hash("user@example.com:123456:SIGNUP:pepper", 10);
+    const verification = {
+      id: "verification",
+      codeHash,
+      expiresAt: new Date(Date.now() + 60_000),
+      verifiedAt: null as Date | null,
+      attemptCount: 0,
+    };
+    const proofs = new Set<string>();
+    const repository = {
+      latestVerification: jest.fn(async () => verification),
+      verifyAndCreateProof: jest.fn(async (input: { token: string }) => {
+        verification.verifiedAt ??= new Date();
+        proofs.add(input.token);
+        return { verificationId: verification.id };
+      }),
+    } as unknown as EmailRepository;
+    const service = new EmailService(repository, config, allow());
+
+    const first = await service.verifySignupCode("user@example.com", "123456");
+    verification.expiresAt = new Date(Date.now() - 1);
+    const retried = await service.verifySignupCode("user@example.com", "123456");
+
+    expect(retried).toEqual(first);
+    expect(proofs.size).toBe(1);
   });
 
   it("resets password only with a one-time reset token", async () => {

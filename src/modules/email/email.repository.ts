@@ -50,25 +50,71 @@ export class EmailRepository {
       .returning();
     return result;
   };
-  markVerified = async (id: string) =>
-    (
-      await this.db
+  verifyAndCreateProof = (input: {
+    email: string;
+    expiresAt: Date;
+    purpose: EmailVerificationPurposeValue;
+    token: string;
+    verificationId: string;
+  }) =>
+    this.db.transaction(async (tx) => {
+      const now = new Date();
+      const tokenHash = hashToken(input.token);
+      const [verification] = await tx
+        .select()
+        .from(emailVerifications)
+        .where(
+          and(
+            eq(emailVerifications.id, input.verificationId),
+            eq(emailVerifications.email, input.email),
+            eq(emailVerifications.purpose, input.purpose),
+          ),
+        )
+        .limit(1)
+        .for("update");
+      if (!verification) return undefined;
+      const [existing] = await tx
+        .select()
+        .from(emailVerificationTokens)
+        .where(
+          and(
+            eq(emailVerificationTokens.tokenHash, tokenHash),
+            eq(emailVerificationTokens.verificationId, input.verificationId),
+            eq(emailVerificationTokens.email, input.email),
+            eq(emailVerificationTokens.purpose, input.purpose),
+            isNull(emailVerificationTokens.usedAt),
+            gt(emailVerificationTokens.expiresAt, now),
+          ),
+        )
+        .limit(1);
+      if (existing) return existing;
+      if (
+        verification.verifiedAt ||
+        verification.expiresAt.getTime() <= now.getTime() ||
+        verification.attemptCount >= 5
+      )
+        return undefined;
+      const [verified] = await tx
         .update(emailVerifications)
-        .set({ verifiedAt: new Date() })
-        .where(and(eq(emailVerifications.id, id), isNull(emailVerifications.verifiedAt)))
-        .returning()
-    )[0];
-  createVerificationToken = async (
-    token: string,
-    email: string,
-    purpose: EmailVerificationPurposeValue,
-    verificationId: string,
-    expiresAt: Date,
-  ) => {
-    await this.db
-      .insert(emailVerificationTokens)
-      .values({ tokenHash: hashToken(token), email, purpose, verificationId, expiresAt });
-  };
+        .set({ verifiedAt: now })
+        .where(and(eq(emailVerifications.id, input.verificationId), isNull(emailVerifications.verifiedAt)))
+        .returning({ id: emailVerifications.id });
+      if (!verified) return undefined;
+      return requireResult(
+        (
+          await tx
+            .insert(emailVerificationTokens)
+            .values({
+              tokenHash,
+              email: input.email,
+              purpose: input.purpose,
+              verificationId: input.verificationId,
+              expiresAt: input.expiresAt,
+            })
+            .returning()
+        )[0],
+      );
+    });
   consumeVerifiedEmailToken = async (token: string, email: string, executor: DatabaseExecutor = this.db) =>
     (
       await executor

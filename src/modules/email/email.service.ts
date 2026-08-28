@@ -1,7 +1,7 @@
 import { Injectable } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import * as bcrypt from "bcrypt";
-import { createHash, randomBytes } from "crypto";
+import { createHash, createHmac } from "crypto";
 import {
   CustomBadRequestException,
   CustomTooManyRequestsException,
@@ -56,25 +56,24 @@ export class EmailService {
       EmailErrorMessage.RequestLimitExceeded,
     );
     const verification = await this.repository.latestVerification(normalizedEmail, purpose);
-    if (!verification || verification.verifiedAt) throw new CustomUnauthorizedException(EmailErrorMessage.InvalidCode);
-    if (verification.expiresAt.getTime() <= Date.now())
+    if (!verification) throw new CustomUnauthorizedException(EmailErrorMessage.InvalidCode);
+    if (!verification.verifiedAt && verification.expiresAt.getTime() <= Date.now())
       throw new CustomUnauthorizedException(EmailErrorMessage.ExpiredCode);
-    if (verification.attemptCount >= 5)
+    if (!verification.verifiedAt && verification.attemptCount >= 5)
       throw new CustomTooManyRequestsException(EmailErrorMessage.CodeAttemptLimitExceeded);
     if (!(await bcrypt.compare(this.pepperedCode(normalizedEmail, code, purpose), verification.codeHash))) {
       await this.repository.incrementAttempt(verification.id);
       throw new CustomUnauthorizedException(EmailErrorMessage.InvalidCode);
     }
-    const verified = await this.repository.markVerified(verification.id);
-    if (!verified) throw new CustomUnauthorizedException(EmailErrorMessage.InvalidCode);
-    const token = this.createOpaqueToken();
-    await this.repository.createVerificationToken(
-      token,
-      normalizedEmail,
+    const token = this.proofToken(verification.id);
+    const proof = await this.repository.verifyAndCreateProof({
+      email: normalizedEmail,
+      expiresAt: new Date(Date.now() + 15 * 60 * 1000),
       purpose,
-      verified.id,
-      new Date(Date.now() + 15 * 60 * 1000),
-    );
+      token,
+      verificationId: verification.id,
+    });
+    if (!proof) throw new CustomUnauthorizedException(EmailErrorMessage.InvalidCode);
     return { emailVerificationToken: token };
   };
   requestPasswordReset = async (email: string, origin: RequestOrigin) => {
@@ -176,5 +175,9 @@ export class EmailService {
       : []),
   ];
   private sha256 = (value: string) => createHash("sha256").update(value).digest("hex");
-  private createOpaqueToken = () => randomBytes(32).toString("base64url");
+  private proofToken = (verificationId: string) =>
+    createHmac("sha256", this.configService.getOrThrow<string>("EMAIL_CODE_PEPPER"))
+      .update("email-verification-proof\0")
+      .update(verificationId)
+      .digest("base64url");
 }
