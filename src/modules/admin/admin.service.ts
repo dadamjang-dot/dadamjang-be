@@ -548,7 +548,7 @@ export class AdminService {
         const values = this.categoryValues({
           name: input.name ?? current.name,
           slug: input.slug ?? current.slug,
-          parentId: nextParentId ?? undefined,
+          ...(nextParentId === null ? {} : { parentId: nextParentId }),
           sortOrder: input.sortOrder ?? current.sortOrder,
           isActive: input.isActive ?? current.isActive,
         });

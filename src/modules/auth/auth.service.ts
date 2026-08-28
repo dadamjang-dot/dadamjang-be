@@ -10,6 +10,8 @@ import { AuthRepository } from "./auth.repository";
 import { AuthPortal, SigninAuthInput } from "./auth.types";
 import { UserRole, type UserRoleValue } from "src/auth/role";
 
+type JwtExpiration = Exclude<JwtSignOptions["expiresIn"], undefined>;
+
 @Injectable()
 export class AuthService {
   constructor(
@@ -52,14 +54,14 @@ export class AuthService {
       { userId: user.userId, role },
       {
         secret: this.configService.getOrThrow<string>("JWT_ACCESS_TOKEN_SECRET"),
-        expiresIn: this.configService.getOrThrow<string>("JWT_ACCESS_TOKEN_EXP") as JwtSignOptions["expiresIn"],
+        expiresIn: this.configService.getOrThrow<string>("JWT_ACCESS_TOKEN_EXP") as JwtExpiration,
       },
     );
     const refreshToken = await this.jwtService.signAsync(
       { userId: user.userId, role, deviceId },
       {
         secret: this.configService.getOrThrow<string>("JWT_REFRESH_TOKEN_SECRET"),
-        expiresIn: this.configService.getOrThrow<string>("JWT_REFRESH_TOKEN_EXP") as JwtSignOptions["expiresIn"],
+        expiresIn: this.configService.getOrThrow<string>("JWT_REFRESH_TOKEN_EXP") as JwtExpiration,
       },
     );
     const decoded = this.jwtService.decode(refreshToken) as { exp?: number } | null;

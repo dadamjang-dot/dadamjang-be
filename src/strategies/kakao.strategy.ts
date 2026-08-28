@@ -18,7 +18,7 @@ export class KakaoStrategy extends PassportStrategy(Strategy, "kakao") {
     const account = profile._json?.kakao_account;
     return {
       providerUserId: String(profile.id),
-      email: account?.email,
+      ...(account?.email === undefined ? {} : { email: account.email }),
       emailVerified: account?.is_email_valid === true && account.is_email_verified === true,
     };
   }

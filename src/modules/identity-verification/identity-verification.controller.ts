@@ -38,9 +38,9 @@ export class IdentityVerificationController {
   async success(@Param("sessionId") sessionId: string, @Body() body: CallbackBody, @Res() res: Response) {
     await this.service.callback(sessionId, {
       resultCode: body.resultCode ?? "",
-      authRequestUrl: body.authRequestUrl,
-      transactionId: body.txId,
-      token: body.token,
+      ...(body.authRequestUrl === undefined ? {} : { authRequestUrl: body.authRequestUrl }),
+      ...(body.txId === undefined ? {} : { transactionId: body.txId }),
+      ...(body.token === undefined ? {} : { token: body.token }),
     });
     return res.redirect(this.redirectUrl(sessionId, "verified"));
   }

@@ -75,8 +75,8 @@ export class KakaoFlowService {
     try {
       const user = await this.repository.completeSignup({
         kakaoSignupToken: input.kakaoSignupToken,
-        email,
-        emailVerificationToken: input.emailVerificationToken,
+        ...(email === undefined ? {} : { email }),
+        ...(input.emailVerificationToken === undefined ? {} : { emailVerificationToken: input.emailVerificationToken }),
         identityVerificationToken: input.identityVerificationToken,
         deviceIdHash: hashToken(deviceId),
         userId: randomUUID(),
