@@ -28,8 +28,6 @@ export type KakaoRequest = Request & {
   user: KakaoProfile;
   cookies: { kakao_oauth_flow?: string };
 };
-export type KakaoBeginResult =
-  { existingUser: true; tokenPayload: TokenPayload } | { existingUser: false; kakaoSignupToken: string };
 
 export enum AuthPortal {
   Fo = "FO",
@@ -38,26 +36,6 @@ export enum AuthPortal {
 }
 
 registerEnumType(AuthPortal, { name: "AuthPortal" });
-
-@InputType()
-export class SignupAuthInput {
-  @Field()
-  userid!: string;
-  @Field()
-  email!: string;
-  @Field()
-  password!: string;
-  @Field()
-  emailVerificationToken!: string;
-}
-
-@InputType()
-export class KakaoSignupAuthInput {
-  @Field()
-  userid!: string;
-  @Field()
-  kakaoSignupToken!: string;
-}
 
 @InputType()
 export class SigninAuthInput {

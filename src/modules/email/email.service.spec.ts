@@ -36,12 +36,10 @@ describe("EmailService", () => {
 
   it("resets password only with a one-time reset token", async () => {
     const repository = {
-      consumePasswordResetToken: jest.fn().mockResolvedValue({ userId: "user" }),
-      resetPassword: jest.fn().mockResolvedValue(undefined),
+      resetPasswordWithToken: jest.fn().mockResolvedValue(true),
     } as unknown as EmailRepository;
     const service = new EmailService(repository, config, {} as EmailSender);
 
     await expect(service.resetPassword("token", "new-password")).resolves.toEqual({ ok: true });
-    expect(repository.resetPassword).toHaveBeenCalledWith("user", expect.any(String));
   });
 });

@@ -1,4 +1,4 @@
-import { Injectable, Logger } from "@nestjs/common";
+import { Injectable } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 
 export interface EmailSender {
@@ -8,15 +8,12 @@ export interface EmailSender {
 
 @Injectable()
 export class DevEmailSender implements EmailSender {
-  private readonly logger = new Logger(DevEmailSender.name);
   constructor(private readonly configService: ConfigService) {}
-  sendCode = async (email: string, code: string) => {
+  sendCode = async (email: string, _code: string) => {
     this.assertDelivery(email);
-    this.logger.log(`email_code_dev recipient=${email} code=${code}`);
   };
-  sendLink = async (email: string, subject: string, url: string) => {
+  sendLink = async (email: string, _subject: string, _url: string) => {
     this.assertDelivery(email);
-    this.logger.log(`email_link_dev recipient=${email} subject=${subject} url=${url}`);
   };
   private assertDelivery = (email: string) => {
     if (this.configService.get<string>("EMAIL_DEV_FAIL_RECIPIENT") === email)

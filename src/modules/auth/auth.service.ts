@@ -2,20 +2,12 @@ import { Injectable } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { JwtService, JwtSignOptions } from "@nestjs/jwt";
 import * as bcrypt from "bcrypt";
-import { randomBytes, randomUUID } from "crypto";
-import { CustomBadRequestException, CustomUnauthorizedException } from "src/common/errors/custom-exceptions";
+import { CustomUnauthorizedException } from "src/common/errors/custom-exceptions";
 import { EmailService } from "src/modules/email/email.service";
 import { User } from "src/modules/database/schema";
 import { AuthErrorMessage } from "./auth.error";
 import { AuthRepository } from "./auth.repository";
-import {
-  AuthPortal,
-  KakaoBeginResult,
-  KakaoProfile,
-  KakaoSignupAuthInput,
-  SigninAuthInput,
-  SignupAuthInput,
-} from "./auth.types";
+import { AuthPortal, SigninAuthInput } from "./auth.types";
 import { UserRole, type UserRoleValue } from "src/auth/role";
 
 @Injectable()
@@ -26,45 +18,11 @@ export class AuthService {
     private readonly configService: ConfigService,
     private readonly emailService: EmailService,
   ) {}
-  signup = async (input: SignupAuthInput, deviceId: string) => {
-    const user = await this.mapDuplicate(async () =>
-      this.emailService.consumeSignupToken(input.emailVerificationToken, input.email, {
-        userId: randomUUID(),
-        userid: input.userid,
-        password: await bcrypt.hash(input.password, 10),
-      }),
-    );
-    if (!user) throw new CustomUnauthorizedException(AuthErrorMessage.InvalidEmailVerificationToken);
-    return this.issueTokensForUser(user, deviceId);
-  };
   signin = async (input: SigninAuthInput, deviceId: string) => {
     const user = await this.repository.findByUserid(this.emailService.normalizeUserid(input.userid));
     if (!user || !(await bcrypt.compare(input.password, user.password)))
       throw new CustomUnauthorizedException(AuthErrorMessage.AuthRequired);
     this.assertPortalRole((user as User & { role?: UserRoleValue }).role ?? UserRole.User, input.portal);
-    return this.issueTokensForUser(user, deviceId);
-  };
-  beginKakao = async (profile: KakaoProfile, deviceId: string): Promise<KakaoBeginResult> => {
-    const user = await this.repository.findKakaoUser(profile.providerUserId);
-    if (user) return { existingUser: true, tokenPayload: await this.issueTokensForUser(user, deviceId) };
-    if (!profile.email) throw new CustomBadRequestException("카카오 계정 이메일 제공 동의가 필요합니다.");
-    const kakaoSignupToken = randomBytes(32).toString("base64url");
-    await this.repository.createKakaoSignupToken(
-      kakaoSignupToken,
-      profile.providerUserId,
-      this.emailService.normalizeEmail(profile.email),
-    );
-    return { existingUser: false, kakaoSignupToken };
-  };
-  completeKakaoSignup = async (input: KakaoSignupAuthInput, deviceId: string) => {
-    const user = await this.mapDuplicate(async () =>
-      this.repository.consumeKakaoSignupTokenAndCreateUser(input.kakaoSignupToken, {
-        userId: randomUUID(),
-        userid: this.emailService.normalizeUserid(input.userid),
-        password: await bcrypt.hash(randomBytes(32).toString("base64url"), 10),
-      }),
-    );
-    if (!user) throw new CustomUnauthorizedException("카카오 가입 토큰이 유효하지 않습니다.");
     return this.issueTokensForUser(user, deviceId);
   };
   refresh = async (userId: string, deviceId: string, refreshToken: string) => {
@@ -113,15 +71,6 @@ export class AuthService {
       refreshTokenExp: new Date(decoded.exp * 1000),
     });
     return { accessToken, refreshToken, role };
-  };
-  private mapDuplicate = async <T>(operation: () => Promise<T>) => {
-    try {
-      return await operation();
-    } catch (error) {
-      if (typeof error === "object" && error !== null && "code" in error && error.code === "23505")
-        throw new CustomBadRequestException(AuthErrorMessage.DuplicateUser);
-      throw error;
-    }
   };
   private assertPortalRole = (role: UserRoleValue, portal: AuthPortal) => {
     const allowed =

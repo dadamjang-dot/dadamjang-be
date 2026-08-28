@@ -7,44 +7,18 @@ import { authCookieOptions } from "./cookie-options";
 import { AuthErrorMessage } from "./auth.error";
 import { deviceIdFromRequest, setTokenCookies } from "./auth-http";
 import { AuthService } from "./auth.service";
-import {
-  AuthRequest,
-  AuthViewer,
-  KakaoSignupAuthInput,
-  RefreshAuthRequest,
-  SigninAuthInput,
-  SignupAuthInput,
-  TokenPayload,
-} from "./auth.types";
+import { AuthRequest, AuthViewer, RefreshAuthRequest, SigninAuthInput, TokenPayload } from "./auth.types";
 import { JwtAccessTokenGuard } from "src/guards/accessToken.guard";
 
 @Resolver()
 export class AuthResolver {
   constructor(private readonly authService: AuthService) {}
-  @Mutation(() => TokenPayload) async signup(
-    @Args("input") input: SignupAuthInput,
-    @Context("req") req: Request,
-    @Context("res") res: Response,
-  ) {
-    const result = await this.authService.signup(input, deviceIdFromRequest(req));
-    setTokenCookies(res, result);
-    return result;
-  }
   @Mutation(() => TokenPayload) async signin(
     @Args("input") input: SigninAuthInput,
     @Context("req") req: Request,
     @Context("res") res: Response,
   ) {
     const result = await this.authService.signin(input, deviceIdFromRequest(req));
-    setTokenCookies(res, result);
-    return result;
-  }
-  @Mutation(() => TokenPayload) async completeKakaoSignup(
-    @Args("input") input: KakaoSignupAuthInput,
-    @Context("req") req: Request,
-    @Context("res") res: Response,
-  ) {
-    const result = await this.authService.completeKakaoSignup(input, deviceIdFromRequest(req));
     setTokenCookies(res, result);
     return result;
   }

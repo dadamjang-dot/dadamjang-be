@@ -13,8 +13,12 @@ import { EmailService } from "./email.service";
     {
       provide: "EmailSender",
       inject: [ConfigService],
-      useFactory: (config: ConfigService) =>
-        config.get<string>("RESEND_API_KEY") ? new ResendEmailSender(config) : new DevEmailSender(config),
+      useFactory: (config: ConfigService) => {
+        if (config.get<string>("RESEND_API_KEY")?.trim()) return new ResendEmailSender(config);
+        if (config.get<string>("NODE_ENV") === "production")
+          throw new Error("RESEND_API_KEY is required in production");
+        return new DevEmailSender(config);
+      },
     },
   ],
   exports: [EmailService],

@@ -50,19 +50,4 @@ describe("AuthService", () => {
     await expect(service.logout("user-1", "device")).resolves.toBe(true);
     expect(deleteRefreshToken).toHaveBeenCalledWith("user-1", "device");
   });
-
-  it("maps duplicate signup database errors", async () => {
-    const service = createService(
-      {},
-      {
-        consumeSignupToken: jest.fn().mockRejectedValue({ code: "23505" }),
-      },
-    );
-    await expect(
-      service.signup(
-        { userid: "user", email: "user@example.test", password: "password", emailVerificationToken: "token" },
-        "device",
-      ),
-    ).rejects.toThrow(AuthErrorMessage.DuplicateUser);
-  });
 });

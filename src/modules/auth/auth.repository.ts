@@ -1,15 +1,7 @@
 import { Inject, Injectable } from "@nestjs/common";
-import { and, eq, gt, isNull } from "drizzle-orm";
-import { hashToken } from "src/common/security/token-hash";
+import { and, eq } from "drizzle-orm";
 import { Database, DRIZZLE } from "src/modules/database/database.module";
-import {
-  authIdentities,
-  kakaoSignupTokens,
-  refreshTokens,
-  users,
-  type RefreshToken,
-  type User,
-} from "src/modules/database/schema";
+import { refreshTokens, users, type RefreshToken, type User } from "src/modules/database/schema";
 
 @Injectable()
 export class AuthRepository {
@@ -45,46 +37,4 @@ export class AuthRepository {
       .delete(refreshTokens)
       .where(and(eq(refreshTokens.userId, userId), eq(refreshTokens.deviceId, deviceId)));
   };
-  findKakaoUser = async (providerUserId: string) => {
-    const identity = await this.db.query.authIdentities.findFirst({
-      where: and(eq(authIdentities.provider, "kakao"), eq(authIdentities.providerUserId, providerUserId)),
-    });
-    return identity ? this.findUser(identity.userId) : undefined;
-  };
-  createKakaoSignupToken = async (token: string, providerUserId: string, email: string) => {
-    await this.db.insert(kakaoSignupTokens).values({
-      tokenHash: hashToken(token),
-      providerUserId,
-      email,
-      expiresAt: new Date(Date.now() + 15 * 60 * 1000),
-    });
-  };
-  consumeKakaoSignupTokenAndCreateUser = async (
-    token: string,
-    input: { userId: string; userid: string; password: string },
-  ) =>
-    this.db.transaction(async (tx) => {
-      const [signupToken] = await tx
-        .update(kakaoSignupTokens)
-        .set({ usedAt: new Date() })
-        .where(
-          and(
-            eq(kakaoSignupTokens.tokenHash, hashToken(token)),
-            isNull(kakaoSignupTokens.usedAt),
-            gt(kakaoSignupTokens.expiresAt, new Date()),
-          ),
-        )
-        .returning();
-      if (!signupToken?.email) return undefined;
-      const [user] = await tx
-        .insert(users)
-        .values({ ...input, email: signupToken.email })
-        .returning();
-      await tx.insert(authIdentities).values({
-        userId: user.userId,
-        provider: "kakao",
-        providerUserId: signupToken.providerUserId,
-      });
-      return user;
-    });
 }

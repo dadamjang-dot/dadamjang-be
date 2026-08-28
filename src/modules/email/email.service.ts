@@ -94,27 +94,10 @@ export class EmailService {
   };
   resetPassword = async (token: string, password: string) => {
     this.assertPassword(password);
-    const recovery = await this.repository.consumePasswordResetToken(token);
-    if (recovery) {
-      await this.repository.resetPassword(recovery.userId, await bcrypt.hash(password, 10));
-      return { ok: true };
-    }
-    const verification = await this.repository.consumePasswordResetEmailToken(token);
-    if (!verification) throw new CustomUnauthorizedException(EmailErrorMessage.InvalidRecoveryToken);
-    const user = await this.repository.findUserByEmail(verification.email);
-    if (user) await this.repository.resetPassword(user.userId, await bcrypt.hash(password, 10));
+    const reset = await this.repository.resetPasswordWithToken(token, await bcrypt.hash(password, 10));
+    if (!reset) throw new CustomUnauthorizedException(EmailErrorMessage.InvalidRecoveryToken);
     return { ok: true };
   };
-  consumeSignupToken = async (
-    token: string,
-    email: string,
-    input: { userId: string; userid: string; password: string },
-  ) =>
-    this.repository.consumeSignupTokenAndCreateUser(token, {
-      ...input,
-      email: this.normalizeEmail(email),
-      userid: this.normalizeUserid(input.userid),
-    });
   consumeVerifiedEmailToken = async (token: string, email: string) => {
     const verificationToken = await this.repository.consumeVerifiedEmailToken(token, this.normalizeEmail(email));
     if (!verificationToken) throw new CustomUnauthorizedException(EmailErrorMessage.InvalidCode);

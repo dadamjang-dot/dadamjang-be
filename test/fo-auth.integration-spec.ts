@@ -65,6 +65,14 @@ describe("FO auth GraphQL integration", () => {
     await pool.end();
   });
 
+  it("does not expose legacy signup mutations that bypass FO proofs", async () => {
+    const response = await request(app.getHttpServer()).post("/graphql").send({
+      query: `query MutationFields { __schema { mutationType { fields { name } } } }`,
+    });
+    const fieldNames = response.body.data.__schema.mutationType.fields.map((field: { name: string }) => field.name);
+    expect(fieldNames).not.toEqual(expect.arrayContaining(["signup", "completeKakaoSignup"]));
+  });
+
   it("signs in a FO user with a normalized email and hides credential details", async () => {
     const success = await request(app.getHttpServer())
       .post("/graphql")
