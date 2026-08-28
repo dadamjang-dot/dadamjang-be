@@ -27,6 +27,21 @@ const adminToken = (agent: Agent) => signin(agent, "Bo", ADMIN_FIXTURE.userid, A
 const graphql = (app: INestApplication, token: string, query: string, variables?: Record<string, unknown>) =>
   request(app.getHttpServer()).post("/graphql").set("Authorization", `Bearer ${token}`).send({ query, variables });
 
+const waitForAdvisoryWaiters = async (pool: Pool, expected: number) => {
+  for (let attempt = 0; attempt < 500; attempt += 1) {
+    const result = await pool.query<{ count: number }>(
+      `SELECT count(*)::int AS count
+       FROM pg_stat_activity
+       WHERE datname = current_database()
+         AND pid <> pg_backend_pid()
+         AND wait_event = 'advisory'`,
+    );
+    if ((result.rows[0]?.count ?? 0) >= expected) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`Timed out waiting for ${expected} advisory lock waiters`);
+};
+
 describe("Admin GraphQL integration", () => {
   let app: INestApplication;
   let pool: Pool;
@@ -424,6 +439,73 @@ describe("Admin GraphQL integration", () => {
     expect(publicProduct.body.errors[0].message).toBe("Category has public products");
     const updated = await graphql(app, token, updateMutation, { input: { categoryId: childId, sortOrder: 7 } });
     expect(updated.body.data.updateCategory.sortOrder).toBe(7);
+  });
+
+  it("serializes opposite category reparenting without persisting a cycle", async () => {
+    const firstCategoryId = "33000000-0000-4000-8000-000000000001";
+    const secondCategoryId = "33000000-0000-4000-8000-000000000002";
+    await pool.query(
+      `INSERT INTO categories ("categoryId", name, slug, "sortOrder") VALUES
+        ($1, 'Concurrent A', 'concurrent-a', 10),
+        ($2, 'Concurrent B', 'concurrent-b', 11)`,
+      [firstCategoryId, secondCategoryId],
+    );
+    const token = await adminToken(request.agent(app.getHttpServer()));
+    const mutation = `mutation Update($input: UpdateCategoryInput!) {
+      updateCategory(input: $input) { categoryId parentId }
+    }`;
+    const blocker = await pool.connect();
+    const requests: Promise<request.Response>[] = [];
+    let released = false;
+    try {
+      await pool.query(`
+        CREATE FUNCTION delay_test_category_reparent() RETURNS trigger AS $$
+        BEGIN
+          IF NEW."parentId" IS DISTINCT FROM OLD."parentId" THEN
+            PERFORM pg_advisory_xact_lock(91002, 1);
+          END IF;
+          RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql;
+        CREATE TRIGGER delay_test_category_reparent
+        BEFORE UPDATE ON categories
+        FOR EACH ROW EXECUTE FUNCTION delay_test_category_reparent();
+      `);
+      await blocker.query(`SELECT pg_advisory_lock(91002, 1)`);
+      const firstRequest = graphql(app, token, mutation, {
+        input: { categoryId: firstCategoryId, parentId: secondCategoryId },
+      }).then((response) => response);
+      requests.push(firstRequest);
+      await waitForAdvisoryWaiters(pool, 1);
+      const secondRequest = graphql(app, token, mutation, {
+        input: { categoryId: secondCategoryId, parentId: firstCategoryId },
+      }).then((response) => response);
+      requests.push(secondRequest);
+      await waitForAdvisoryWaiters(pool, 2);
+      await blocker.query(`SELECT pg_advisory_unlock(91002, 1)`);
+      released = true;
+      const responses = await Promise.all(requests);
+      expect(responses.filter(({ body }) => body.data?.updateCategory)).toHaveLength(1);
+      expect(
+        responses.filter(({ body }) => body.errors?.[0]?.message === "Category hierarchy cannot contain a cycle"),
+      ).toHaveLength(1);
+      const state = await pool.query<{ categoryId: string; parentId: string | null }>(
+        `SELECT "categoryId", "parentId" FROM categories WHERE "categoryId" IN ($1, $2) ORDER BY "categoryId"`,
+        [firstCategoryId, secondCategoryId],
+      );
+      const parentById = new Map(state.rows.map((row) => [row.categoryId, row.parentId]));
+      expect(
+        parentById.get(firstCategoryId) === secondCategoryId && parentById.get(secondCategoryId) === firstCategoryId,
+      ).toBe(false);
+    } finally {
+      if (!released) await blocker.query(`SELECT pg_advisory_unlock(91002, 1)`).catch(() => undefined);
+      await Promise.allSettled(requests);
+      blocker.release();
+      await pool.query(`
+        DROP TRIGGER IF EXISTS delay_test_category_reparent ON categories;
+        DROP FUNCTION IF EXISTS delay_test_category_reparent();
+      `);
+    }
   });
 
   it("creates, revokes, expires, and consumes hash-only admin invites once", async () => {

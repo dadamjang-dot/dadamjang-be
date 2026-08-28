@@ -528,6 +528,7 @@ export class AdminService {
   updateCategory = async (adminUserId: string, input: UpdateCategoryInput) => {
     try {
       await this.db.transaction(async (tx) => {
+        await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${"category-hierarchy"}, 6))`);
         const [current] = await tx
           .select()
           .from(categories)

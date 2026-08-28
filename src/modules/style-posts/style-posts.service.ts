@@ -432,24 +432,40 @@ export class StylePostsService {
   };
 
   like = async (stylePostId: string, userId: string) => {
-    await this.get(stylePostId);
-    await this.db.insert(stylePostLikes).values({ stylePostId, userId }).onConflictDoNothing();
+    await this.setLikeState(stylePostId, userId, true);
     return this.get(stylePostId, userId);
   };
 
   unlike = async (stylePostId: string, userId: string) => {
-    await this.get(stylePostId);
-    await this.db
-      .update(stylePostLikes)
-      .set({ deletedAt: new Date() })
-      .where(
-        and(
-          eq(stylePostLikes.stylePostId, stylePostId),
-          eq(stylePostLikes.userId, userId),
-          isNull(stylePostLikes.deletedAt),
-        ),
-      );
+    await this.setLikeState(stylePostId, userId, false);
     return this.get(stylePostId, userId);
+  };
+
+  private setLikeState = async (stylePostId: string, userId: string, liked: boolean) => {
+    if (!UUID_PATTERN.test(stylePostId)) throw new CustomBadRequestException(StylePostErrorMessage.InvalidStylePostId);
+    await this.db.transaction(async (tx) => {
+      await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${`${stylePostId}:${userId}`}, 5))`);
+      const [post] = await tx
+        .select({ stylePostId: stylePosts.stylePostId })
+        .from(stylePosts)
+        .where(eq(stylePosts.stylePostId, stylePostId))
+        .limit(1);
+      if (!post) throw new CustomNotFoundException(StylePostErrorMessage.NotFound);
+      if (liked) {
+        await tx.insert(stylePostLikes).values({ stylePostId, userId }).onConflictDoNothing();
+        return;
+      }
+      await tx
+        .update(stylePostLikes)
+        .set({ deletedAt: new Date() })
+        .where(
+          and(
+            eq(stylePostLikes.stylePostId, stylePostId),
+            eq(stylePostLikes.userId, userId),
+            isNull(stylePostLikes.deletedAt),
+          ),
+        );
+    });
   };
 
   private getPurchasedProductRows = async (

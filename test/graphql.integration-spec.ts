@@ -67,6 +67,21 @@ const signin = async (agent: ReturnType<typeof request.agent>) => {
   return response.body.data.signin.accessToken;
 };
 
+const waitForAdvisoryWaiters = async (pool: Pool, expected: number) => {
+  for (let attempt = 0; attempt < 500; attempt += 1) {
+    const result = await pool.query<{ count: number }>(
+      `SELECT count(*)::int AS count
+       FROM pg_stat_activity
+       WHERE datname = current_database()
+         AND pid <> pg_backend_pid()
+         AND wait_event = 'advisory'`,
+    );
+    if ((result.rows[0]?.count ?? 0) >= expected) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`Timed out waiting for ${expected} advisory lock waiters`);
+};
+
 describe("PostgreSQL GraphQL integration", () => {
   let app: INestApplication;
   let pool: Pool;
@@ -423,6 +438,67 @@ describe("PostgreSQL GraphQL integration", () => {
     expect(repeatedUnlike.body.data.unlikeStylePost).toEqual({ likeCount: 0, isLiked: false });
     const reliked = await agent.post("/graphql").set(auth).send({ query: likeMutation });
     expect(reliked.body.data.likeStylePost).toEqual({ likeCount: 1, isLiked: true });
+  });
+
+  it("preserves a later unlike when an earlier like is delayed", async () => {
+    const stylePostId = "82000000-0000-4000-8000-000000000099";
+    await pool.query(
+      `INSERT INTO "stylePosts" ("stylePostId", "authorId", title, content, category)
+       VALUES ($1, $2, 'Concurrent like', 'Concurrent like', 'CLOTHING')`,
+      [stylePostId, FIXTURE.userId],
+    );
+    const accessToken = await signin(request.agent(app.getHttpServer()));
+    const blocker = await pool.connect();
+    const requests: Promise<request.Response>[] = [];
+    let released = false;
+    try {
+      await pool.query(`
+        CREATE FUNCTION delay_test_style_like_insert() RETURNS trigger AS $$
+        BEGIN
+          PERFORM pg_advisory_xact_lock(91001, 1);
+          RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql;
+        CREATE TRIGGER delay_test_style_like_insert
+        BEFORE INSERT ON "stylePostLikes"
+        FOR EACH ROW EXECUTE FUNCTION delay_test_style_like_insert();
+      `);
+      await blocker.query(`SELECT pg_advisory_lock(91001, 1)`);
+      const likeRequest = request(app.getHttpServer())
+        .post("/graphql")
+        .set("Authorization", `Bearer ${accessToken}`)
+        .send({ query: `mutation { likeStylePost(stylePostId: "${stylePostId}") { isLiked } }` })
+        .then((response) => response);
+      requests.push(likeRequest);
+      await waitForAdvisoryWaiters(pool, 1);
+      const unlikeRequest = request(app.getHttpServer())
+        .post("/graphql")
+        .set("Authorization", `Bearer ${accessToken}`)
+        .send({ query: `mutation { unlikeStylePost(stylePostId: "${stylePostId}") { isLiked } }` })
+        .then((response) => response);
+      requests.push(unlikeRequest);
+      await Promise.race([unlikeRequest, waitForAdvisoryWaiters(pool, 2)]);
+      await blocker.query(`SELECT pg_advisory_unlock(91001, 1)`);
+      released = true;
+      const [liked, unliked] = await Promise.all(requests);
+      expect(liked?.body.errors).toBeUndefined();
+      expect(unliked?.body.errors).toBeUndefined();
+      const state = await pool.query<{ active_likes: number }>(
+        `SELECT count(*)::int AS active_likes
+         FROM "stylePostLikes"
+         WHERE "stylePostId" = $1 AND "userId" = $2 AND "deletedAt" IS NULL`,
+        [stylePostId, FIXTURE.userId],
+      );
+      expect(state.rows[0]?.active_likes).toBe(0);
+    } finally {
+      if (!released) await blocker.query(`SELECT pg_advisory_unlock(91001, 1)`).catch(() => undefined);
+      await Promise.allSettled(requests);
+      blocker.release();
+      await pool.query(`
+        DROP TRIGGER IF EXISTS delay_test_style_like_insert ON "stylePostLikes";
+        DROP FUNCTION IF EXISTS delay_test_style_like_insert();
+      `);
+    }
   });
 
   it("paginates style posts with category and sort-aware cursors", async () => {
