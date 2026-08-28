@@ -2,6 +2,7 @@ import { HttpException, HttpStatus, Module } from "@nestjs/common";
 import { ConfigModule } from "@nestjs/config";
 import { GraphQLModule } from "@nestjs/graphql";
 import { ApolloDriver, ApolloDriverConfig } from "@nestjs/apollo";
+import type { ExpressContextFunctionArgument } from "@as-integrations/express5";
 import { GraphQLError } from "graphql";
 import { AuthModule } from "./auth/auth.module";
 import { DatabaseModule } from "./database/database.module";
@@ -42,7 +43,7 @@ const graphQlErrorCode = (status: number) => {
     GraphQLModule.forRoot<ApolloDriverConfig>({
       driver: ApolloDriver,
       autoSchemaFile: true,
-      context: ({ req, res }) => ({ req, res }),
+      context: ({ req, res }: ExpressContextFunctionArgument) => ({ req, res }),
       formatError: (formattedError, error) => {
         const originalError = error instanceof GraphQLError ? error.originalError : undefined;
         const extensions = Object.fromEntries(

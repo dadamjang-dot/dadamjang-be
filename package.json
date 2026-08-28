@@ -69,6 +69,7 @@
     "@types/jest": "^30.0.0",
     "@types/multer": "^2.2.0",
     "@types/node": "^26.1.1",
+    "@types/passport": "1.0.17",
     "@types/passport-jwt": "^4.0.1",
     "@types/passport-kakao": "^1.0.3",
     "@types/pg": "^8.20.0",
