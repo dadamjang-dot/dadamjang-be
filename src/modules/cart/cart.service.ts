@@ -70,7 +70,11 @@ export class CartService {
   removeItem = async (userId: string, skuId: string) => {
     await this.db.transaction(async (tx) => {
       const cart = await this.getOrCreateLockedCart(tx, userId);
-      await tx.delete(cartItems).where(and(eq(cartItems.cartId, cart.cartId), eq(cartItems.skuId, skuId)));
+      const [removed] = await tx
+        .delete(cartItems)
+        .where(and(eq(cartItems.cartId, cart.cartId), eq(cartItems.skuId, skuId)))
+        .returning({ skuId: cartItems.skuId });
+      if (!removed) return;
       await tx.insert(activityEvents).values({
         actorUserId: userId,
         eventType: "CART_ITEM_REMOVED",
