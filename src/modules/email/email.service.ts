@@ -1,31 +1,36 @@
-import { Inject, Injectable } from "@nestjs/common";
+import { Injectable } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import * as bcrypt from "bcrypt";
-import { createHash, randomBytes, randomInt } from "crypto";
+import { createHash, randomBytes } from "crypto";
 import {
   CustomBadRequestException,
-  CustomServiceUnavailableException,
   CustomTooManyRequestsException,
   CustomUnauthorizedException,
 } from "src/common/errors/custom-exceptions";
 import { AdmissionLimiter, type AdmissionRule, type RequestOrigin } from "src/modules/admission/admission-limiter";
-import { EmailSender } from "./email.sender";
+import type { DatabaseTransaction } from "src/modules/database/database.module";
 import { EmailErrorMessage } from "./email.error";
+import { emailCodeSecret, encryptEmailPayload } from "./email.outbox";
 import { EmailRepository } from "./email.repository";
-import { EmailVerificationPurpose, type EmailVerificationPurposeValue } from "./email.types";
+import {
+  EmailDeliveryKind,
+  EmailVerificationPurpose,
+  type EmailDeliveryKindValue,
+  type EmailVerificationPurposeValue,
+} from "./email.types";
 
 @Injectable()
 export class EmailService {
   constructor(
     private readonly repository: EmailRepository,
     private readonly configService: ConfigService,
-    @Inject("EmailSender") private readonly sender: EmailSender,
     private readonly admissionLimiter: AdmissionLimiter,
   ) {}
   requestSignupCode = async (email: string, origin: RequestOrigin) => {
     const normalizedEmail = this.normalizeEmail(email);
     await this.admitEmailDelivery(normalizedEmail, origin);
-    return this.issueCode(normalizedEmail, EmailVerificationPurpose.Signup, origin.ip);
+    await this.queueDelivery(normalizedEmail, origin.ip, EmailDeliveryKind.SignupCode, 10 * 60_000);
+    return { ok: true };
   };
   requestPasswordResetCode = (email: string, origin: RequestOrigin) => this.requestRecoveryCode(email, origin);
   verifySignupCode = (email: string, code: string, origin: RequestOrigin = { ip: "unknown" }) =>
@@ -35,29 +40,7 @@ export class EmailService {
   private requestRecoveryCode = async (email: string, origin: RequestOrigin) => {
     const normalizedEmail = this.normalizeEmail(email);
     await this.admitEmailDelivery(normalizedEmail, origin);
-    const user = await this.repository.findUserByEmail(normalizedEmail);
-    if (user) return this.issueCode(normalizedEmail, EmailVerificationPurpose.PasswordReset, origin.ip);
-    await bcrypt.hash(this.pepperedCode(normalizedEmail, "000000", EmailVerificationPurpose.PasswordReset), 10);
-    return { ok: true };
-  };
-  private issueCode = async (normalizedEmail: string, purpose: EmailVerificationPurposeValue, ip: string) => {
-    const now = new Date();
-    const ipHash = this.sha256(ip);
-    const code = String(randomInt(1_000_000)).padStart(6, "0");
-    const verification = await this.repository.createVerification({
-      email: normalizedEmail,
-      purpose,
-      codeHash: await bcrypt.hash(this.pepperedCode(normalizedEmail, code, purpose), 10),
-      expiresAt: new Date(now.getTime() + 5 * 60 * 1000),
-      requestIpHash: ipHash,
-    });
-    try {
-      await this.sender.sendCode(normalizedEmail, code);
-    } catch {
-      await this.repository.deleteVerification(verification.id);
-      if (purpose === EmailVerificationPurpose.Signup)
-        throw new CustomServiceUnavailableException(EmailErrorMessage.EmailSendFailed);
-    }
+    await this.queueDelivery(normalizedEmail, origin.ip, EmailDeliveryKind.PasswordResetCode, 10 * 60_000);
     return { ok: true };
   };
   private verifyCode = async (
@@ -97,8 +80,7 @@ export class EmailService {
   requestPasswordReset = async (email: string, origin: RequestOrigin) => {
     const normalizedEmail = this.normalizeEmail(email);
     await this.admitEmailDelivery(normalizedEmail, origin);
-    const user = await this.repository.findUserByEmail(normalizedEmail);
-    if (user) await this.requestPasswordResetForUser(user, origin.ip);
+    await this.queueDelivery(normalizedEmail, origin.ip, EmailDeliveryKind.PasswordResetLink, 20 * 60_000);
     return { ok: true };
   };
   resetPassword = async (token: string, password: string, origin: RequestOrigin = { ip: "unknown" }) => {
@@ -138,31 +120,26 @@ export class EmailService {
     if (password.length < 8 || Buffer.byteLength(password, "utf8") > 72)
       throw new CustomBadRequestException(EmailErrorMessage.InvalidPassword);
   };
-  sendAdminInvite = (email: string, token: string) => {
-    const boUrl = this.configService.getOrThrow<string>("DADAMJANG_BO_URL").replace(/\/$/, "");
-    return this.sender.sendLink(email, "다담장 관리자 초대", `${boUrl}/invite/accept#token=${token}`);
-  };
-  private requestPasswordResetForUser = async (user: { userId: string; email: string }, ip: string) => {
-    const token = this.createOpaqueToken();
-    await this.repository.createPasswordResetToken(
-      token,
-      user.userId,
-      new Date(Date.now() + 15 * 60 * 1000),
-      this.sha256(ip),
+  queueAdminInvite = (transaction: DatabaseTransaction, email: string, token: string, inviteId: string) =>
+    this.repository.enqueueDelivery(
+      {
+        email,
+        expiresAt: new Date(Date.now() + 23 * 60 * 60_000),
+        kind: EmailDeliveryKind.AdminInvite,
+        payloadCiphertext: encryptEmailPayload(token, this.configService.getOrThrow<string>("EMAIL_CODE_PEPPER")),
+        proofId: inviteId,
+      },
+      transaction,
     );
-    const clientUrl = this.configService.getOrThrow<string>("CLIENT_URL").replace(/\/$/, "");
-    try {
-      await this.sender.sendLink(
-        user.email,
-        "비밀번호 재설정",
-        `${clientUrl}/account-recovery/password#token=${token}`,
-      );
-    } catch {
-      await this.repository.deletePasswordResetToken(token);
-    }
-  };
   private pepperedCode = (email: string, code: string, purpose: EmailVerificationPurposeValue) =>
-    `${email}:${code}:${purpose}:${this.configService.getOrThrow<string>("EMAIL_CODE_PEPPER")}`;
+    emailCodeSecret(email, code, purpose, this.configService.getOrThrow<string>("EMAIL_CODE_PEPPER"));
+  private queueDelivery = (email: string, ip: string, kind: EmailDeliveryKindValue, lifetimeMs: number) =>
+    this.repository.enqueueDelivery({
+      email,
+      expiresAt: new Date(Date.now() + lifetimeMs),
+      kind,
+      requestIpHash: this.sha256(ip),
+    });
   private admitEmailDelivery = (email: string, origin: RequestOrigin) =>
     this.admissionLimiter.assertAllowed(
       "EMAIL_DELIVERY",

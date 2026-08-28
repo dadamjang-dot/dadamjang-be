@@ -1,11 +1,15 @@
 import { Global, Module, OnApplicationShutdown } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
+import type { ExtractTablesWithRelations } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/node-postgres";
+import type { NodePgTransaction } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
 import * as schema from "./schema";
 
 export const DRIZZLE = Symbol("DRIZZLE");
 export type Database = ReturnType<typeof drizzle<typeof schema>>;
+export type DatabaseTransaction = NodePgTransaction<typeof schema, ExtractTablesWithRelations<typeof schema>>;
+export type DatabaseExecutor = Database | DatabaseTransaction;
 
 class DatabasePool extends Pool implements OnApplicationShutdown {
   onApplicationShutdown = async () => {

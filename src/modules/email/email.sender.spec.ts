@@ -8,8 +8,13 @@ describe("DevEmailSender", () => {
     const sender = new DevEmailSender({ get: jest.fn() } as unknown as ConfigService);
 
     try {
-      await sender.sendCode("user@example.test", "123456");
-      await sender.sendLink("user@example.test", "비밀번호 재설정", "https://example.test/reset#token=reset-secret");
+      await sender.sendCode("user@example.test", "123456", "code-id");
+      await sender.sendLink(
+        "user@example.test",
+        "비밀번호 재설정",
+        "https://example.test/reset#token=reset-secret",
+        "link-id",
+      );
       const output = log.mock.calls.flat().join(" ");
       expect(output).not.toContain("123456");
       expect(output).not.toContain("reset-secret");
@@ -31,11 +36,12 @@ describe("ResendEmailSender", () => {
     } as unknown as ConfigService);
 
     try {
-      await sender.sendCode("recipient@example.test", "123456");
+      await sender.sendCode("recipient@example.test", "123456", "email-delivery/job-id");
       const request = send.mock.calls[0]?.[1];
       expect(request?.headers).toEqual({
         authorization: "Bearer resend-api-key",
         "content-type": "application/json",
+        "idempotency-key": "email-delivery/job-id",
       });
       expect(JSON.parse(String(request?.body))).toEqual(
         expect.objectContaining({ from: "sender@example.test", to: ["recipient@example.test"] }),
@@ -56,7 +62,9 @@ describe("ResendEmailSender", () => {
     } as unknown as ConfigService);
 
     try {
-      await expect(sender.sendCode("recipient@example.test", "123456")).rejects.toThrow("Resend request timed out");
+      await expect(sender.sendCode("recipient@example.test", "123456", "timeout-id")).rejects.toThrow(
+        "Resend request timed out",
+      );
       expect(timeout).toHaveBeenCalledWith(10_000);
       expect(send.mock.calls[0]?.[1]?.signal).toBe(timeoutSignal);
     } finally {

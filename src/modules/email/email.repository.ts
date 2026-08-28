@@ -1,9 +1,12 @@
 import { Inject, Injectable } from "@nestjs/common";
-import { and, desc, eq, gt, isNull, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNull, lt, lte, or, sql } from "drizzle-orm";
+import { randomUUID } from "crypto";
 import { requireResult } from "src/common/invariants/require-result";
 import { hashToken } from "src/common/security/token-hash";
-import { Database, DRIZZLE } from "src/modules/database/database.module";
+import { Database, type DatabaseExecutor, DRIZZLE } from "src/modules/database/database.module";
 import {
+  adminInvites,
+  emailDeliveryOutbox,
   emailVerificationTokens,
   emailVerifications,
   passwordResetTokens,
@@ -11,21 +14,26 @@ import {
   users,
   type EmailVerification,
 } from "src/modules/database/schema";
-import type { EmailVerificationPurposeValue } from "./email.types";
+import {
+  EmailDeliveryKind,
+  EmailVerificationPurpose,
+  type EmailDeliveryKindValue,
+  type EmailVerificationPurposeValue,
+} from "./email.types";
+
+type Delivery = typeof emailDeliveryOutbox.$inferSelect;
+type ClaimedDelivery = Delivery & { claimToken: string };
+
+type DeliveryPreparation = Readonly<{
+  codeHash?: string;
+  payloadCiphertext: string;
+  proofExpiresAt: Date;
+  token?: string;
+}>;
 
 @Injectable()
 export class EmailRepository {
   constructor(@Inject(DRIZZLE) private readonly db: Database) {}
-  createVerification = async (input: {
-    email: string;
-    purpose: EmailVerificationPurposeValue;
-    codeHash: string;
-    expiresAt: Date;
-    requestIpHash: string;
-  }) => requireResult((await this.db.insert(emailVerifications).values(input).returning())[0]);
-  deleteVerification = async (id: string) => {
-    await this.db.delete(emailVerifications).where(eq(emailVerifications.id, id));
-  };
   latestVerification = (
     email: string,
     purpose: EmailVerificationPurposeValue,
@@ -77,7 +85,6 @@ export class EmailRepository {
         )
         .returning()
     )[0];
-  findUserByEmail = (email: string) => this.db.query.users.findFirst({ where: eq(users.email, email) });
   hasValidRecoveryToken = async (token: string) => {
     const tokenHash = hashToken(token);
     const now = new Date();
@@ -107,11 +114,265 @@ export class EmailRepository {
       .limit(1);
     return !!emailProof;
   };
-  createPasswordResetToken = async (token: string, userId: string, expiresAt: Date, requestIpHash: string) => {
-    await this.db.insert(passwordResetTokens).values({ tokenHash: hashToken(token), userId, expiresAt, requestIpHash });
+  enqueueDelivery = async (
+    input: Readonly<{
+      email: string;
+      expiresAt: Date;
+      kind: EmailDeliveryKindValue;
+      payloadCiphertext?: string;
+      proofId?: string;
+      requestIpHash?: string;
+    }>,
+    executor: DatabaseExecutor = this.db,
+  ) =>
+    requireResult(
+      (
+        await executor
+          .insert(emailDeliveryOutbox)
+          .values({
+            email: input.email,
+            expiresAt: input.expiresAt,
+            kind: input.kind,
+            ...(input.payloadCiphertext ? { payloadCiphertext: input.payloadCiphertext } : {}),
+            ...(input.proofId ? { proofId: input.proofId } : {}),
+            ...(input.requestIpHash ? { requestIpHash: input.requestIpHash } : {}),
+          })
+          .returning()
+      )[0],
+    );
+
+  claimDelivery = async (now = new Date()) =>
+    this.db.transaction(async (tx) => {
+      await tx
+        .update(emailDeliveryOutbox)
+        .set({ claimedAt: null, claimToken: null, status: "FAILED", updatedAt: now })
+        .where(
+          and(inArray(emailDeliveryOutbox.status, ["PENDING", "PROCESSING"]), lte(emailDeliveryOutbox.expiresAt, now)),
+        );
+      const staleAt = new Date(now.getTime() - 30_000);
+      const [delivery] = await tx
+        .select()
+        .from(emailDeliveryOutbox)
+        .where(
+          and(
+            gt(emailDeliveryOutbox.expiresAt, now),
+            or(
+              and(eq(emailDeliveryOutbox.status, "PENDING"), lte(emailDeliveryOutbox.availableAt, now)),
+              and(eq(emailDeliveryOutbox.status, "PROCESSING"), lt(emailDeliveryOutbox.claimedAt, staleAt)),
+            ),
+          ),
+        )
+        .orderBy(asc(emailDeliveryOutbox.availableAt), asc(emailDeliveryOutbox.createdAt), asc(emailDeliveryOutbox.id))
+        .limit(1)
+        .for("update", { skipLocked: true });
+      if (!delivery) return undefined;
+      const claimToken = randomUUID();
+      const claimed = requireResult(
+        (
+          await tx
+            .update(emailDeliveryOutbox)
+            .set({
+              attemptCount: sql`${emailDeliveryOutbox.attemptCount} + 1`,
+              claimedAt: now,
+              claimToken,
+              status: "PROCESSING",
+              updatedAt: now,
+            })
+            .where(eq(emailDeliveryOutbox.id, delivery.id))
+            .returning()
+        )[0],
+      );
+      return { ...claimed, claimToken } as ClaimedDelivery;
+    });
+
+  prepareDelivery = async (claimed: ClaimedDelivery, preparation: DeliveryPreparation, now = new Date()) =>
+    this.db.transaction(async (tx) => {
+      const [delivery] = await tx
+        .select()
+        .from(emailDeliveryOutbox)
+        .where(
+          and(
+            eq(emailDeliveryOutbox.id, claimed.id),
+            eq(emailDeliveryOutbox.claimToken, claimed.claimToken),
+            eq(emailDeliveryOutbox.status, "PROCESSING"),
+          ),
+        )
+        .limit(1)
+        .for("update");
+      if (!delivery) throw new Error("Email delivery claim was lost");
+      if (delivery.payloadCiphertext && delivery.proofId)
+        return {
+          ...delivery,
+          claimToken: claimed.claimToken,
+          payloadCiphertext: delivery.payloadCiphertext,
+          proofId: delivery.proofId,
+        };
+      const purpose =
+        delivery.kind === EmailDeliveryKind.SignupCode
+          ? EmailVerificationPurpose.Signup
+          : EmailVerificationPurpose.PasswordReset;
+      const user =
+        delivery.kind === EmailDeliveryKind.SignupCode
+          ? { email: delivery.email }
+          : await tx.query.users.findFirst({ where: eq(users.email, delivery.email) });
+      if (!user) {
+        await tx
+          .update(emailDeliveryOutbox)
+          .set({ claimToken: null, claimedAt: null, status: "SUPPRESSED", updatedAt: now })
+          .where(eq(emailDeliveryOutbox.id, delivery.id));
+        return undefined;
+      }
+      let proofId: string;
+      if (delivery.kind === EmailDeliveryKind.PasswordResetLink) {
+        const token = requireResult(preparation.token);
+        const tokenHash = hashToken(token);
+        await tx.insert(passwordResetTokens).values({
+          tokenHash,
+          userId: requireResult("userId" in user ? user.userId : undefined),
+          expiresAt: preparation.proofExpiresAt,
+          requestIpHash: delivery.requestIpHash,
+        });
+        proofId = tokenHash;
+      } else {
+        const verification = requireResult(
+          (
+            await tx
+              .insert(emailVerifications)
+              .values({
+                email: delivery.email,
+                purpose,
+                codeHash: requireResult(preparation.codeHash),
+                expiresAt: preparation.proofExpiresAt,
+                requestIpHash: delivery.requestIpHash,
+              })
+              .returning({ id: emailVerifications.id })
+          )[0],
+        );
+        proofId = verification.id;
+      }
+      const prepared = requireResult(
+        (
+          await tx
+            .update(emailDeliveryOutbox)
+            .set({
+              expiresAt: preparation.proofExpiresAt,
+              payloadCiphertext: preparation.payloadCiphertext,
+              proofId,
+              updatedAt: now,
+            })
+            .where(eq(emailDeliveryOutbox.id, delivery.id))
+            .returning()
+        )[0],
+      );
+      return {
+        ...prepared,
+        claimToken: claimed.claimToken,
+        payloadCiphertext: preparation.payloadCiphertext,
+        proofId,
+      };
+    });
+
+  isDeliveryCurrent = async (delivery: Delivery & { proofId: string }, secret: string, now = new Date()) => {
+    if (delivery.kind === EmailDeliveryKind.AdminInvite) {
+      const [invite] = await this.db
+        .select({ inviteId: adminInvites.inviteId })
+        .from(adminInvites)
+        .where(
+          and(
+            eq(adminInvites.inviteId, delivery.proofId),
+            eq(adminInvites.email, delivery.email),
+            eq(adminInvites.tokenHash, hashToken(secret)),
+            isNull(adminInvites.acceptedAt),
+            isNull(adminInvites.revokedAt),
+            gt(adminInvites.expiresAt, now),
+          ),
+        )
+        .limit(1);
+      return !!invite;
+    }
+    if (delivery.kind === EmailDeliveryKind.PasswordResetLink) {
+      const [token] = await this.db
+        .select({ tokenHash: passwordResetTokens.tokenHash })
+        .from(passwordResetTokens)
+        .where(
+          and(
+            eq(passwordResetTokens.tokenHash, delivery.proofId),
+            isNull(passwordResetTokens.usedAt),
+            gt(passwordResetTokens.expiresAt, now),
+          ),
+        )
+        .limit(1);
+      return !!token;
+    }
+    const purpose = delivery.kind === EmailDeliveryKind.SignupCode ? "SIGNUP" : "PASSWORD_RESET";
+    const [verification] = await this.db
+      .select({ id: emailVerifications.id })
+      .from(emailVerifications)
+      .where(
+        and(
+          eq(emailVerifications.id, delivery.proofId),
+          eq(emailVerifications.email, delivery.email),
+          eq(emailVerifications.purpose, purpose),
+          isNull(emailVerifications.verifiedAt),
+          gt(emailVerifications.expiresAt, now),
+        ),
+      )
+      .limit(1);
+    return !!verification;
   };
-  deletePasswordResetToken = async (token: string) => {
-    await this.db.delete(passwordResetTokens).where(eq(passwordResetTokens.tokenHash, hashToken(token)));
+
+  completeDelivery = async (id: string, claimToken: string, now = new Date()) => {
+    const [completed] = await this.db
+      .update(emailDeliveryOutbox)
+      .set({ claimToken: null, claimedAt: null, sentAt: now, status: "SENT", updatedAt: now })
+      .where(
+        and(
+          eq(emailDeliveryOutbox.id, id),
+          eq(emailDeliveryOutbox.claimToken, claimToken),
+          eq(emailDeliveryOutbox.status, "PROCESSING"),
+        ),
+      )
+      .returning({ id: emailDeliveryOutbox.id });
+    if (!completed) throw new Error("Email delivery claim was lost");
+  };
+
+  suppressDelivery = async (id: string, claimToken: string, now = new Date()) => {
+    await this.db
+      .update(emailDeliveryOutbox)
+      .set({ claimToken: null, claimedAt: null, status: "SUPPRESSED", updatedAt: now })
+      .where(
+        and(
+          eq(emailDeliveryOutbox.id, id),
+          eq(emailDeliveryOutbox.claimToken, claimToken),
+          eq(emailDeliveryOutbox.status, "PROCESSING"),
+        ),
+      );
+  };
+
+  retryDelivery = async (delivery: ClaimedDelivery, error: unknown, now = new Date()) => {
+    const retryAt = new Date(now.getTime() + Math.min(2 ** delivery.attemptCount, 300) * 1_000);
+    const retry = delivery.attemptCount < 8 && retryAt.getTime() < delivery.expiresAt.getTime();
+    const message = (error instanceof Error ? `${error.name}: ${error.message}` : "Unknown delivery error").slice(
+      0,
+      500,
+    );
+    await this.db
+      .update(emailDeliveryOutbox)
+      .set({
+        availableAt: retry ? retryAt : delivery.expiresAt,
+        claimToken: null,
+        claimedAt: null,
+        lastError: message,
+        status: retry ? "PENDING" : "FAILED",
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(emailDeliveryOutbox.id, delivery.id),
+          eq(emailDeliveryOutbox.claimToken, delivery.claimToken),
+          eq(emailDeliveryOutbox.status, "PROCESSING"),
+        ),
+      );
   };
   resetPasswordWithToken = (token: string, password: string) =>
     this.db.transaction(async (tx) => {

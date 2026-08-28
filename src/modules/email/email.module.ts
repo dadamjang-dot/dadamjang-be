@@ -3,6 +3,7 @@ import { ConfigService } from "@nestjs/config";
 import { AdmissionModule } from "src/modules/admission/admission.module";
 import { EmailRepository } from "./email.repository";
 import { DevEmailSender, ResendEmailSender } from "./email.sender";
+import { EmailDeliveryWorker } from "./email.outbox";
 import { EmailResolver } from "./email.resolver";
 import { EmailService } from "./email.service";
 
@@ -12,6 +13,7 @@ import { EmailService } from "./email.service";
     EmailResolver,
     EmailService,
     EmailRepository,
+    EmailDeliveryWorker,
     {
       provide: "EmailSender",
       inject: [ConfigService],
@@ -29,6 +31,6 @@ import { EmailService } from "./email.service";
       },
     },
   ],
-  exports: [EmailService],
+  exports: [EmailDeliveryWorker, EmailService],
 })
 export class EmailModule {}

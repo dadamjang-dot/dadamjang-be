@@ -8,6 +8,7 @@ process.env.KAKAO_CLIENT_ID ??= "integration-kakao-client";
 process.env.KAKAO_CALLBACK_URL ??= "http://localhost/auth/kakao/callback";
 process.env.EMAIL_CODE_PEPPER ??= "integration-email-pepper";
 process.env.EMAIL_DEV_FAIL_RECIPIENT ??= "failed-delivery@example.test";
+process.env.EMAIL_OUTBOX_WORKER_ENABLED ??= "false";
 process.env.IDENTITY_CI_PEPPER ??= "integration-identity-pepper";
 process.env.IDENTITY_VERIFICATION_MOCK_ENABLED ??= "true";
 process.env.IDENTITY_INICIS_CALLBACK_BASE_URL ??= "http://localhost:5500";

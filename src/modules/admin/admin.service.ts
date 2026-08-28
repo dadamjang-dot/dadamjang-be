@@ -6,7 +6,6 @@ import {
   CustomBadRequestException,
   CustomConflictException,
   CustomNotFoundException,
-  CustomServiceUnavailableException,
 } from "src/common/errors/custom-exceptions";
 import { requireResult } from "src/common/invariants/require-result";
 import { hashToken } from "src/common/security/token-hash";
@@ -613,11 +612,7 @@ export class AdminService {
         )[0],
       );
       inviteId = invite.inviteId;
-      try {
-        await this.emailService.sendAdminInvite(email, token);
-      } catch {
-        throw new CustomServiceUnavailableException(AdminErrorMessage.InviteEmailFailed);
-      }
+      await this.emailService.queueAdminInvite(tx, email, token, invite.inviteId);
       await tx.insert(auditLogs).values({
         actorUserId: adminUserId,
         action: "ADMIN_INVITED",

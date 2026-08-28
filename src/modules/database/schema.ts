@@ -111,6 +111,64 @@ export const requestAdmissions = pgTable(
   ],
 );
 
+export const emailDeliveryOutbox = pgTable(
+  "emailDeliveryOutbox",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    kind: varchar("kind", { length: 40 }).notNull(),
+    email: varchar("email", { length: 255 }).notNull(),
+    requestIpHash: varchar("requestIpHash", { length: 64 }),
+    payloadCiphertext: text("payloadCiphertext"),
+    proofId: text("proofId"),
+    status: varchar("status", { length: 20 }).notNull().default("PENDING"),
+    attemptCount: integer("attemptCount").notNull().default(0),
+    availableAt: timestamp("availableAt", { withTimezone: true }).defaultNow().notNull(),
+    claimedAt: timestamp("claimedAt", { withTimezone: true }),
+    claimToken: uuid("claimToken"),
+    expiresAt: timestamp("expiresAt", { withTimezone: true }).notNull(),
+    sentAt: timestamp("sentAt", { withTimezone: true }),
+    lastError: varchar("lastError", { length: 500 }),
+    createdAt: timestamp("createdAt", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    check(
+      "email_delivery_outbox_kind_check",
+      sql`${table.kind} IN ('SIGNUP_CODE', 'PASSWORD_RESET_CODE', 'PASSWORD_RESET_LINK', 'ADMIN_INVITE')`,
+    ),
+    check(
+      "email_delivery_outbox_status_check",
+      sql`${table.status} IN ('PENDING', 'PROCESSING', 'SENT', 'SUPPRESSED', 'FAILED')`,
+    ),
+    check("email_delivery_outbox_attempt_count_check", sql`${table.attemptCount} >= 0`),
+    check(
+      "email_delivery_outbox_claim_check",
+      sql`(${table.status} = 'PROCESSING' AND ${table.claimedAt} IS NOT NULL AND ${table.claimToken} IS NOT NULL)
+        OR (${table.status} <> 'PROCESSING' AND ${table.claimedAt} IS NULL AND ${table.claimToken} IS NULL)`,
+    ),
+    check(
+      "email_delivery_outbox_payload_check",
+      sql`(${table.payloadCiphertext} IS NULL AND ${table.proofId} IS NULL)
+        OR (${table.payloadCiphertext} IS NOT NULL AND ${table.proofId} IS NOT NULL)`,
+    ),
+    check(
+      "email_delivery_outbox_sent_check",
+      sql`(${table.status} = 'SENT' AND ${table.sentAt} IS NOT NULL)
+        OR (${table.status} <> 'SENT' AND ${table.sentAt} IS NULL)`,
+    ),
+    index("email_delivery_outbox_pending_idx")
+      .on(table.availableAt, table.createdAt, table.id)
+      .where(sql`${table.status} = 'PENDING'`),
+    index("email_delivery_outbox_processing_idx")
+      .on(table.claimedAt, table.createdAt, table.id)
+      .where(sql`${table.status} = 'PROCESSING'`),
+    index("email_delivery_outbox_expiry_idx")
+      .on(table.expiresAt)
+      .where(sql`${table.status} IN ('PENDING', 'PROCESSING')`),
+    index("email_delivery_outbox_email_created_idx").on(table.email, table.createdAt),
+  ],
+);
+
 export const kakaoSignupTokens = pgTable("kakaoSignupToken", {
   tokenHash: text("tokenHash").primaryKey(),
   providerUserId: varchar("providerUserId", { length: 255 }).notNull(),
