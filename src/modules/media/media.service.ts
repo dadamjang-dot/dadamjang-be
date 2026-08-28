@@ -28,7 +28,14 @@ const imageTransformBaseUrl = (value: string) => {
     throw new Error("CLOUDFLARE_IMAGES_TRANSFORM_BASE_URL must be a valid HTTPS URL ending in /cdn-cgi/image");
   }
   const pathname = url.pathname.replace(/\/+$/, "");
-  if (url.protocol !== "https:" || pathname !== "/cdn-cgi/image" || url.search || url.hash)
+  if (
+    url.protocol !== "https:" ||
+    pathname !== "/cdn-cgi/image" ||
+    value.includes("?") ||
+    value.includes("#") ||
+    url.username ||
+    url.password
+  )
     throw new Error("CLOUDFLARE_IMAGES_TRANSFORM_BASE_URL must be a valid HTTPS URL ending in /cdn-cgi/image");
   url.pathname = pathname;
   return url.toString();

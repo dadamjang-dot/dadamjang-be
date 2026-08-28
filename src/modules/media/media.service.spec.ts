@@ -28,8 +28,11 @@ describe("MediaService", () => {
     "https://images.example.com/prefix/cdn-cgi/image",
     "https://images.example.com/cdn-cgi/image/cdn-cgi/image",
     "https://images.example.com/cdn-cgi/image/width=640",
+    "https://images.example.com/cdn-cgi/image?",
     "https://images.example.com/cdn-cgi/image?width=640",
+    "https://images.example.com/cdn-cgi/image#",
     "https://images.example.com/cdn-cgi/image#fragment",
+    "https://user:password@images.example.com/cdn-cgi/image",
   ])("rejects invalid transform base %s at startup", (baseUrl) => {
     expect(() => createService(baseUrl)).toThrow("CLOUDFLARE_IMAGES_TRANSFORM_BASE_URL");
   });
