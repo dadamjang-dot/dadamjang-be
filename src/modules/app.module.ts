@@ -36,20 +36,23 @@ const graphQlErrorCode = (status: number) => {
   return "INTERNAL_SERVER_ERROR";
 };
 
+const productionSecretPlaceholders = new Set(["replace-me", "generate-with-openssl-rand-base64-32"]);
+
+const invalidProductionSecret = (value: unknown) =>
+  typeof value !== "string" || productionSecretPlaceholders.has(value.trim()) || Buffer.byteLength(value, "utf8") < 32;
+
 export const validateConfig = (environment: Record<string, unknown>) => {
   if (environment.NODE_ENV !== "production") return environment;
   const accessSecret = environment.JWT_ACCESS_TOKEN_SECRET;
   const refreshSecret = environment.JWT_REFRESH_TOKEN_SECRET;
-  if (
-    typeof accessSecret !== "string" ||
-    typeof refreshSecret !== "string" ||
-    accessSecret === "replace-me" ||
-    refreshSecret === "replace-me" ||
-    Buffer.byteLength(accessSecret, "utf8") < 32 ||
-    Buffer.byteLength(refreshSecret, "utf8") < 32
-  )
+  if (invalidProductionSecret(accessSecret) || invalidProductionSecret(refreshSecret))
     throw new Error("Production JWT secrets must be at least 32 bytes and must not use placeholders");
   if (accessSecret === refreshSecret) throw new Error("JWT access and refresh secrets must be distinct");
+  const emailPepper = environment.EMAIL_CODE_PEPPER;
+  const identityPepper = environment.IDENTITY_CI_PEPPER;
+  if (invalidProductionSecret(emailPepper) || invalidProductionSecret(identityPepper))
+    throw new Error("Production peppers must be at least 32 bytes and must not use placeholders");
+  if (emailPepper === identityPepper) throw new Error("Production peppers must be distinct");
   return environment;
 };
 
