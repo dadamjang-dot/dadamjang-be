@@ -39,6 +39,7 @@ const STYLE_POST_CATEGORIES = new Set<string>(Object.values(StylePostCategory));
 const STYLE_POST_SORTS = new Set<string>(Object.values(StylePostSort));
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const STYLE_POST_ID_REFERENCE = sql.raw('"stylePosts"."stylePostId"');
+const ANONYMOUS_RANKING_TIMEOUT = "5000ms";
 
 type StylePostCursor = {
   category: StylePostCategory | null;
@@ -312,12 +313,18 @@ export class StylePostsService {
               ),
             )
         : undefined;
-    const pageKeys = await this.db
-      .select({ stylePostId: stylePosts.stylePostId, createdAt: stylePosts.createdAt, sortValue })
-      .from(stylePosts)
-      .where(and(categoryCondition, snapshotCondition, cursorCondition))
-      .orderBy(desc(sortValue), desc(stylePosts.createdAt), desc(stylePosts.stylePostId))
-      .limit(pageSize + 1);
+    const pageKeys = await this.db.transaction(
+      async (tx) => {
+        await tx.execute(sql`select set_config('statement_timeout', ${ANONYMOUS_RANKING_TIMEOUT}, true)`);
+        return tx
+          .select({ stylePostId: stylePosts.stylePostId, createdAt: stylePosts.createdAt, sortValue })
+          .from(stylePosts)
+          .where(and(categoryCondition, snapshotCondition, cursorCondition))
+          .orderBy(desc(sortValue), desc(stylePosts.createdAt), desc(stylePosts.stylePostId))
+          .limit(pageSize + 1);
+      },
+      { accessMode: "read only" },
+    );
     const rowIds = pageKeys.map(({ stylePostId }) => stylePostId);
     const rows = rowIds.length
       ? await this.db.select().from(stylePosts).where(inArray(stylePosts.stylePostId, rowIds))

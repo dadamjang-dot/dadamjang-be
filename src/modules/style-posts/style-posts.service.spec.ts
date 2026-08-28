@@ -1,4 +1,5 @@
 import { StylePostsService } from "./style-posts.service";
+import { PgDialect } from "drizzle-orm/pg-core";
 
 const purchasedQuery = (rows: readonly unknown[]) => {
   const result = Promise.resolve(rows);
@@ -76,5 +77,31 @@ describe("StylePostsService purchased products", () => {
     await service.purchasedStyleProducts("user-1");
 
     expect(query.groupBy).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("StylePostsService ranking budget", () => {
+  it("sets a local statement timeout around style ranking queries", async () => {
+    const query = purchasedQuery([]);
+    const execute = jest.fn().mockResolvedValue(undefined);
+    const select = jest.fn().mockReturnValue(query);
+    const transaction = jest.fn(async (callback: (tx: unknown) => Promise<unknown>) => callback({ execute, select }));
+    const service = new StylePostsService(
+      { select, transaction } as never,
+      {} as never,
+      { getOrThrow: jest.fn().mockReturnValue("cursor-secret") } as never,
+    );
+
+    await expect(service.list()).resolves.toEqual({ nodes: [], hasNextPage: false, nextCursor: null });
+
+    expect(transaction).toHaveBeenCalledTimes(1);
+    expect(execute).toHaveBeenCalledTimes(1);
+    const statement = execute.mock.calls[0]?.[0];
+    if (!statement) return;
+    expect(new PgDialect().sqlToQuery(statement)).toMatchObject({
+      sql: "select set_config('statement_timeout', $1, true)",
+      params: ["5000ms"],
+    });
+    expect(execute.mock.invocationCallOrder[0]).toBeLessThan(select.mock.invocationCallOrder[0]!);
   });
 });

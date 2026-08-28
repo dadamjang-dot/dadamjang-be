@@ -1,11 +1,34 @@
 import { CatalogErrorMessage } from "./catalog.error";
 import { CatalogService, decodeProductCursor, encodeProductCursor } from "./catalog.service";
 import { CreateProductDraftInput, ProductSort } from "./catalog.types";
+import { PgDialect } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
 
 const rawCursor = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url");
 const createCatalogService = () => new CatalogService({} as never, { getProductImageUrl: jest.fn() } as never);
 const CURSOR_CREATED_AT = "2026-07-11T00:00:00.000000Z";
 const CURSOR_PRODUCT_ID = "70000000-0000-4000-8000-000000000001";
+
+const catalogQuery = (rows: readonly unknown[]) => {
+  const result = Promise.resolve(rows);
+  const chain = {
+    activeLowestPrice: sql<number>`0`,
+    activeStockTotal: sql<number>`0`,
+    from: jest.fn(),
+    where: jest.fn(),
+    as: jest.fn(),
+    leftJoinLateral: jest.fn(),
+    orderBy: jest.fn(),
+    limit: jest.fn().mockResolvedValue(rows),
+    then: result.then.bind(result),
+  };
+  chain.from.mockReturnValue(chain);
+  chain.where.mockReturnValue(chain);
+  chain.as.mockReturnValue(chain);
+  chain.leftJoinLateral.mockReturnValue(chain);
+  chain.orderBy.mockReturnValue(chain);
+  return chain;
+};
 
 describe("catalog cursor", () => {
   it.each([
@@ -213,6 +236,36 @@ describe("catalog product batches", () => {
         lowestPriceEvidenceSummary: "현재 옵션 최저가 기준",
       },
     ]);
+  });
+});
+
+describe("catalog ranking budget", () => {
+  it("sets a local statement timeout before catalog ranking queries", async () => {
+    const execute = jest.fn().mockResolvedValue(undefined);
+    const select = jest
+      .fn()
+      .mockReturnValueOnce(catalogQuery([]))
+      .mockReturnValueOnce(catalogQuery([]))
+      .mockReturnValueOnce(catalogQuery([{ count: 0 }]))
+      .mockReturnValueOnce(catalogQuery([]));
+    const transaction = jest.fn(async (callback: (tx: unknown) => Promise<unknown>) => callback({ execute, select }));
+    const service = new CatalogService({ transaction } as never, {} as never);
+
+    await expect(service.listProducts({ sort: ProductSort.POPULAR })).resolves.toEqual({
+      nodes: [],
+      hasNextPage: false,
+      nextCursor: null,
+      totalCount: 0,
+    });
+
+    expect(execute).toHaveBeenCalledTimes(1);
+    const statement = execute.mock.calls[0]?.[0];
+    if (!statement) return;
+    expect(new PgDialect().sqlToQuery(statement)).toMatchObject({
+      sql: "select set_config('statement_timeout', $1, true)",
+      params: ["5000ms"],
+    });
+    expect(execute.mock.invocationCallOrder[0]).toBeLessThan(select.mock.invocationCallOrder[0]!);
   });
 });
 

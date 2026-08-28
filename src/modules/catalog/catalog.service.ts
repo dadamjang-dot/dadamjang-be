@@ -50,6 +50,7 @@ const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3
 const CURSOR_TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.(\d{6})Z$/;
 const DATE_CURSOR_KEYS = ["v", "sort", "createdAt", "productId"];
 const METRIC_CURSOR_KEYS = [...DATE_CURSOR_KEYS, "sortValue"];
+const ANONYMOUS_RANKING_TIMEOUT = "5000ms";
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
@@ -215,6 +216,7 @@ export class CatalogService {
     const cursor = filter.after ? decodeProductCursor(filter.after, selectedSort) : undefined;
     return this.db.transaction(
       async (tx) => {
+        await tx.execute(sql`select set_config('statement_timeout', ${ANONYMOUS_RANKING_TIMEOUT}, true)`);
         const candidateSkuMetrics = this.activeSkuMetrics(tx, "candidateSkuMetrics");
         const activeLowestPrice = sql<number>`${candidateSkuMetrics.activeLowestPrice}`;
         const activeStockTotal = sql<number>`${candidateSkuMetrics.activeStockTotal}`;
