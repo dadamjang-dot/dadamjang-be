@@ -66,6 +66,29 @@ describe("IdentityVerificationService", () => {
     );
   });
 
+  it("does not accept an impossible birthday as an adult", async () => {
+    const repository = {
+      findSession: jest.fn().mockResolvedValue(pendingSession),
+      markVerified: jest.fn().mockImplementation(async (input) => ({
+        ...pendingSession,
+        status: "VERIFIED",
+        ...input,
+      })),
+    } as unknown as IdentityVerificationRepository;
+    const adapter = {
+      verify: jest.fn().mockResolvedValue({
+        ci: "raw-ci",
+        birthday: "20000231",
+        certificateProvider: "KAKAO",
+      }),
+    } as unknown as InicisIdentityAdapter;
+    const service = new IdentityVerificationService(repository, adapter, config);
+
+    await service.callback("session-1", { resultCode: "0000" });
+
+    expect(repository.markVerified).toHaveBeenCalledWith(expect.objectContaining({ isFourteenOrOlder: false }));
+  });
+
   it("returns an already verified callback without verifying it twice", async () => {
     const verifiedSession = { ...pendingSession, status: "VERIFIED" };
     const repository = {

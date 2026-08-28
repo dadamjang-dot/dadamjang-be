@@ -125,10 +125,14 @@ export class IdentityVerificationService {
 
   private isFourteenOrOlder = (birthday: string) => {
     if (!/^\d{8}$/u.test(birthday)) return false;
-    const birthDate = new Date(`${birthday.slice(0, 4)}-${birthday.slice(4, 6)}-${birthday.slice(6, 8)}T00:00:00Z`);
-    const threshold = new Date();
-    threshold.setUTCFullYear(threshold.getUTCFullYear() - 14);
-    return birthDate.getTime() <= threshold.getTime();
+    const year = Number(birthday.slice(0, 4));
+    const month = Number(birthday.slice(4, 6));
+    const day = Number(birthday.slice(6, 8));
+    const birthDate = new Date(Date.UTC(year, month - 1, day));
+    if (birthDate.getUTCFullYear() !== year || birthDate.getUTCMonth() !== month - 1 || birthDate.getUTCDate() !== day)
+      return false;
+    const today = new Date();
+    return birthDate.getTime() <= Date.UTC(today.getUTCFullYear() - 14, today.getUTCMonth(), today.getUTCDate());
   };
 
   private isMockEnabled = () =>
