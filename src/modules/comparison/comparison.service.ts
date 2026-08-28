@@ -1,6 +1,7 @@
 import { Inject, Injectable } from "@nestjs/common";
 import { and, desc, eq } from "drizzle-orm";
 import { CustomNotFoundException } from "src/common/errors/custom-exceptions";
+import { requireResult } from "src/common/invariants/require-result";
 import { ComparisonErrorMessage } from "./comparison.error";
 import { CatalogService } from "src/modules/catalog/catalog.service";
 import { Database, DRIZZLE } from "src/modules/database/database.module";
@@ -27,7 +28,7 @@ export class ComparisonService {
 
     return rows.map(({ comparisonItems: item }) => ({
       ...item,
-      product: productById.get(item.productId)!,
+      product: requireResult(productById.get(item.productId)),
     }));
   };
 

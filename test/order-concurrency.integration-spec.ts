@@ -2,6 +2,7 @@ import type { INestApplication } from "@nestjs/common";
 import type { Pool } from "pg";
 import request from "supertest";
 import { createApp } from "src/app";
+import { requireResult } from "src/common/invariants/require-result";
 import { FIXTURE } from "src/database/fixtures";
 import { resetTestFixtures, testPool } from "./support/database";
 
@@ -247,7 +248,9 @@ describe("PostgreSQL checkout concurrency", () => {
       throw lockError;
     }
 
-    const [checkoutResponse, upsertResponse] = await Promise.all(requests);
+    const responses = await Promise.all(requests);
+    const checkoutResponse = requireResult(responses[0]);
+    const upsertResponse = requireResult(responses[1]);
     expect(checkoutResponse.body.errors).toBeUndefined();
     expect(upsertResponse.body.errors).toBeUndefined();
     const state = await pool.query<{
@@ -292,7 +295,9 @@ describe("PostgreSQL checkout concurrency", () => {
       throw lockError;
     }
 
-    const [removeResponse, checkoutResponse] = await Promise.all(requests);
+    const responses = await Promise.all(requests);
+    const removeResponse = requireResult(responses[0]);
+    const checkoutResponse = requireResult(responses[1]);
     expect(removeResponse.body.errors).toBeUndefined();
     expect(checkoutResponse.body.errors).toBeUndefined();
     const state = await pool.query<{

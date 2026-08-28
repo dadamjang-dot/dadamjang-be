@@ -32,7 +32,7 @@ describe("ResendEmailSender", () => {
 
     try {
       await sender.sendCode("recipient@example.test", "123456");
-      const request = send.mock.calls[0][1];
+      const request = send.mock.calls[0]?.[1];
       expect(request?.headers).toEqual({
         authorization: "Bearer resend-api-key",
         "content-type": "application/json",

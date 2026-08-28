@@ -1,6 +1,7 @@
 import { Inject, Injectable } from "@nestjs/common";
 import { SQL, and, asc, desc, eq, getTableColumns, gte, ilike, inArray, lte, or, sql } from "drizzle-orm";
 import { CustomBadRequestException, CustomNotFoundException } from "src/common/errors/custom-exceptions";
+import { requireResult } from "src/common/invariants/require-result";
 import { Database, DRIZZLE } from "src/modules/database/database.module";
 import { brands, categories, colors, productSkus, products, sizes } from "src/modules/database/schema";
 import { CatalogErrorMessage } from "./catalog.error";
@@ -53,9 +54,11 @@ const hasExactKeys = (value: Record<string, unknown>, expected: string[]) => {
 const isCanonicalCursorTimestamp = (value: string) => {
   const match = CURSOR_TIMESTAMP_PATTERN.exec(value);
   if (!match) return false;
+  const fraction = match[1];
+  if (!fraction) return false;
   const parsed = new Date(value);
   if (Number.isNaN(parsed.getTime())) return false;
-  return `${parsed.toISOString().slice(0, -1)}${match[1].slice(3)}Z` === value;
+  return `${parsed.toISOString().slice(0, -1)}${fraction.slice(3)}Z` === value;
 };
 
 const isProductCursor = (value: unknown): value is ProductCursor => {
@@ -122,8 +125,7 @@ export class CatalogService {
   };
 
   createCategory = async (input: CreateCategoryInput) => {
-    const [category] = await this.db.insert(categories).values(input).returning();
-    return category;
+    return requireResult((await this.db.insert(categories).values(input).returning())[0]);
   };
 
   listProducts = async (filter: ProductFilterInput) => {
@@ -319,7 +321,7 @@ export class CatalogService {
       .where(and(eq(products.productId, productId), eq(products.status, "PUBLISHED")))
       .limit(1);
     if (!product) throw new CustomNotFoundException(CatalogErrorMessage.ProductNotFound);
-    return (await this.withSkus([product]))[0];
+    return requireResult((await this.withSkus([product]))[0]);
   };
 
   getProductsByIds = async (productIds: string[]): Promise<ProductType[]> => {
@@ -336,19 +338,23 @@ export class CatalogService {
     if (input.skus.some((sku) => sku.price < 0 || sku.stock < 0))
       throw new CustomBadRequestException(CatalogErrorMessage.InvalidPriceOrStock);
     return this.db.transaction(async (tx) => {
-      const [product] = await tx
-        .insert(products)
-        .values({
-          partnerId,
-          categoryId: input.categoryId,
-          brandId: input.brandId,
-          title: input.title,
-          description: input.description,
-          imageUrls: input.imageUrls,
-          isOnSale: input.isOnSale,
-          isExpressDelivery: input.isExpressDelivery,
-        })
-        .returning();
+      const product = requireResult(
+        (
+          await tx
+            .insert(products)
+            .values({
+              partnerId,
+              categoryId: input.categoryId,
+              brandId: input.brandId,
+              title: input.title,
+              description: input.description,
+              imageUrls: input.imageUrls,
+              isOnSale: input.isOnSale,
+              isExpressDelivery: input.isExpressDelivery,
+            })
+            .returning()
+        )[0],
+      );
       await tx
         .insert(productSkus)
         .values(input.skus.map((sku, position) => ({ ...sku, position, productId: product.productId })));
@@ -363,7 +369,7 @@ export class CatalogService {
       .where(and(eq(products.productId, productId), eq(products.partnerId, partnerId)))
       .limit(1);
     if (!product) throw new CustomNotFoundException(CatalogErrorMessage.ProductNotFound);
-    return (await this.withSkus([product]))[0];
+    return requireResult((await this.withSkus([product]))[0]);
   };
 
   approveProduct = async (productId: string, approved: boolean, rejectionReason?: string) => {

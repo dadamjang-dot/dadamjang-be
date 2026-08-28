@@ -3,6 +3,7 @@ import * as bcrypt from "bcrypt";
 import type { Pool } from "pg";
 import request from "supertest";
 import { createApp } from "src/app";
+import { requireResult } from "src/common/invariants/require-result";
 import { hashToken } from "src/common/security/token-hash";
 import { FIXTURE } from "src/database/fixtures";
 import { EmailErrorMessage } from "src/modules/email/email.error";
@@ -210,23 +211,25 @@ describe("FO account recovery GraphQL integration", () => {
     const password = await pool.query<{ password: string }>(`SELECT "password" FROM "users" WHERE "userId" = $1`, [
       FIXTURE.userId,
     ]);
-    await expect(bcrypt.compare("PrimaryPassword123!", password.rows[0].password)).resolves.toBe(true);
+    await expect(bcrypt.compare("PrimaryPassword123!", requireResult(password.rows[0]).password)).resolves.toBe(true);
   });
 
   it.each([
     { caseName: "link-link", tokens: ["race-link-a", "race-link-b"] },
     { caseName: "link-email", tokens: ["race-link-a", "race-email-a"] },
     { caseName: "email-email", tokens: ["race-email-a", "race-email-b"] },
-  ])(
+  ] as const)(
     "serializes $caseName password resets for one account",
     async ({ tokens }) => {
       await seedResetRace(pool);
-      const passwords = ["ConcurrentPasswordA123!", "ConcurrentPasswordB123!"];
+      const passwords = ["ConcurrentPasswordA123!", "ConcurrentPasswordB123!"] as const;
       let responses: Awaited<ReturnType<typeof resetPassword>>[];
 
       try {
         await installResetRaceDelay(pool);
-        responses = await Promise.all(tokens.map((token, index) => resetPassword(app, token, passwords[index])));
+        responses = await Promise.all(
+          tokens.map((token, index) => resetPassword(app, token, requireResult(passwords[index]))),
+        );
       } finally {
         await removeResetRaceDelay(pool);
       }
@@ -237,7 +240,7 @@ describe("FO account recovery GraphQL integration", () => {
       const failures = responses.filter((response) => response.body.errors !== undefined);
       expect(successIndexes).toHaveLength(1);
       expect(failures).toHaveLength(1);
-      expect(failures[0].body.errors).toEqual([
+      expect(requireResult(failures[0]).body.errors).toEqual([
         expect.objectContaining({
           message: EmailErrorMessage.InvalidRecoveryToken,
           extensions: expect.objectContaining({ code: "UNAUTHENTICATED" }),
@@ -259,8 +262,10 @@ describe("FO account recovery GraphQL integration", () => {
          WHERE u."userId" = $1`,
         [FIXTURE.userId],
       );
-      expect(state.rows[0]).toEqual(expect.objectContaining({ linkProofs: 0, emailProofs: 0, refreshTokens: 0 }));
-      await expect(bcrypt.compare(passwords[successIndexes[0]], state.rows[0].password)).resolves.toBe(true);
+      const stateRow = requireResult(state.rows[0]);
+      const winningPassword = requireResult(passwords[requireResult(successIndexes[0])]);
+      expect(stateRow).toEqual(expect.objectContaining({ linkProofs: 0, emailProofs: 0, refreshTokens: 0 }));
+      await expect(bcrypt.compare(winningPassword, stateRow.password)).resolves.toBe(true);
     },
     15_000,
   );
@@ -299,7 +304,7 @@ describe("FO account recovery GraphQL integration", () => {
                  AND query ILIKE '%from "users"%for update%'
              ) AS "waiting"`,
         );
-        waitingForLock = waiting.rows[0].waiting;
+        waitingForLock = requireResult(waiting.rows[0]).waiting;
         if (!waitingForLock) await new Promise((resolve) => setTimeout(resolve, 20));
       }
 
@@ -329,8 +334,12 @@ describe("FO account recovery GraphQL integration", () => {
          WHERE u."userId" = $1 AND p."tokenHash" = $2`,
       [FIXTURE.userId, hashToken("expiring-lock-proof")],
     );
-    expect(after.rows[0]).toEqual(
-      expect.objectContaining({ password: before.rows[0].password, proofUsedAt: null, refreshTokens: 1 }),
+    expect(requireResult(after.rows[0])).toEqual(
+      expect.objectContaining({
+        password: requireResult(before.rows[0]).password,
+        proofUsedAt: null,
+        refreshTokens: 1,
+      }),
     );
   }, 10_000);
 

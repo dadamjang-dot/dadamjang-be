@@ -8,6 +8,7 @@ import {
   CustomNotFoundException,
   CustomServiceUnavailableException,
 } from "src/common/errors/custom-exceptions";
+import { requireResult } from "src/common/invariants/require-result";
 import { hashToken } from "src/common/security/token-hash";
 import { CreateCategoryInput } from "src/modules/catalog/catalog.types";
 import { Database, DRIZZLE } from "src/modules/database/database.module";
@@ -401,15 +402,19 @@ export class AdminService {
         })
         .where(and(eq(partners.partnerId, input.partnerId), eq(partners.status, "PENDING")))
         .returning();
-      if (!partner) await this.throwPartnerMutationError(input.partnerId);
+      if (!partner) return this.throwPartnerMutationError(input.partnerId);
       if (input.approved) {
         let brandId = partner.brandId;
         if (!brandId) {
-          const [brand] = await tx
-            .insert(brands)
-            .values({ name: partner.tradeName, slug: `partner-${partner.partnerId}`, isActive: true })
-            .onConflictDoUpdate({ target: brands.slug, set: { name: partner.tradeName, isActive: true } })
-            .returning();
+          const brand = requireResult(
+            (
+              await tx
+                .insert(brands)
+                .values({ name: partner.tradeName, slug: `partner-${partner.partnerId}`, isActive: true })
+                .onConflictDoUpdate({ target: brands.slug, set: { name: partner.tradeName, isActive: true } })
+                .returning()
+            )[0],
+          );
           brandId = brand.brandId;
           await tx
             .update(partners)
@@ -444,7 +449,7 @@ export class AdminService {
         })
         .where(and(eq(products.productId, input.productId), eq(products.approvalStatus, "PENDING")))
         .returning();
-      if (!product) await this.throwProductMutationError(input.productId);
+      if (!product) return this.throwProductMutationError(input.productId);
       await tx.insert(auditLogs).values({
         actorUserId: adminUserId,
         action: input.approved ? "PRODUCT_APPROVED" : "PRODUCT_REJECTED",
@@ -508,7 +513,7 @@ export class AdminService {
     try {
       await this.db.transaction(async (tx) => {
         if (values.parentId) await this.assertCategoryExists(tx, values.parentId);
-        const [category] = await tx.insert(categories).values(values).returning();
+        const category = requireResult((await tx.insert(categories).values(values).returning())[0]);
         categoryId = category.categoryId;
         await tx.insert(auditLogs).values({
           actorUserId: adminUserId,
@@ -547,11 +552,15 @@ export class AdminService {
           sortOrder: input.sortOrder ?? current.sortOrder,
           isActive: input.isActive ?? current.isActive,
         });
-        const [updated] = await tx
-          .update(categories)
-          .set({ ...values, parentId: nextParentId, updatedAt: new Date() })
-          .where(eq(categories.categoryId, input.categoryId))
-          .returning();
+        const updated = requireResult(
+          (
+            await tx
+              .update(categories)
+              .set({ ...values, parentId: nextParentId, updatedAt: new Date() })
+              .where(eq(categories.categoryId, input.categoryId))
+              .returning()
+          )[0],
+        );
         await tx.insert(auditLogs).values({
           actorUserId: adminUserId,
           action: "CATEGORY_UPDATED",
@@ -578,27 +587,31 @@ export class AdminService {
     if (existingUser) throw new CustomBadRequestException(AdminErrorMessage.InviteEmailAlreadyRegistered);
     let inviteId = "";
     await this.db.transaction(async (tx) => {
-      const [invite] = await tx
-        .insert(adminInvites)
-        .values({
-          email,
-          tokenHash: hashToken(token),
-          invitedByUserId: adminUserId,
-          expiresAt: new Date(Date.now() + 72 * 60 * 60 * 1000),
-        })
-        .onConflictDoUpdate({
-          target: adminInvites.email,
-          set: {
-            tokenHash: hashToken(token),
-            invitedByUserId: adminUserId,
-            expiresAt: new Date(Date.now() + 72 * 60 * 60 * 1000),
-            acceptedAt: null,
-            acceptedByUserId: null,
-            revokedAt: null,
-            createdAt: new Date(),
-          },
-        })
-        .returning();
+      const invite = requireResult(
+        (
+          await tx
+            .insert(adminInvites)
+            .values({
+              email,
+              tokenHash: hashToken(token),
+              invitedByUserId: adminUserId,
+              expiresAt: new Date(Date.now() + 72 * 60 * 60 * 1000),
+            })
+            .onConflictDoUpdate({
+              target: adminInvites.email,
+              set: {
+                tokenHash: hashToken(token),
+                invitedByUserId: adminUserId,
+                expiresAt: new Date(Date.now() + 72 * 60 * 60 * 1000),
+                acceptedAt: null,
+                acceptedByUserId: null,
+                revokedAt: null,
+                createdAt: new Date(),
+              },
+            })
+            .returning()
+        )[0],
+      );
       inviteId = invite.inviteId;
       try {
         await this.emailService.sendAdminInvite(email, token);

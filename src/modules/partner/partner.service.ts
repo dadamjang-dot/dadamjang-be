@@ -1,6 +1,7 @@
 import { Inject, Injectable } from "@nestjs/common";
 import { SQL, and, asc, desc, eq, exists, getTableColumns, ilike, inArray, or, sql } from "drizzle-orm";
 import { CustomBadRequestException, CustomNotFoundException } from "src/common/errors/custom-exceptions";
+import { requireResult } from "src/common/invariants/require-result";
 import { Database, DRIZZLE } from "src/modules/database/database.module";
 import {
   activityEvents,
@@ -47,10 +48,14 @@ export class PartnerService {
     if (existing) throw new CustomBadRequestException(PartnerErrorMessage.AlreadyExists);
     const businessEmail = this.emailService.normalizeEmail(input.businessEmail);
     await this.emailService.consumeVerifiedEmailToken(input.businessEmailVerificationToken, businessEmail);
-    const [partner] = await this.db
-      .insert(partners)
-      .values({ ...input, businessEmail, ownerUserId })
-      .returning();
+    const partner = requireResult(
+      (
+        await this.db
+          .insert(partners)
+          .values({ ...input, businessEmail, ownerUserId })
+          .returning()
+      )[0],
+    );
     await this.db.insert(activityEvents).values({
       actorUserId: ownerUserId,
       eventType: "PARTNER_APPLICATION_SUBMITTED",
@@ -159,33 +164,37 @@ export class PartnerService {
       )
       .limit(1);
     if (!product) throw new CustomNotFoundException("Product not found");
-    return (await this.hydrate(ownerUserId, [product]))[0];
+    return requireResult((await this.hydrate(ownerUserId, [product]))[0]);
   };
 
   createDraft = async (ownerUserId: string, input: PartnerProductInput) => {
     const partner = await this.approvedPartner(ownerUserId);
     await this.validate(ownerUserId, input);
     const imageUrls = await Promise.all(input.imageKeys.map((key) => this.mediaService.getProductImageUrl(key)));
-    const [created] = await this.db.transaction(async (tx) => {
-      const [product] = await tx
-        .insert(products)
-        .values({
-          partnerId: partner.partnerId,
-          brandId: partner.brandId,
-          categoryId: input.categoryId,
-          title: input.title.trim(),
-          description: input.description.trim(),
-          imageKeys: input.imageKeys,
-          imageUrls,
-          approvalStatus: "DRAFT",
-          isOnSale: input.isOnSale,
-          isExpressDelivery: input.isExpressDelivery,
-        })
-        .returning();
+    const created = await this.db.transaction(async (tx) => {
+      const product = requireResult(
+        (
+          await tx
+            .insert(products)
+            .values({
+              partnerId: partner.partnerId,
+              brandId: partner.brandId,
+              categoryId: input.categoryId,
+              title: input.title.trim(),
+              description: input.description.trim(),
+              imageKeys: input.imageKeys,
+              imageUrls,
+              approvalStatus: "DRAFT",
+              isOnSale: input.isOnSale,
+              isExpressDelivery: input.isExpressDelivery,
+            })
+            .returning()
+        )[0],
+      );
       await tx
         .insert(productSkus)
         .values(input.skus.map((sku, position) => ({ ...sku, position, productId: product.productId })));
-      return [product];
+      return product;
     });
     return this.getProduct(ownerUserId, created.productId);
   };

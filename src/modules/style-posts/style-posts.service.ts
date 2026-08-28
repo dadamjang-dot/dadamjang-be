@@ -3,6 +3,7 @@ import { ConfigService } from "@nestjs/config";
 import { createHmac, timingSafeEqual } from "crypto";
 import { and, asc, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import { CustomBadRequestException, CustomNotFoundException } from "src/common/errors/custom-exceptions";
+import { requireResult } from "src/common/invariants/require-result";
 import { Database, DRIZZLE } from "src/modules/database/database.module";
 import {
   brands,
@@ -200,21 +201,25 @@ export class StylePostsService {
     const imageUrls = imageKeys.map((key) => this.mediaService.getStylePostImageUrl(key));
     try {
       const post = await this.db.transaction(async (tx) => {
-        const [created] = await tx
-          .insert(stylePosts)
-          .values({
-            authorId,
-            title: content.slice(0, 200),
-            content,
-            imageUrls,
-            category: input.category,
-            hashtags,
-            brandTagIds,
-            imageKeys,
-            idempotencyKey,
-            isPartner,
-          })
-          .returning();
+        const created = requireResult(
+          (
+            await tx
+              .insert(stylePosts)
+              .values({
+                authorId,
+                title: content.slice(0, 200),
+                content,
+                imageUrls,
+                category: input.category,
+                hashtags,
+                brandTagIds,
+                imageKeys,
+                idempotencyKey,
+                isPartner,
+              })
+              .returning()
+          )[0],
+        );
         await tx
           .insert(stylePostProducts)
           .values(productIds.map((productId) => ({ stylePostId: created.stylePostId, productId })));
@@ -237,8 +242,7 @@ export class StylePostsService {
     if (!UUID_PATTERN.test(stylePostId)) throw new CustomBadRequestException(StylePostErrorMessage.InvalidStylePostId);
     const [post] = await this.db.select().from(stylePosts).where(eq(stylePosts.stylePostId, stylePostId)).limit(1);
     if (!post) throw new CustomNotFoundException(StylePostErrorMessage.NotFound);
-    const [result] = await this.hydrate([post], viewerId);
-    return result;
+    return requireResult((await this.hydrate([post], viewerId))[0]);
   };
 
   list = async (

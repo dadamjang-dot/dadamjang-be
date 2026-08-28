@@ -2,6 +2,7 @@ import type { INestApplication } from "@nestjs/common";
 import type { Pool } from "pg";
 import request from "supertest";
 import { createApp } from "src/app";
+import { requireResult } from "src/common/invariants/require-result";
 import { FIXTURE } from "src/database/fixtures";
 import { decodeProductCursor, encodeProductCursor } from "src/modules/catalog/catalog.service";
 import { ProductSort } from "src/modules/catalog/catalog.types";
@@ -42,6 +43,8 @@ const flattenPlan = (plan: ExplainPlan): ExplainPlan[] => [
   plan,
   ...(plan.Plans?.flatMap((child) => flattenPlan(child)) ?? []),
 ];
+
+const explainPlan = (rows: { "QUERY PLAN": [{ Plan: ExplainPlan }] }[]) => requireResult(rows[0])["QUERY PLAN"][0].Plan;
 
 describe("catalog PostgreSQL integration", () => {
   let app: INestApplication;
@@ -321,11 +324,11 @@ describe("catalog PostgreSQL integration", () => {
       const plans = [
         {
           name: "products_catalog_default_keyset_idx",
-          nodes: flattenPlan(defaultPlan.rows[0]["QUERY PLAN"][0].Plan),
+          nodes: flattenPlan(explainPlan(defaultPlan.rows)),
         },
         {
           name: "products_catalog_category_keyset_idx",
-          nodes: flattenPlan(categoryPlan.rows[0]["QUERY PLAN"][0].Plan),
+          nodes: flattenPlan(explainPlan(categoryPlan.rows)),
         },
       ];
 
@@ -367,7 +370,7 @@ describe("catalog PostgreSQL integration", () => {
       `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ${candidate.text}`,
       candidate.values,
     );
-    const nodes = flattenPlan(planResult.rows[0]["QUERY PLAN"][0].Plan);
+    const nodes = flattenPlan(explainPlan(planResult.rows));
     const sort = nodes.find((node) => node["Node Type"] === "Sort");
     const aggregate = nodes.find((node) => node["Node Type"] === "Aggregate" && node["Actual Loops"] === 12);
 

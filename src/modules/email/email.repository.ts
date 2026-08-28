@@ -1,5 +1,6 @@
 import { Inject, Injectable } from "@nestjs/common";
 import { and, desc, eq, gte, gt, isNull, sql } from "drizzle-orm";
+import { requireResult } from "src/common/invariants/require-result";
 import { hashToken } from "src/common/security/token-hash";
 import { Database, DRIZZLE } from "src/modules/database/database.module";
 import {
@@ -21,7 +22,7 @@ export class EmailRepository {
     codeHash: string;
     expiresAt: Date;
     requestIpHash: string;
-  }) => (await this.db.insert(emailVerifications).values(input).returning())[0];
+  }) => requireResult((await this.db.insert(emailVerifications).values(input).returning())[0]);
   deleteVerification = async (id: string) => {
     await this.db.delete(emailVerifications).where(eq(emailVerifications.id, id));
   };

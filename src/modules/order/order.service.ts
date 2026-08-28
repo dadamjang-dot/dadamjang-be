@@ -1,6 +1,7 @@
 import { Inject, Injectable } from "@nestjs/common";
 import { and, desc, eq } from "drizzle-orm";
 import { CustomBadRequestException, CustomNotFoundException } from "src/common/errors/custom-exceptions";
+import { requireResult } from "src/common/invariants/require-result";
 import { OrderErrorMessage, getInsufficientStockMessage } from "./order.error";
 import { Database, DRIZZLE } from "src/modules/database/database.module";
 import {
@@ -65,7 +66,9 @@ export class OrderService {
       if (insufficientStock)
         throw new CustomBadRequestException(getInsufficientStockMessage(insufficientStock.productSkus.code));
       const totalAmount = rows.reduce((sum, row) => sum + row.productSkus.price * row.cartItems.quantity, 0);
-      const [order] = await tx.insert(orders).values({ orderNumber: orderNumber(), userId, totalAmount }).returning();
+      const order = requireResult(
+        (await tx.insert(orders).values({ orderNumber: orderNumber(), userId, totalAmount }).returning())[0],
+      );
       await tx.insert(orderItems).values(
         rows.map(({ cartItems: item, productSkus: sku, products: product }) => ({
           orderId: order.orderId,
