@@ -11,12 +11,16 @@ describe("OrderService", () => {
     await expect(service.checkoutCart("user-1", {})).rejects.toThrow(OrderErrorMessage.IdempotencyKeyRequired);
   });
 
-  it("rejects an empty cart before calling payment", async () => {
+  it("rejects an empty cart after claiming an idempotency key", async () => {
     const db = {
       transaction: async (callback: (tx: unknown) => Promise<unknown>) =>
         callback({
-          select: () => ({ from: () => ({ where: () => ({ limit: async () => [] }) }) }),
-          insert: () => ({ values: () => ({ returning: async () => [{ checkoutIdempotencyKeyId: "key-1" }] }) }),
+          select: () => ({ from: () => ({ where: () => ({ limit: () => ({ for: async () => [] }) }) }) }),
+          insert: () => ({
+            values: () => ({
+              onConflictDoNothing: () => ({ returning: async () => [{ checkoutIdempotencyKeyId: "key-1" }] }),
+            }),
+          }),
         }),
     };
     const service = new OrderService(db as never);
@@ -26,6 +30,7 @@ describe("OrderService", () => {
   });
 
   it("returns the existing order for a reused idempotency key", async () => {
+    let insertCount = 0;
     let selectCount = 0;
     const order = {
       orderId: "order-1",
@@ -56,7 +61,13 @@ describe("OrderService", () => {
               },
             }),
           }),
-          insert: () => ({ values: async () => undefined }),
+          insert: () => ({
+            values: () => {
+              insertCount += 1;
+              if (insertCount === 1) return { onConflictDoNothing: () => ({ returning: async () => [] }) };
+              return Promise.resolve();
+            },
+          }),
         }),
     };
     const service = new OrderService(db as never);
@@ -64,61 +75,5 @@ describe("OrderService", () => {
       orderId: "order-1",
       items: [],
     });
-  });
-
-  it("records a payment failure without decrementing stock", async () => {
-    let selectCount = 0;
-    const skuUpdate = jest.fn();
-    const row = {
-      cartItems: { quantity: 1 },
-      productSkus: { skuId: "sku-1", code: "SKU-1", price: 1000, stock: 1, isActive: true },
-      products: { productId: "product-1", title: "Product", status: "PUBLISHED" },
-    };
-    const db = {
-      transaction: async (callback: (tx: unknown) => Promise<unknown>) =>
-        callback({
-          select: () => ({
-            from: () => ({
-              innerJoin: () => ({ innerJoin: () => ({ where: async () => [row] }) }),
-              where: () => ({
-                limit: async () => {
-                  selectCount += 1;
-                  return selectCount === 1 ? [] : [{ cartId: "cart-1" }];
-                },
-              }),
-            }),
-          }),
-          insert: () => ({
-            values: () => ({
-              returning: async () =>
-                selectCount === 1
-                  ? [{ checkoutIdempotencyKeyId: "key-1" }]
-                  : [{ orderId: "order-1", status: "PAYMENT_PENDING" }],
-            }),
-          }),
-          update: (table: unknown) => {
-            if (String(table).includes("productSkus")) skuUpdate();
-            return {
-              set: () => ({
-                where: () => ({
-                  returning: async () => [
-                    {
-                      orderId: "order-1",
-                      status: "FAILED",
-                      paymentStatus: "FAILED",
-                      paymentFailureReason: "Mock payment rejected",
-                    },
-                  ],
-                }),
-              }),
-            };
-          },
-        }),
-    };
-    const service = new OrderService(db as never);
-    await expect(
-      service.checkoutCart("user-1", { idempotencyKey: "checkout-failure", forcePaymentFailure: true }),
-    ).resolves.toMatchObject({ status: "FAILED", paymentStatus: "FAILED" });
-    expect(skuUpdate).not.toHaveBeenCalled();
   });
 });

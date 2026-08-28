@@ -467,7 +467,7 @@ describe("PostgreSQL GraphQL integration", () => {
     expect(removed.body.data.removeWish).toBe(true);
   });
 
-  it("updates cart and completes checkout idempotently", async () => {
+  it("creates a payment-pending order idempotently without claiming approval", async () => {
     const agent = request.agent(app.getHttpServer());
     const accessToken = await signin(agent);
     const auth = { Authorization: `Bearer ${accessToken}` };
@@ -482,14 +482,19 @@ describe("PostgreSQL GraphQL integration", () => {
     const checkout = await agent.post("/graphql").set(auth).send({ query: checkoutMutation });
     const repeated = await agent.post("/graphql").set(auth).send({ query: checkoutMutation });
     expect(checkout.body.data.checkoutCart).toMatchObject({
-      status: "PAID",
-      paymentStatus: "APPROVED",
+      status: "PAYMENT_PENDING",
+      paymentStatus: "PENDING",
       totalAmount: 30000,
     });
     expect(repeated.body.data.checkoutCart.orderId).toBe(checkout.body.data.checkoutCart.orderId);
+    const events = await pool.query<{ eventType: string }>(
+      `SELECT "eventType" FROM "activityEvents" WHERE "subjectId" = $1 ORDER BY "createdAt"`,
+      [checkout.body.data.checkoutCart.orderId],
+    );
+    expect(events.rows).toEqual([{ eventType: "ORDER_PAYMENT_PENDING" }, { eventType: "CHECKOUT_IDEMPOTENCY_REUSED" }]);
   });
 
-  it("records checkout payment failure without consuming stock", async () => {
+  it("rejects checkout test controls in the public GraphQL input", async () => {
     const agent = request.agent(app.getHttpServer());
     const accessToken = await signin(agent);
     const auth = { Authorization: `Bearer ${accessToken}` };
@@ -499,17 +504,22 @@ describe("PostgreSQL GraphQL integration", () => {
       .send({
         query: `mutation { upsertCartItem(input: { skuId: "${FIXTURE.secondSkuId}", quantity: 1 }) { cartId } }`,
       });
-    const failed = await agent.post("/graphql").set(auth).send({
+    const rejected = await agent.post("/graphql").set(auth).send({
       query: `mutation { checkoutCart(input: { idempotencyKey: "integration-failure", forcePaymentFailure: true }) { status paymentStatus paymentFailureReason } }`,
     });
-    expect(failed.body.data.checkoutCart).toMatchObject({
-      status: "FAILED",
-      paymentStatus: "FAILED",
-      paymentFailureReason: "Mock payment rejected",
-    });
-    const stock = await pool.query<{ stock: number }>(`SELECT stock FROM "productSkus" WHERE "skuId" = $1`, [
-      FIXTURE.secondSkuId,
-    ]);
-    expect(stock.rows[0]?.stock).toBe(1);
+    const schema = await agent
+      .post("/graphql")
+      .send({ query: `{ __type(name: "CheckoutCartInput") { inputFields { name } } }` });
+    expect(rejected.status).toBe(400);
+    expect(rejected.body.data).toBeUndefined();
+    expect(schema.body.data.__type.inputFields).toEqual([{ name: "idempotencyKey" }]);
+    const state = await pool.query<{ cart_items: number; orders: number; stock: number }>(
+      `SELECT
+        (SELECT count(*)::int FROM "cartItems") AS cart_items,
+        (SELECT count(*)::int FROM "orders") AS orders,
+        (SELECT stock FROM "productSkus" WHERE "skuId" = $1) AS stock`,
+      [FIXTURE.secondSkuId],
+    );
+    expect(state.rows[0]).toEqual({ cart_items: 1, orders: 0, stock: 1 });
   });
 });

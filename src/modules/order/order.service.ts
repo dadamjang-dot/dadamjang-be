@@ -15,7 +15,7 @@ import {
   products,
 } from "src/modules/database/schema";
 
-type CheckoutInput = { forcePaymentFailure?: boolean; idempotencyKey?: string };
+type CheckoutInput = { idempotencyKey?: string };
 const orderNumber = () =>
   `DJ-${new Date().toISOString().slice(0, 10).replaceAll("-", "")}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
 
@@ -27,12 +27,20 @@ export class OrderService {
     this.db.transaction(async (tx) => {
       if (!input.idempotencyKey?.trim()) throw new CustomBadRequestException(OrderErrorMessage.IdempotencyKeyRequired);
       const checkoutKey = input.idempotencyKey.trim();
-      const [existingIdempotency] = await tx
-        .select()
-        .from(checkoutIdempotencyKeys)
-        .where(and(eq(checkoutIdempotencyKeys.userId, userId), eq(checkoutIdempotencyKeys.idempotencyKey, checkoutKey)))
-        .limit(1);
-      if (existingIdempotency?.orderId) {
+      const [idempotencyRecord] = await tx
+        .insert(checkoutIdempotencyKeys)
+        .values({ userId, idempotencyKey: checkoutKey })
+        .onConflictDoNothing({ target: [checkoutIdempotencyKeys.userId, checkoutIdempotencyKeys.idempotencyKey] })
+        .returning();
+      if (!idempotencyRecord) {
+        const [existingIdempotency] = await tx
+          .select()
+          .from(checkoutIdempotencyKeys)
+          .where(
+            and(eq(checkoutIdempotencyKeys.userId, userId), eq(checkoutIdempotencyKeys.idempotencyKey, checkoutKey)),
+          )
+          .limit(1);
+        if (!existingIdempotency?.orderId) throw new CustomBadRequestException(OrderErrorMessage.CheckoutProcessing);
         await tx.insert(activityEvents).values({
           actorUserId: userId,
           eventType: "CHECKOUT_IDEMPOTENCY_REUSED",
@@ -42,13 +50,8 @@ export class OrderService {
         });
         return this.getOrderInTransaction(tx, userId, existingIdempotency.orderId);
       }
-      if (existingIdempotency) throw new CustomBadRequestException(OrderErrorMessage.CheckoutProcessing);
-      const [idempotencyRecord] = await tx
-        .insert(checkoutIdempotencyKeys)
-        .values({ userId, idempotencyKey: checkoutKey })
-        .returning();
 
-      const [cart] = await tx.select().from(carts).where(eq(carts.userId, userId)).limit(1);
+      const [cart] = await tx.select().from(carts).where(eq(carts.userId, userId)).limit(1).for("update");
       if (!cart) throw new CustomBadRequestException(OrderErrorMessage.CartEmpty);
       const rows = await tx
         .select()
@@ -72,35 +75,6 @@ export class OrderService {
           quantity: item.quantity,
         })),
       );
-      if (input.forcePaymentFailure) {
-        const [failedOrder] = await tx
-          .update(orders)
-          .set({
-            status: "FAILED",
-            paymentStatus: "FAILED",
-            paymentFailureReason: "Mock payment rejected",
-            updatedAt: new Date(),
-          })
-          .where(eq(orders.orderId, order.orderId))
-          .returning();
-        await tx.insert(activityEvents).values({
-          actorUserId: userId,
-          eventType: "ORDER_PAYMENT_FAILED",
-          subjectType: "ORDER",
-          subjectId: order.orderId,
-          payload: { totalAmount },
-        });
-        await this.markIdempotencyCompleted(
-          tx,
-          idempotencyRecord.checkoutIdempotencyKeyId,
-          failedOrder.orderId,
-          "FAILED",
-        );
-        return {
-          ...failedOrder,
-          items: await tx.select().from(orderItems).where(eq(orderItems.orderId, order.orderId)),
-        };
-      }
       for (const row of rows) {
         const [updatedSku] = await tx
           .update(productSkus)
@@ -112,27 +86,17 @@ export class OrderService {
           .returning();
         if (!updatedSku) throw new CustomBadRequestException(getInsufficientStockMessage(row.productSkus.code));
       }
-      const [paidOrder] = await tx
-        .update(orders)
-        .set({ status: "PAID", paymentStatus: "APPROVED", updatedAt: new Date() })
-        .where(eq(orders.orderId, order.orderId))
-        .returning();
       await tx.delete(cartItems).where(eq(cartItems.cartId, cart.cartId));
       await tx.insert(activityEvents).values({
         actorUserId: userId,
-        eventType: "ORDER_PAID",
+        eventType: "ORDER_PAYMENT_PENDING",
         subjectType: "ORDER",
         subjectId: order.orderId,
         payload: { totalAmount },
       });
-      await this.markIdempotencyCompleted(
-        tx,
-        idempotencyRecord.checkoutIdempotencyKeyId,
-        paidOrder.orderId,
-        "COMPLETED",
-      );
+      await this.markIdempotencyCompleted(tx, idempotencyRecord.checkoutIdempotencyKeyId, order.orderId);
       return {
-        ...paidOrder,
+        ...order,
         items: await tx.select().from(orderItems).where(eq(orderItems.orderId, order.orderId)),
       };
     });
@@ -167,11 +131,10 @@ export class OrderService {
     tx: Pick<Database, "update">,
     checkoutIdempotencyKeyId: string,
     orderId: string,
-    status: "COMPLETED" | "FAILED",
   ) =>
     tx
       .update(checkoutIdempotencyKeys)
-      .set({ orderId, status, updatedAt: new Date() })
+      .set({ orderId, status: "COMPLETED", updatedAt: new Date() })
       .where(eq(checkoutIdempotencyKeys.checkoutIdempotencyKeyId, checkoutIdempotencyKeyId));
 
   transitionOrder = async (orderId: string, nextStatus: string) => {

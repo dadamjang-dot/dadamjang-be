@@ -205,6 +205,26 @@ describe("Admin GraphQL integration", () => {
     expect(audit.rowCount).toBe(1);
   });
 
+  it("does not let an admin mark a payment-pending order as paid", async () => {
+    await pool.query(
+      `UPDATE "orders" SET status = 'PAYMENT_PENDING', "paymentStatus" = 'PENDING' WHERE "orderId" = $1`,
+      [ADMIN_FIXTURE.orderId],
+    );
+    const token = await adminToken(request.agent(app.getHttpServer()));
+    const mutation = `mutation Transition($input: TransitionOrderInput!) {
+      transitionOrder(input: $input) { orderId status paymentStatus }
+    }`;
+    const response = await graphql(app, token, mutation, {
+      input: { orderId: ADMIN_FIXTURE.orderId, nextStatus: "PAID" },
+    });
+    expect(response.body.errors[0].extensions.code).toBe("BAD_USER_INPUT");
+    const order = await pool.query<{ paymentStatus: string; status: string }>(
+      `SELECT status, "paymentStatus" FROM "orders" WHERE "orderId" = $1`,
+      [ADMIN_FIXTURE.orderId],
+    );
+    expect(order.rows[0]).toEqual({ paymentStatus: "PENDING", status: "PAYMENT_PENDING" });
+  });
+
   it("validates category hierarchy, uniqueness, and deactivation constraints", async () => {
     const token = await adminToken(request.agent(app.getHttpServer()));
     const createMutation = `mutation Create($input: CreateCategoryInput!) {
