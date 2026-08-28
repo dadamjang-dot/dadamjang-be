@@ -1,9 +1,38 @@
+import { CopyObjectCommand, GetObjectCommand, HeadObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import type { INestApplication } from "@nestjs/common";
 import type { Pool } from "pg";
 import request from "supertest";
 import { createApp } from "src/app";
 import { FIXTURE } from "src/database/fixtures";
 import { migrateTestDatabase, resetTestFixtures, testPool } from "./support/database";
+
+const jpegBytes = Uint8Array.from([0xff, 0xd8, 0xff, ...Array.from({ length: 61 }, () => 0)]);
+
+const styleImageObject =
+  (bytes = jpegBytes) =>
+  async (command: unknown) => {
+    if (command instanceof HeadObjectCommand)
+      return {
+        ContentType: "image/jpeg",
+        ContentLength: 1024,
+        Metadata: {
+          "owner-id": FIXTURE.userId,
+          "declared-content-type": "image/jpeg",
+          "declared-size": "1024",
+        },
+        ETag: '"style-etag"',
+      };
+    if (command instanceof GetObjectCommand)
+      return {
+        ContentType: "image/jpeg",
+        ContentLength: 64,
+        ContentRange: "bytes 0-63/1024",
+        ETag: '"style-etag"',
+        Body: { transformToByteArray: async () => bytes },
+      };
+    if (command instanceof CopyObjectCommand) return { CopyObjectResult: { ETag: '"copied-style-etag"' } };
+    throw new Error("Unexpected storage command");
+  };
 
 const signin = async (agent: ReturnType<typeof request.agent>) => {
   const response = await agent
@@ -34,11 +63,42 @@ describe("PostgreSQL GraphQL integration", () => {
 
   beforeEach(async () => {
     await resetTestFixtures(pool);
+    jest.spyOn(S3Client.prototype, "send").mockImplementation(styleImageObject() as never);
   });
+
+  afterEach(() => jest.restoreAllMocks());
 
   afterAll(async () => {
     await app.close();
     await pool.end();
+  });
+
+  it("bounds style list thumbnails while preserving detail images", async () => {
+    const stylePostId = "82000000-0000-4000-8000-000000000010";
+    const imageKey = `style-posts/${FIXTURE.userId}/00000000-0000-4000-8000-000000000010.webp`;
+    const fullSizeUrl = `http://localhost/images/format=auto,fit=scale-down/http://localhost/r2/${imageKey}`;
+    await pool.query(
+      `INSERT INTO "stylePosts"
+        ("stylePostId", "authorId", "title", "content", "category", "imageKeys", "imageUrls")
+       VALUES ($1, $2, 'Bounded thumbnail', 'Bounded thumbnail', 'CLOTHING', $3::jsonb, $4::jsonb)`,
+      [stylePostId, FIXTURE.userId, JSON.stringify([imageKey]), JSON.stringify([fullSizeUrl])],
+    );
+
+    const summary = await request(app.getHttpServer())
+      .post("/graphql")
+      .send({ query: `{ stylePosts(filter: { sort: LATEST }) { nodes { stylePostId thumbnailUrl } } }` })
+      .expect(200);
+    const detail = await request(app.getHttpServer())
+      .post("/graphql")
+      .send({ query: `{ stylePost(stylePostId: "${stylePostId}") { imageUrls } }` })
+      .expect(200);
+
+    expect(summary.body.errors).toBeUndefined();
+    expect(summary.body.data.stylePosts.nodes[0]).toEqual({
+      stylePostId,
+      thumbnailUrl: `http://localhost/images/format=auto,width=640/http://localhost/r2/${imageKey}`,
+    });
+    expect(detail.body.data.stylePost.imageUrls).toEqual([fullSizeUrl]);
   });
 
   it("runs all migrations initially and idempotently", async () => {
@@ -201,10 +261,35 @@ describe("PostgreSQL GraphQL integration", () => {
       .expect(200);
     expect(feedAfterInvalidImage.body.data.stylePosts.nodes).toEqual([]);
 
+    jest
+      .mocked(S3Client.prototype.send)
+      .mockImplementation(
+        styleImageObject(
+          Uint8Array.from([...Buffer.from("%PDF", "ascii"), ...Array.from({ length: 60 }, () => 0)]),
+        ) as never,
+      );
+    const invalidMagic = await agent
+      .post("/graphql")
+      .set(auth)
+      .send({
+        query: createMutation,
+        variables: {
+          input: {
+            category: "CLOTHING",
+            productIds: [FIXTURE.productId],
+            imageKeys: [`style-posts/${FIXTURE.userId}/00000000-0000-4000-8000-000000000003.jpg`],
+            content: "이미지가 아닌 바이트",
+            idempotencyKey: "invalid-style-magic",
+          },
+        },
+      });
+    expect(invalidMagic.body.errors[0].extensions.code).toBe("BAD_USER_INPUT");
+    jest.mocked(S3Client.prototype.send).mockImplementation(styleImageObject() as never);
+
     const input = {
       category: "CLOTHING",
       productIds: [FIXTURE.productId],
-      imageKeys: [`style-posts/${FIXTURE.userId}/00000000-0000-4000-8000-000000000001.jpg`],
+      imageKeys: [`pending/style-posts/${FIXTURE.userId}/00000000-0000-4000-8000-000000000001.jpg`],
       content: "오늘의 스타일",
       hashtags: ["daily_look"],
       brandTagIds: [FIXTURE.brandId],
@@ -221,6 +306,13 @@ describe("PostgreSQL GraphQL integration", () => {
       likeCount: 0,
       isLiked: false,
     });
+    const storedImages = await pool.query<{ imageKeys: string[] }>(
+      `SELECT "imageKeys" FROM "stylePosts" WHERE "stylePostId" = $1`,
+      [first.body.data.createStylePost.stylePostId],
+    );
+    expect(storedImages.rows[0]?.imageKeys).toEqual([
+      expect.stringMatching(/^style-posts\/10000000-0000-4000-8000-000000000001\/[0-9a-f-]{36}\.jpg$/),
+    ]);
 
     const invalidCursor = Buffer.from(
       JSON.stringify({

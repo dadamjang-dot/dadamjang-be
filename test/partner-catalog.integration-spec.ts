@@ -1,4 +1,4 @@
-import { S3Client } from "@aws-sdk/client-s3";
+import { CopyObjectCommand, GetObjectCommand, HeadObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import type { INestApplication } from "@nestjs/common";
 import type { Pool } from "pg";
 import request from "supertest";
@@ -7,6 +7,43 @@ import { FIXTURE } from "src/database/fixtures";
 import { resetTestFixtures, testPool } from "./support/database";
 
 const validImageKey = "products/10000000-0000-4000-8000-000000000001/90000000-0000-4000-8000-000000000001.png";
+const pendingImageKey =
+  "pending/products/10000000-0000-4000-8000-000000000001/90000000-0000-4000-8000-000000000003.png";
+const pngBytes = Uint8Array.from([
+  0x89,
+  0x50,
+  0x4e,
+  0x47,
+  0x0d,
+  0x0a,
+  0x1a,
+  0x0a,
+  ...Array.from({ length: 56 }, () => 0),
+]);
+
+const validImageObject = async (command: unknown) => {
+  if (command instanceof HeadObjectCommand)
+    return {
+      ContentType: "image/png",
+      ContentLength: 1024,
+      Metadata: {
+        "owner-id": FIXTURE.userId,
+        "declared-content-type": "image/png",
+        "declared-size": "1024",
+      },
+      ETag: '"image-etag"',
+    };
+  if (command instanceof GetObjectCommand)
+    return {
+      ContentType: "image/png",
+      ContentLength: 64,
+      ContentRange: "bytes 0-63/1024",
+      ETag: '"image-etag"',
+      Body: { transformToByteArray: async () => pngBytes },
+    };
+  if (command instanceof CopyObjectCommand) return { CopyObjectResult: { ETag: '"copied-etag"' } };
+  throw new Error("Unexpected storage command");
+};
 
 describe("partner catalog GraphQL integration", () => {
   let app: INestApplication;
@@ -60,9 +97,7 @@ describe("partner catalog GraphQL integration", () => {
   beforeEach(async () => {
     await resetTestFixtures(pool);
     await pool.query(`UPDATE "users" SET "role" = 'PARTNER' WHERE "userId" = $1`, [FIXTURE.userId]);
-    jest
-      .spyOn(S3Client.prototype, "send")
-      .mockResolvedValue({ ContentType: "image/png", ContentLength: 1024 } as never);
+    jest.spyOn(S3Client.prototype, "send").mockImplementation(validImageObject as never);
   });
 
   afterEach(() => jest.restoreAllMocks());
@@ -100,6 +135,33 @@ describe("partner catalog GraphQL integration", () => {
     expect(second.body.data.myPartnerProducts.nodes[0].productId).not.toBe(
       first.body.data.myPartnerProducts.nodes[0].productId,
     );
+  });
+
+  it("stores only the promoted immutable product image key", async () => {
+    const accessToken = await signin();
+    const created = await graphql(
+      accessToken,
+      `
+        mutation CreatePartnerProduct($input: PartnerProductInput!) {
+          createPartnerProductDraft(input: $input) {
+            productId
+            imageKeys
+          }
+        }
+      `,
+      { input: { ...input(), imageKeys: [pendingImageKey] } },
+    );
+
+    expect(created.body.errors).toBeUndefined();
+    const imageKeys = created.body.data.createPartnerProductDraft.imageKeys as string[];
+    expect(imageKeys).toHaveLength(1);
+    expect(imageKeys[0]).toMatch(/^products\/10000000-0000-4000-8000-000000000001\/[0-9a-f-]{36}\.png$/);
+    expect(imageKeys[0]).not.toBe(pendingImageKey);
+    const stored = await pool.query<{ imageKeys: string[] }>(
+      `SELECT "imageKeys" FROM "products" WHERE "productId" = $1`,
+      [created.body.data.createPartnerProductDraft.productId],
+    );
+    expect(stored.rows[0]?.imageKeys).toEqual(imageKeys);
   });
 
   it("preserves SKU order through the complete product lifecycle", async () => {

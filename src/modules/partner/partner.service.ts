@@ -169,8 +169,8 @@ export class PartnerService {
 
   createDraft = async (ownerUserId: string, input: PartnerProductInput) => {
     const partner = await this.approvedPartner(ownerUserId);
-    await this.validate(ownerUserId, input);
-    const imageUrls = await Promise.all(input.imageKeys.map((key) => this.mediaService.getProductImageUrl(key)));
+    const imageKeys = await this.validate(ownerUserId, input);
+    const imageUrls = await Promise.all(imageKeys.map((key) => this.mediaService.getProductImageUrl(key)));
     const created = await this.db.transaction(async (tx) => {
       const product = requireResult(
         (
@@ -182,7 +182,7 @@ export class PartnerService {
               categoryId: input.categoryId,
               title: input.title.trim(),
               description: input.description.trim(),
-              imageKeys: input.imageKeys,
+              imageKeys,
               imageUrls,
               approvalStatus: "DRAFT",
               isOnSale: input.isOnSale,
@@ -201,8 +201,8 @@ export class PartnerService {
 
   updateDraft = async (ownerUserId: string, productId: string, input: PartnerProductInput) => {
     const partner = await this.approvedPartner(ownerUserId);
-    await this.validate(ownerUserId, input);
-    const imageUrls = await Promise.all(input.imageKeys.map((key) => this.mediaService.getProductImageUrl(key)));
+    const imageKeys = await this.validate(ownerUserId, input);
+    const imageUrls = await Promise.all(imageKeys.map((key) => this.mediaService.getProductImageUrl(key)));
     await this.db.transaction(async (tx) => {
       const [updated] = await tx
         .update(products)
@@ -210,7 +210,7 @@ export class PartnerService {
           categoryId: input.categoryId,
           title: input.title.trim(),
           description: input.description.trim(),
-          imageKeys: input.imageKeys,
+          imageKeys,
           imageUrls,
           isOnSale: input.isOnSale,
           isExpressDelivery: input.isExpressDelivery,
@@ -309,7 +309,6 @@ export class PartnerService {
       throw new CustomBadRequestException(PartnerErrorMessage.InvalidProductInput);
     if (input.imageKeys.some((key) => !this.mediaService.isProductImageKeyForUser(key, ownerUserId)))
       throw new CustomBadRequestException(PartnerErrorMessage.ImageOwnership);
-    await Promise.all(input.imageKeys.map((key) => this.mediaService.validateProductImageObject(key, ownerUserId)));
     const [category] = await this.db
       .select()
       .from(categories)
@@ -337,6 +336,7 @@ export class PartnerService {
       new Set(validSizes.map((v) => v.sizeId)).size !== new Set(sizeIds).size
     )
       throw new CustomBadRequestException(PartnerErrorMessage.CatalogOptionInactive);
+    return Promise.all(input.imageKeys.map((key) => this.mediaService.validateProductImageObject(key, ownerUserId)));
   };
 
   private hydrate = async (ownerUserId: string, rows: (typeof products.$inferSelect)[]) => {

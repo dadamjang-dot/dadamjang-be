@@ -16,6 +16,7 @@ import {
   users,
 } from "src/modules/database/schema";
 import { MediaService } from "src/modules/media/media.service";
+import { IMAGE_SUMMARY_WIDTH } from "src/modules/media/media.constant";
 import { MAX_PAGE_SIZE } from "./style-posts.constant";
 import { StylePostErrorMessage } from "./style-posts.error";
 import {
@@ -198,7 +199,10 @@ export class StylePostsService {
     if (brandTagIds.some((brandId) => !purchasedBrandIds.has(brandId)))
       throw new CustomBadRequestException(StylePostErrorMessage.BrandTagNotPurchased);
 
-    const imageUrls = imageKeys.map((key) => this.mediaService.getStylePostImageUrl(key));
+    const attachedImageKeys = await Promise.all(
+      imageKeys.map((key) => this.mediaService.validateStylePostImageObject(key, authorId)),
+    );
+    const imageUrls = attachedImageKeys.map((key) => this.mediaService.getStylePostImageUrl(key));
     try {
       const post = await this.db.transaction(async (tx) => {
         const created = requireResult(
@@ -213,7 +217,7 @@ export class StylePostsService {
                 category: input.category,
                 hashtags,
                 brandTagIds,
-                imageKeys,
+                imageKeys: attachedImageKeys,
                 idempotencyKey,
                 isPartner,
               })
@@ -326,7 +330,7 @@ export class StylePostsService {
     const pageRows = pageKeysForPage
       .map(({ stylePostId }) => rowsById.get(stylePostId))
       .filter((row): row is typeof stylePosts.$inferSelect => Boolean(row));
-    const posts = await this.hydrate(pageRows, viewerId);
+    const posts = await this.hydrate(pageRows, viewerId, IMAGE_SUMMARY_WIDTH);
     const hasNextPage = visibleKeys.length > pageSize;
     const tail = pageKeysForPage[pageKeysForPage.length - 1];
     return {
@@ -405,7 +409,7 @@ export class StylePostsService {
     const tail = visibleKeys[visibleKeys.length - 1];
     const hasNextPage = pageKeys.length > pageSize;
     return {
-      nodes: await this.hydrate(pageRows, userId),
+      nodes: await this.hydrate(pageRows, userId, IMAGE_SUMMARY_WIDTH),
       hasNextPage,
       nextCursor:
         hasNextPage && tail
@@ -467,7 +471,11 @@ export class StylePostsService {
     return [...latest.values()];
   };
 
-  private hydrate = async (rows: (typeof stylePosts.$inferSelect)[], viewerId?: string): Promise<StylePostType[]> => {
+  private hydrate = async (
+    rows: (typeof stylePosts.$inferSelect)[],
+    viewerId?: string,
+    thumbnailWidth?: number,
+  ): Promise<StylePostType[]> => {
     if (rows.length === 0) return [];
     const postIds = rows.map((row) => row.stylePostId);
     const authorIds = unique(rows.map((row) => row.authorId));
@@ -544,7 +552,10 @@ export class StylePostsService {
         content: row.content,
         category: row.category as StylePostCategory,
         imageUrls,
-        thumbnailUrl: imageUrls[0] ?? null,
+        thumbnailUrl:
+          thumbnailWidth && row.imageKeys[0]
+            ? this.mediaService.getStylePostImageUrl(row.imageKeys[0], thumbnailWidth)
+            : (imageUrls[0] ?? null),
         hashtags: row.hashtags ?? [],
         brandTags,
         products: productsByPost.get(row.stylePostId) ?? [],

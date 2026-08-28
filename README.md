@@ -38,6 +38,19 @@
 - 이미 journal에 기록될 수 있는 migration SQL은 checksum 계약 때문에 수정하지 않습니다. `0015_catalog_keyset_indexes.sql`은 이 원자성을 유지하는 일반 index build이며 timeout으로 무기한 대기를 막습니다.
 - `CREATE INDEX CONCURRENTLY`는 transaction 밖 DDL과 journal 사이의 crash 복구 및 invalid index 재실행 protocol이 마련되기 전에는 runner에서 지원하지 않습니다.
 
+## Media trust boundary와 R2 운영 계약
+
+- 업로드 mutation은 5분 만료 presigned `PUT`과 `pending/products/...` 또는 `pending/style-posts/...` 키만 발급합니다. 서명에는 `Content-Type`과 `Content-Length`가 포함되고, pending 객체에는 소유자·선언 MIME·선언 크기 metadata가 기록되어야 합니다.
+- 첨부 시 서버는 소유자 경로, 허용 확장자, `HeadObject`의 MIME/크기/ETag를 확인하고 `Range: bytes=0-63` 및 `If-Match`로 실제 JPEG/PNG/WebP/HEIC/HEIF magic bytes를 검사합니다. 검증된 pending 객체만 조건부 `CopyObject`로 새 final 키에 승격하며 DB에는 final 키만 저장합니다.
+- 배포 전부터 존재한 final 키는 선언 metadata가 없어도 호환됩니다. 단, 소유자 경로와 MIME·크기·ETag·magic-byte 검사는 동일하게 통과해야 합니다. 선언 metadata는 presigned 경계를 증명하는 pending 객체에만 필수입니다.
+- 애플리케이션의 delivery URL helper는 pending 키를 거부합니다. 다만 R2 public bucket 설정은 애플리케이션이 강제하거나 조회할 수 없으므로 다음 항목은 **배포 필수 전제**입니다.
+  - production bucket의 `r2.dev` public development URL을 비활성화합니다. 그렇지 않으면 custom-domain WAF를 우회할 수 있습니다.
+  - R2 custom domain에서 URI path가 `/pending/`으로 시작하는 모든 `GET`/`HEAD`를 WAF custom rule로 차단하고 캐시하지 않습니다. 배포 검증에서 pending 원본 URL과 Images 변환 URL이 모두 전달되지 않는지 확인합니다.
+  - object lifecycle rule을 prefix `pending/`, expiration 1일로 설정합니다. 만료 시점 이후 실제 삭제는 통상 최대 24시간 더 걸릴 수 있으며, 더 긴 bucket-lock rule을 `pending/`에 적용하면 안 됩니다.
+  - browser upload CORS는 production 앱 origin만 허용하고 method는 `PUT`, 요청 header는 최소 `Content-Type`만 허용합니다. presigner가 metadata를 query parameter로 서명하므로 임의 `x-amz-meta-*` header 허용은 필요하지 않습니다.
+
+이 저장소는 외부 R2 bucket을 소유하는 Terraform resource를 만들지 않습니다. 운영자는 Cloudflare의 [public bucket access](https://developers.cloudflare.com/r2/buckets/public-buckets/), [CORS](https://developers.cloudflare.com/r2/buckets/cors/), [object lifecycle](https://developers.cloudflare.com/r2/buckets/object-lifecycles/) 설정을 별도 배포 게이트로 확인해야 합니다. `CopyObject`, `x-amz-copy-source-if-match`, ranged `GetObject` 지원 여부는 [R2 S3 compatibility](https://developers.cloudflare.com/r2/api/s3/api/) 계약을 기준으로 합니다.
+
 ## Checkout 정합성 계약
 
 - `checkoutCart(input)`은 `idempotencyKey`를 필수로 받습니다.
