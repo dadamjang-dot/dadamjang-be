@@ -21,28 +21,46 @@ const pngBytes = Uint8Array.from([
   ...Array.from({ length: 56 }, () => 0),
 ]);
 
-const validImageObject = async (command: unknown) => {
-  if (command instanceof HeadObjectCommand)
-    return {
-      ContentType: "image/png",
-      ContentLength: 1024,
-      Metadata: {
-        "owner-id": FIXTURE.userId,
-        "declared-content-type": "image/png",
-        "declared-size": "1024",
-      },
-      ETag: '"image-etag"',
-    };
-  if (command instanceof GetObjectCommand)
-    return {
-      ContentType: "image/png",
-      ContentLength: 64,
-      ContentRange: "bytes 0-63/1024",
-      ETag: '"image-etag"',
-      Body: { transformToByteArray: async () => pngBytes },
-    };
-  if (command instanceof CopyObjectCommand) return { CopyObjectResult: { ETag: '"copied-etag"' } };
-  throw new Error("Unexpected storage command");
+const validImageObject = () => {
+  let destination: { key: string; metadata: Record<string, string> } | undefined;
+  return async (command: unknown) => {
+    if (command instanceof HeadObjectCommand) {
+      const promoted = destination;
+      if (promoted && promoted.key === command.input.Key)
+        return {
+          ContentType: "image/png",
+          ContentLength: 1024,
+          Metadata: promoted.metadata,
+          ETag: '"copied-etag"',
+        };
+      if (/\/[0-9a-f]{64}\./.test(command.input.Key ?? ""))
+        throw Object.assign(new Error("missing"), { $metadata: { httpStatusCode: 404 } });
+      return {
+        ContentType: "image/png",
+        ContentLength: 1024,
+        Metadata: {
+          "owner-id": FIXTURE.userId,
+          "declared-content-type": "image/png",
+          "declared-size": "1024",
+        },
+        ETag: '"image-etag"',
+      };
+    }
+    if (command instanceof GetObjectCommand)
+      return {
+        ContentType: "image/png",
+        ContentLength: 64,
+        ContentRange: "bytes 0-63/1024",
+        ETag: destination?.key === command.input.Key ? '"copied-etag"' : '"image-etag"',
+        Body: { transformToByteArray: async () => pngBytes },
+      };
+    if (command instanceof CopyObjectCommand) {
+      if (!command.input.Key) throw new Error("Copy destination is required");
+      destination = { key: command.input.Key, metadata: command.input.Metadata ?? {} };
+      return { CopyObjectResult: { ETag: '"copied-etag"' } };
+    }
+    throw new Error("Unexpected storage command");
+  };
 };
 
 describe("partner catalog GraphQL integration", () => {
@@ -97,7 +115,7 @@ describe("partner catalog GraphQL integration", () => {
   beforeEach(async () => {
     await resetTestFixtures(pool);
     await pool.query(`UPDATE "users" SET "role" = 'PARTNER' WHERE "userId" = $1`, [FIXTURE.userId]);
-    jest.spyOn(S3Client.prototype, "send").mockImplementation(validImageObject as never);
+    jest.spyOn(S3Client.prototype, "send").mockImplementation(validImageObject() as never);
   });
 
   afterEach(() => jest.restoreAllMocks());
@@ -155,7 +173,7 @@ describe("partner catalog GraphQL integration", () => {
     expect(created.body.errors).toBeUndefined();
     const imageKeys = created.body.data.createPartnerProductDraft.imageKeys as string[];
     expect(imageKeys).toHaveLength(1);
-    expect(imageKeys[0]).toMatch(/^products\/10000000-0000-4000-8000-000000000001\/[0-9a-f-]{36}\.png$/);
+    expect(imageKeys[0]).toMatch(/^products\/10000000-0000-4000-8000-000000000001\/[0-9a-f]{64}\.png$/);
     expect(imageKeys[0]).not.toBe(pendingImageKey);
     const stored = await pool.query<{ imageKeys: string[] }>(
       `SELECT "imageKeys" FROM "products" WHERE "productId" = $1`,

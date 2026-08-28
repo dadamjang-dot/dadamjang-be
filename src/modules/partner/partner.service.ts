@@ -263,7 +263,7 @@ export class PartnerService {
       )
       .limit(1);
     if (!candidate) throw new CustomBadRequestException(PartnerErrorMessage.InvalidTransition);
-    await Promise.all(candidate.imageKeys.map((key) => this.mediaService.validateProductImageObject(key, ownerUserId)));
+    await this.mediaService.validateProductImageObjects(candidate.imageKeys, ownerUserId);
     const [product] = await this.db
       .update(products)
       .set(
@@ -336,7 +336,7 @@ export class PartnerService {
       new Set(validSizes.map((v) => v.sizeId)).size !== new Set(sizeIds).size
     )
       throw new CustomBadRequestException(PartnerErrorMessage.CatalogOptionInactive);
-    return Promise.all(input.imageKeys.map((key) => this.mediaService.validateProductImageObject(key, ownerUserId)));
+    return this.mediaService.validateProductImageObjects(input.imageKeys, ownerUserId);
   };
 
   private hydrate = async (ownerUserId: string, rows: (typeof products.$inferSelect)[]) => {

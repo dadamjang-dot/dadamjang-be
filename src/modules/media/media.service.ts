@@ -9,7 +9,7 @@ import {
   type HeadObjectCommandOutput,
 } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
-import { randomUUID } from "crypto";
+import { createHash, randomUUID } from "crypto";
 import { CustomBadRequestException } from "src/common/errors/custom-exceptions";
 import { AdmissionLimiter, type AdmissionRule, type RequestOrigin } from "src/modules/admission/admission-limiter";
 import {
@@ -48,6 +48,13 @@ type ImagePolicy = Readonly<{
   maxFileSize: number;
   pendingPattern: RegExp;
   pendingPrefix: "pending/products" | "pending/style-posts";
+}>;
+type InspectedImageObject = Readonly<{
+  expectedContentType: ImageContentType;
+  extension: keyof typeof IMAGE_CONTENT_TYPES;
+  head: Readonly<{ contentType: ImageContentType; etag: string; size: number }>;
+  key: string;
+  location: "final" | "pending";
 }>;
 
 const PRODUCT_POLICY: ImagePolicy = {
@@ -134,6 +141,9 @@ export class MediaService {
   validateProductImageObject = (key: string, userId: string) =>
     this.validateAndPromoteImageObject(key, userId, PRODUCT_POLICY);
 
+  validateProductImageObjects = (keys: readonly string[], userId: string) =>
+    this.validateAndPromoteImageObjects(keys, userId, PRODUCT_POLICY);
+
   getStylePostImageUrl = (key: string, width?: number) => {
     if (!STYLE_POST_IMAGE_KEY_PATTERN.test(key)) throw new CustomBadRequestException(MediaErrorMessage.InvalidKey);
     return this.transformedUrl(key, width);
@@ -144,6 +154,9 @@ export class MediaService {
 
   validateStylePostImageObject = (key: string, userId: string) =>
     this.validateAndPromoteImageObject(key, userId, STYLE_POST_POLICY);
+
+  validateStylePostImageObjects = (keys: readonly string[], userId: string) =>
+    this.validateAndPromoteImageObjects(keys, userId, STYLE_POST_POLICY);
 
   private createUpload = async (
     userId: string,
@@ -186,7 +199,19 @@ export class MediaService {
     return { key, uploadUrl, originalUrl, imageUrl: this.transformedUrl(key) };
   };
 
-  private validateAndPromoteImageObject = async (key: string, userId: string, policy: ImagePolicy) => {
+  private validateAndPromoteImageObject = async (key: string, userId: string, policy: ImagePolicy) =>
+    this.promoteImageObject(await this.inspectImageObject(key, userId, policy), userId, policy);
+
+  private validateAndPromoteImageObjects = async (keys: readonly string[], userId: string, policy: ImagePolicy) => {
+    const objects = await Promise.all(keys.map((key) => this.inspectImageObject(key, userId, policy)));
+    return Promise.all(objects.map((object) => this.promoteImageObject(object, userId, policy)));
+  };
+
+  private inspectImageObject = async (
+    key: string,
+    userId: string,
+    policy: ImagePolicy,
+  ): Promise<InspectedImageObject> => {
     const location = this.keyLocation(key, userId, policy);
     if (!location) throw new CustomBadRequestException(MediaErrorMessage.InvalidKey);
     const extension = key.slice(key.lastIndexOf(".") + 1).toLowerCase() as keyof typeof IMAGE_CONTENT_TYPES;
@@ -204,15 +229,38 @@ export class MediaService {
       const bytes = await this.readMagicBytes(key, expectedContentType, head);
       if (!this.hasImageMagic(expectedContentType, bytes))
         throw new CustomBadRequestException(MediaErrorMessage.ObjectInvalid);
-      if (location === "final") return key;
-      const finalKey = `${policy.finalPrefix}/${userId}/${randomUUID()}.${extension}`;
+      return { expectedContentType, extension, head, key, location };
+    } catch (error) {
+      if (error instanceof CustomBadRequestException) throw error;
+      if ([404, 412].includes(storageStatus(error) ?? 0))
+        throw new CustomBadRequestException(MediaErrorMessage.ObjectInvalid);
+      throw error;
+    }
+  };
+
+  private promoteImageObject = async (object: InspectedImageObject, userId: string, policy: ImagePolicy) => {
+    if (object.location === "final") return object.key;
+    const promotionId = this.promotionId(object.key, object.head.etag);
+    const finalKey = `${policy.finalPrefix}/${userId}/${promotionId}.${object.extension}`;
+    try {
+      if (
+        await this.hasMatchingPromotion(finalKey, userId, object.expectedContentType, policy.maxFileSize, promotionId)
+      )
+        return finalKey;
       const copied = await this.client.send(
         new CopyObjectCommand({
           Bucket: this.bucket,
           Key: finalKey,
-          CopySource: this.copySource(key),
-          CopySourceIfMatch: head.etag,
-          MetadataDirective: "COPY",
+          CopySource: this.copySource(object.key),
+          CopySourceIfMatch: object.head.etag,
+          MetadataDirective: "REPLACE",
+          ContentType: object.expectedContentType,
+          Metadata: {
+            "owner-id": userId,
+            "declared-content-type": object.expectedContentType,
+            "declared-size": String(object.head.size),
+            "promotion-id": promotionId,
+          },
         }),
       );
       if (!copied.CopyObjectResult?.ETag) throw new CustomBadRequestException(MediaErrorMessage.ObjectInvalid);
@@ -224,6 +272,31 @@ export class MediaService {
       throw error;
     }
   };
+
+  private hasMatchingPromotion = async (
+    key: string,
+    userId: string,
+    expectedContentType: ImageContentType,
+    maxFileSize: number,
+    promotionId: string,
+  ) => {
+    try {
+      const object = await this.client.send(new HeadObjectCommand({ Bucket: this.bucket, Key: key }));
+      const head = this.verifiedHead(object, userId, expectedContentType, maxFileSize, true);
+      if (object.Metadata?.["promotion-id"] !== promotionId)
+        throw new CustomBadRequestException(MediaErrorMessage.ObjectInvalid);
+      const bytes = await this.readMagicBytes(key, expectedContentType, head);
+      if (!this.hasImageMagic(expectedContentType, bytes))
+        throw new CustomBadRequestException(MediaErrorMessage.ObjectInvalid);
+      return true;
+    } catch (error) {
+      if (storageStatus(error) === 404) return false;
+      throw error;
+    }
+  };
+
+  private promotionId = (key: string, etag: string) =>
+    createHash("sha256").update(key).update("\0").update(etag).digest("hex");
 
   private verifiedHead = (
     object: HeadObjectCommandOutput,

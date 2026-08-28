@@ -13,6 +13,7 @@ type HardenedMediaService = MediaService & {
 const ownerUserId = "00000000-0000-4000-8000-000000000001";
 const validProductKey = `products/${ownerUserId}/00000000-0000-4000-8000-000000000002.webp`;
 const pendingProductKey = `pending/products/${ownerUserId}/00000000-0000-4000-8000-000000000003.png`;
+const invalidPendingProductKey = `pending/products/${ownerUserId}/00000000-0000-4000-8000-000000000004.png`;
 const origin: RequestOrigin = { ip: "127.0.0.1", deviceId: "media-device" };
 
 const allow = () => ({ assertAllowed: jest.fn().mockResolvedValue(undefined) }) as unknown as AdmissionLimiter;
@@ -86,6 +87,54 @@ const validObject = (
   };
 };
 
+const missingObject = () => Object.assign(new Error("missing"), { $metadata: { httpStatusCode: 404 } });
+
+const promotableObject = (contentType: keyof typeof magicBytes, etag = '"object-etag"') => {
+  const size = 1024;
+  let destination: { contentType: string; key: string; metadata: Record<string, string> } | undefined;
+  return async (command: unknown) => {
+    if (command instanceof HeadObjectCommand) {
+      if (command.input.Key === pendingProductKey)
+        return {
+          ContentType: contentType,
+          ContentLength: size,
+          Metadata: metadata(ownerUserId, contentType, size),
+          ETag: etag,
+        };
+      const promoted = destination;
+      if (promoted && promoted.key === command.input.Key)
+        return {
+          ContentType: promoted.contentType,
+          ContentLength: size,
+          Metadata: promoted.metadata,
+          ETag: '"copied-etag"',
+        };
+      throw missingObject();
+    }
+    if (command instanceof GetObjectCommand) {
+      const bytes = magicBytes[contentType];
+      const promoted = destination;
+      return {
+        ContentLength: bytes.byteLength,
+        ContentRange: `bytes 0-${bytes.byteLength - 1}/${size}`,
+        ContentType: contentType,
+        ETag: promoted?.key === command.input.Key ? '"copied-etag"' : etag,
+        Body: { transformToByteArray: async () => bytes },
+      };
+    }
+    if (command instanceof CopyObjectCommand) {
+      if (!command.input.Key) throw new Error("Copy destination is required");
+      destination = {
+        contentType: command.input.ContentType ?? contentType,
+        key: command.input.Key,
+        metadata: command.input.Metadata ?? {},
+      };
+      return { CopyObjectResult: { ETag: '"copied-etag"' } };
+    }
+    throw new Error("Unexpected storage command");
+  };
+};
+
 describe("MediaService", () => {
   it("creates a Cloudflare Images transformation URL without exposing R2 credentials", () => {
     const service = createService();
@@ -150,11 +199,11 @@ describe("MediaService", () => {
 
   it("reads only the first 64 bytes and promotes a verified pending product object", async () => {
     const service = createService();
-    const send = jest.spyOn(clientOf(service), "send").mockImplementation(validObject("image/png"));
+    const send = jest.spyOn(clientOf(service), "send").mockImplementation(promotableObject("image/png"));
 
     const finalKey = await service.validateProductImageObject(pendingProductKey, ownerUserId);
 
-    expect(finalKey).toMatch(new RegExp(`^products/${ownerUserId}/[0-9a-f-]{36}\\.png$`));
+    expect(finalKey).toMatch(new RegExp(`^products/${ownerUserId}/[0-9a-f]{64}\\.png$`));
     expect(send.mock.calls[1]?.[0]).toMatchObject({
       input: {
         Bucket: "dadamjang-staging-images",
@@ -163,15 +212,117 @@ describe("MediaService", () => {
         IfMatch: '"object-etag"',
       },
     });
-    expect(send.mock.calls[2]?.[0]).toMatchObject({
+    const copy = send.mock.calls.map(([command]) => command).find((command) => command instanceof CopyObjectCommand);
+    expect(copy).toMatchObject({
       input: {
         Bucket: "dadamjang-staging-images",
         Key: finalKey,
         CopySource: `/dadamjang-staging-images/${pendingProductKey}`,
         CopySourceIfMatch: '"object-etag"',
-        MetadataDirective: "COPY",
+        MetadataDirective: "REPLACE",
+        ContentType: "image/png",
+        Metadata: {
+          "owner-id": ownerUserId,
+          "declared-content-type": "image/png",
+          "declared-size": "1024",
+          "promotion-id": finalKey.slice(finalKey.lastIndexOf("/") + 1, -4),
+        },
       },
     });
+    expect(service.getProductImageUrl(finalKey)).toContain(finalKey);
+  });
+
+  it("reuses an existing promotion for the same pending object version", async () => {
+    const service = createService();
+    const send = jest.spyOn(clientOf(service), "send").mockImplementation(promotableObject("image/png"));
+
+    const first = await service.validateProductImageObject(pendingProductKey, ownerUserId);
+    const second = await service.validateProductImageObject(pendingProductKey, ownerUserId);
+
+    expect(second).toBe(first);
+    expect(send.mock.calls.filter(([command]) => command instanceof CopyObjectCommand)).toHaveLength(1);
+  });
+
+  it("converges concurrent promotions on one final object key", async () => {
+    const service = createService();
+    const send = jest.spyOn(clientOf(service), "send").mockImplementation(promotableObject("image/png"));
+
+    const finalKeys = await Promise.all(
+      Array.from({ length: 8 }, () => service.validateProductImageObject(pendingProductKey, ownerUserId)),
+    );
+    const copyKeys = send.mock.calls
+      .map(([command]) => command)
+      .filter((command): command is CopyObjectCommand => command instanceof CopyObjectCommand)
+      .map((command) => command.input.Key);
+
+    expect(new Set(finalKeys)).toEqual(new Set([finalKeys[0]]));
+    expect(new Set(copyKeys)).toEqual(new Set([finalKeys[0]]));
+  });
+
+  it("uses a new final key when the pending object ETag changes", async () => {
+    const firstService = createService();
+    const secondService = createService();
+    jest.spyOn(clientOf(firstService), "send").mockImplementation(promotableObject("image/png", '"etag-v1"'));
+    jest.spyOn(clientOf(secondService), "send").mockImplementation(promotableObject("image/png", '"etag-v2"'));
+
+    const first = await firstService.validateProductImageObject(pendingProductKey, ownerUserId);
+    const second = await secondService.validateProductImageObject(pendingProductKey, ownerUserId);
+
+    expect(second).not.toBe(first);
+  });
+
+  it("validates an entire attachment batch before promoting any object", async () => {
+    const service = createService();
+    const send = jest.spyOn(clientOf(service), "send").mockImplementation(async (command) => {
+      if (command instanceof HeadObjectCommand) {
+        const valid = command.input.Key === pendingProductKey;
+        return {
+          ContentType: "image/png",
+          ContentLength: 1024,
+          Metadata: metadata(valid ? ownerUserId : "00000000-0000-4000-8000-000000000099", "image/png", 1024),
+          ETag: '"object-etag"',
+        };
+      }
+      if (command instanceof GetObjectCommand) {
+        const bytes = magicBytes["image/png"];
+        return {
+          ContentLength: bytes.byteLength,
+          ContentRange: `bytes 0-${bytes.byteLength - 1}/1024`,
+          ContentType: "image/png",
+          ETag: '"object-etag"',
+          Body: { transformToByteArray: async () => bytes },
+        };
+      }
+      if (command instanceof CopyObjectCommand) return { CopyObjectResult: { ETag: '"copied-etag"' } };
+      throw new Error("Unexpected storage command");
+    });
+
+    await expect(
+      service.validateProductImageObjects([pendingProductKey, invalidPendingProductKey], ownerUserId),
+    ).rejects.toThrow(MediaErrorMessage.ObjectInvalid);
+    expect(send.mock.calls.some(([command]) => command instanceof CopyObjectCommand)).toBe(false);
+  });
+
+  it("fails closed when an existing deterministic promotion has mismatched server metadata", async () => {
+    const service = createService();
+    const respond = promotableObject("image/png");
+    const send = jest.spyOn(clientOf(service), "send").mockImplementation(respond);
+    const finalKey = await service.validateProductImageObject(pendingProductKey, ownerUserId);
+    send.mockImplementation(async (command) => {
+      if (command instanceof HeadObjectCommand && command.input.Key === finalKey)
+        return {
+          ContentType: "image/png",
+          ContentLength: 1024,
+          Metadata: { ...metadata(ownerUserId, "image/png", 1024), "promotion-id": "0".repeat(64) },
+          ETag: '"copied-etag"',
+        };
+      return respond(command);
+    });
+
+    await expect(service.validateProductImageObject(pendingProductKey, ownerUserId)).rejects.toThrow(
+      MediaErrorMessage.ObjectInvalid,
+    );
+    expect(send.mock.calls.filter(([command]) => command instanceof CopyObjectCommand)).toHaveLength(1);
   });
 
   it("accepts a legacy final object without declared metadata after bounded byte verification", async () => {

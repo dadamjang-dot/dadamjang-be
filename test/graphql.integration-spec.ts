@@ -8,10 +8,20 @@ import { migrateTestDatabase, resetTestFixtures, testPool } from "./support/data
 
 const jpegBytes = Uint8Array.from([0xff, 0xd8, 0xff, ...Array.from({ length: 61 }, () => 0)]);
 
-const styleImageObject =
-  (bytes = jpegBytes) =>
-  async (command: unknown) => {
-    if (command instanceof HeadObjectCommand)
+const styleImageObject = (bytes = jpegBytes) => {
+  let destination: { key: string; metadata: Record<string, string> } | undefined;
+  return async (command: unknown) => {
+    if (command instanceof HeadObjectCommand) {
+      const promoted = destination;
+      if (promoted && promoted.key === command.input.Key)
+        return {
+          ContentType: "image/jpeg",
+          ContentLength: 1024,
+          Metadata: promoted.metadata,
+          ETag: '"copied-style-etag"',
+        };
+      if (/\/[0-9a-f]{64}\./.test(command.input.Key ?? ""))
+        throw Object.assign(new Error("missing"), { $metadata: { httpStatusCode: 404 } });
       return {
         ContentType: "image/jpeg",
         ContentLength: 1024,
@@ -22,17 +32,23 @@ const styleImageObject =
         },
         ETag: '"style-etag"',
       };
+    }
     if (command instanceof GetObjectCommand)
       return {
         ContentType: "image/jpeg",
         ContentLength: 64,
         ContentRange: "bytes 0-63/1024",
-        ETag: '"style-etag"',
+        ETag: destination?.key === command.input.Key ? '"copied-style-etag"' : '"style-etag"',
         Body: { transformToByteArray: async () => bytes },
       };
-    if (command instanceof CopyObjectCommand) return { CopyObjectResult: { ETag: '"copied-style-etag"' } };
+    if (command instanceof CopyObjectCommand) {
+      if (!command.input.Key) throw new Error("Copy destination is required");
+      destination = { key: command.input.Key, metadata: command.input.Metadata ?? {} };
+      return { CopyObjectResult: { ETag: '"copied-style-etag"' } };
+    }
     throw new Error("Unexpected storage command");
   };
+};
 
 const signin = async (agent: ReturnType<typeof request.agent>) => {
   const response = await agent
@@ -311,7 +327,7 @@ describe("PostgreSQL GraphQL integration", () => {
       [first.body.data.createStylePost.stylePostId],
     );
     expect(storedImages.rows[0]?.imageKeys).toEqual([
-      expect.stringMatching(/^style-posts\/10000000-0000-4000-8000-000000000001\/[0-9a-f-]{36}\.jpg$/),
+      expect.stringMatching(/^style-posts\/10000000-0000-4000-8000-000000000001\/[0-9a-f]{64}\.jpg$/),
     ]);
 
     const invalidCursor = Buffer.from(

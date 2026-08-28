@@ -41,7 +41,7 @@
 ## Media trust boundary와 R2 운영 계약
 
 - 업로드 mutation은 5분 만료 presigned `PUT`과 `pending/products/...` 또는 `pending/style-posts/...` 키만 발급합니다. 서명에는 `Content-Type`과 `Content-Length`가 포함되고, pending 객체에는 소유자·선언 MIME·선언 크기 metadata가 기록되어야 합니다.
-- 첨부 시 서버는 소유자 경로, 허용 확장자, `HeadObject`의 MIME/크기/ETag를 확인하고 `Range: bytes=0-63` 및 `If-Match`로 실제 JPEG/PNG/WebP/HEIC/HEIF magic bytes를 검사합니다. 검증된 pending 객체만 조건부 `CopyObject`로 새 final 키에 승격하며 DB에는 final 키만 저장합니다.
+- 첨부 시 서버는 먼저 전체 첨부 묶음의 소유자 경로, 허용 확장자, `HeadObject` MIME/크기/ETag와 `Range: bytes=0-63`·`If-Match` 기반 JPEG/PNG/WebP/HEIC/HEIF magic bytes를 검사합니다. 전부 유효할 때만 pending 객체를 조건부 `CopyObject`로 승격하며 DB에는 final 키만 저장합니다. final 객체 ID는 검증된 source key와 ETag의 SHA-256으로 결정되고 서버 promotion metadata를 확인하므로, 동일 객체 버전의 재시도·동시 요청은 하나의 immutable final 키로 수렴합니다.
 - 배포 전부터 존재한 final 키는 선언 metadata가 없어도 호환됩니다. 단, 소유자 경로와 MIME·크기·ETag·magic-byte 검사는 동일하게 통과해야 합니다. 선언 metadata는 presigned 경계를 증명하는 pending 객체에만 필수입니다.
 - 애플리케이션의 delivery URL helper는 pending 키를 거부합니다. 다만 R2 public bucket 설정은 애플리케이션이 강제하거나 조회할 수 없으므로 다음 항목은 **배포 필수 전제**입니다.
   - production bucket의 `r2.dev` public development URL을 비활성화합니다. 그렇지 않으면 custom-domain WAF를 우회할 수 있습니다.

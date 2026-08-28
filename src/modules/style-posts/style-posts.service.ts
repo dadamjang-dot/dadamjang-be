@@ -199,9 +199,7 @@ export class StylePostsService {
     if (brandTagIds.some((brandId) => !purchasedBrandIds.has(brandId)))
       throw new CustomBadRequestException(StylePostErrorMessage.BrandTagNotPurchased);
 
-    const attachedImageKeys = await Promise.all(
-      imageKeys.map((key) => this.mediaService.validateStylePostImageObject(key, authorId)),
-    );
+    const attachedImageKeys = await this.mediaService.validateStylePostImageObjects(imageKeys, authorId);
     const imageUrls = attachedImageKeys.map((key) => this.mediaService.getStylePostImageUrl(key));
     try {
       const post = await this.db.transaction(async (tx) => {
