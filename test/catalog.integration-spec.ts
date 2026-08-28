@@ -3,7 +3,7 @@ import type { Pool } from "pg";
 import request from "supertest";
 import { createApp } from "src/app";
 import { FIXTURE } from "src/database/fixtures";
-import { decodeProductCursor } from "src/modules/catalog/catalog.service";
+import { decodeProductCursor, encodeProductCursor } from "src/modules/catalog/catalog.service";
 import { ProductSort } from "src/modules/catalog/catalog.types";
 import { type Database, DRIZZLE } from "src/modules/database/database.module";
 import { resetTestFixtures, testPool } from "./support/database";
@@ -21,6 +21,27 @@ const queryText = (query: unknown) => {
     return query.text;
   return "";
 };
+
+type ExplainPlan = {
+  readonly "Actual Loops"?: number;
+  readonly "Actual Rows"?: number;
+  readonly Filter?: string;
+  readonly "Index Cond"?: string;
+  readonly "Index Name"?: string;
+  readonly "Node Type": string;
+  readonly Plans?: ExplainPlan[];
+  readonly "Rows Removed by Filter"?: number;
+};
+
+type ObservedQuery = {
+  readonly text: string;
+  readonly values: unknown[];
+};
+
+const flattenPlan = (plan: ExplainPlan): ExplainPlan[] => [
+  plan,
+  ...(plan.Plans?.flatMap((child) => flattenPlan(child)) ?? []),
+];
 
 describe("catalog PostgreSQL integration", () => {
   let app: INestApplication;
@@ -57,6 +78,43 @@ describe("catalog PostgreSQL integration", () => {
         variables: { filter },
       })
       .expect(200);
+
+  const observeCatalogQueries = async <T>(
+    action: () => Promise<T>,
+    afterQuery?: (query: ObservedQuery) => Promise<void>,
+  ) => {
+    const appPool = app.get<Database>(DRIZZLE).$client;
+    const originalConnect = appPool.connect.bind(appPool);
+    const clientSpies: { mockRestore: () => void }[] = [];
+    const calls: ObservedQuery[] = [];
+    const connectSpy = jest.spyOn(appPool, "connect");
+    connectSpy.mockImplementation((async () => {
+      const client = await originalConnect();
+      const originalQuery = client.query.bind(client) as unknown as (
+        query: unknown,
+        values?: unknown[],
+      ) => Promise<unknown>;
+      const clientSpy = jest.spyOn(client, "query");
+      clientSpy.mockImplementation(((query: unknown, values?: unknown[]) => {
+        const observed = { text: queryText(query), values: values ?? [] };
+        calls.push(observed);
+        const result = originalQuery(query, values);
+        if (!afterQuery) return result;
+        return result.then(async (value) => {
+          await afterQuery(observed);
+          return value;
+        });
+      }) as never);
+      clientSpies.push(clientSpy);
+      return client;
+    }) as never);
+    try {
+      return { result: await action(), calls };
+    } finally {
+      for (const clientSpy of clientSpies) clientSpy.mockRestore();
+      connectSpy.mockRestore();
+    }
+  };
 
   beforeAll(async () => {
     pool = testPool();
@@ -135,7 +193,23 @@ describe("catalog PostgreSQL integration", () => {
     expect(response.body.errors).toEqual([expect.objectContaining({ message: "Invalid product cursor" })]);
   });
 
-  it("uses the candidate SQL metric for the cursor even when hydration sees a changed SKU", async () => {
+  it("rejects impossible cursor timestamps before querying PostgreSQL", async () => {
+    const after = Buffer.from(
+      JSON.stringify({
+        v: 1,
+        sort: ProductSort.LATEST,
+        createdAt: "2026-02-31T00:00:00.000000Z",
+        productId: FIXTURE.productId,
+      }),
+    ).toString("base64url");
+
+    const response = await products({ sort: ProductSort.LATEST, first: 1, after });
+
+    expect(response.body.data).toBeNull();
+    expect(response.body.errors).toEqual([expect.objectContaining({ message: "Invalid product cursor" })]);
+  });
+
+  it("keeps candidate, count, and hydration on one snapshot while a writer commits", async () => {
     const firstProductId = "72100000-0000-4000-8000-000000000001";
     const secondProductId = "72100000-0000-4000-8000-000000000002";
     const firstSkuId = "82100000-0000-4000-8000-000000000001";
@@ -156,122 +230,151 @@ describe("catalog PostgreSQL integration", () => {
       [firstSkuId, firstProductId, secondProductId],
     );
 
-    const appPool = app.get<Database>(DRIZZLE).$client;
-    const originalQuery = appPool.query.bind(appPool) as unknown as (
-      query: unknown,
-      values?: unknown[],
-    ) => Promise<unknown>;
     let changedAfterCandidate = false;
-    const querySpy = jest.spyOn(appPool, "query");
-    querySpy.mockImplementation(((query: unknown, values?: unknown[]) => {
-      const result = originalQuery(query, values);
-      const text = queryText(query);
-      if (changedAfterCandidate || !text.includes("to_char(") || !text.includes(" limit ")) return result;
-      changedAfterCandidate = true;
-      return result.then(async (value) => {
-        await pool.query(`UPDATE "productSkus" SET "price" = 900 WHERE "skuId" = $1`, [firstSkuId]);
-        return value;
-      });
-    }) as never);
+    const { result: response, calls } = await observeCatalogQueries(
+      () => products({ query: "Frozen Cursor Metric", sort: ProductSort.LOW_PRICE, first: 1 }),
+      async ({ text }) => {
+        if (changedAfterCandidate || !text.includes("to_char(") || !text.includes(" limit ")) return;
+        changedAfterCandidate = true;
+        await pool.query(
+          `WITH changed_sku AS (
+             UPDATE "productSkus" SET "price" = 900 WHERE "skuId" = $1 RETURNING "skuId"
+           )
+           UPDATE "products" SET "status" = 'DRAFT'
+           WHERE "productId" = $2 AND EXISTS (SELECT 1 FROM changed_sku)`,
+          [firstSkuId, secondProductId],
+        );
+      },
+    );
+    const connection = response.body.data.products;
+    const cursor = decodeProductCursor(connection.nextCursor, ProductSort.LOW_PRICE);
 
-    try {
-      const response = await products({ query: "Frozen Cursor Metric", sort: ProductSort.LOW_PRICE, first: 1 });
-      const connection = response.body.data.products;
-      const cursor = decodeProductCursor(connection.nextCursor, ProductSort.LOW_PRICE);
-
-      expect(response.body.errors).toBeUndefined();
-      expect(changedAfterCandidate).toBe(true);
-      expect(connection.nodes).toEqual([
-        expect.objectContaining({ productId: firstProductId, skus: [expect.objectContaining({ price: 900 })] }),
-      ]);
-      expect(cursor).toMatchObject({ sort: ProductSort.LOW_PRICE, sortValue: 100 });
-    } finally {
-      querySpy.mockRestore();
-    }
+    expect(response.body.errors).toBeUndefined();
+    expect(changedAfterCandidate).toBe(true);
+    expect(calls[0]?.text.toLowerCase()).toContain("begin isolation level repeatable read read only");
+    expect(connection.totalCount).toBe(2);
+    expect(connection.nodes).toEqual([
+      expect.objectContaining({ productId: firstProductId, skus: [expect.objectContaining({ price: 100 })] }),
+    ]);
+    expect(cursor).toMatchObject({ sort: ProductSort.LOW_PRICE, sortValue: 100 });
+    const committedWriterState = await pool.query<{ price: number; status: string }>(
+      `SELECT sku."price", product."status"
+       FROM "productSkus" sku
+       JOIN "products" product ON product."productId" = $2
+       WHERE sku."skuId" = $1`,
+      [firstSkuId, secondProductId],
+    );
+    expect(committedWriterState.rows).toEqual([{ price: 900, status: "DRAFT" }]);
   });
 
   it("hydrates SKUs and brands only for page product IDs", async () => {
-    const appPool = app.get<Database>(DRIZZLE).$client;
-    const querySpy = jest.spyOn(appPool, "query");
+    const { result: response, calls } = await observeCatalogQueries(() => products({ first: 1 }));
+    const returnedProductId = response.body.data.products.nodes[0].productId;
+    const candidate = calls.find(({ text }) => text.includes("to_char(") && text.includes(" limit "));
+    const skuHydration = calls.find(({ text }) => text.includes('order by "productSkus"."position" asc'));
+    const brandHydration = calls.find(({ text }) => text.includes('from "brands" where "brands"."brandId" in'));
 
-    try {
-      const response = await products({ first: 1 });
-      const returnedProductId = response.body.data.products.nodes[0].productId;
-      const calls = querySpy.mock.calls as unknown as [unknown, unknown[]?][];
-      const candidate = calls.find(([query]) => {
-        const text = queryText(query);
-        return text.includes("to_char(") && text.includes(" limit ");
-      });
-      const skuHydration = calls.find(([query]) => queryText(query).includes('order by "productSkus"."position" asc'));
-      const brandHydration = calls.find(([query]) =>
-        queryText(query).includes('from "brands" where "brands"."brandId" in'),
-      );
-      const candidateText = queryText(candidate?.[0]);
-      const candidateParams = candidate?.[1] ?? [];
-
-      expect(returnedProductId).toBe(FIXTURE.productId);
-      expect(candidateText).toContain("left join lateral");
-      expect(candidateText).toContain('as "cursorSortValue"');
-      expect(candidateText.match(/min\(/g)).toHaveLength(1);
-      expect(candidateText.match(/sum\(/g)).toHaveLength(1);
-      expect(candidateParams[candidateParams.length - 1]).toBe(2);
-      expect(skuHydration?.[1]).toEqual([returnedProductId, true]);
-      expect(brandHydration?.[1]).toEqual([FIXTURE.brandId]);
-    } finally {
-      querySpy.mockRestore();
-    }
+    expect(returnedProductId).toBe(FIXTURE.productId);
+    expect(candidate?.text).toContain("left join lateral");
+    expect(candidate?.text).toContain('as "cursorSortValue"');
+    expect(candidate?.text.match(/min\(/g)).toHaveLength(1);
+    expect(candidate?.text.match(/sum\(/g)).toHaveLength(1);
+    expect(candidate?.values[candidate.values.length - 1]).toBe(2);
+    expect(skuHydration?.values).toEqual([returnedProductId, true]);
+    expect(brandHydration?.values).toEqual([FIXTURE.brandId]);
   });
 
-  it("uses productId-complete indexes for default and category keyset plans", async () => {
+  it("puts the emitted default and category tuple cursor seek in the composite index condition", async () => {
+    const after = encodeProductCursor({
+      v: 1,
+      sort: ProductSort.LATEST,
+      createdAt: "2027-01-01T00:00:00.000000Z",
+      productId: "ffffffff-ffff-4fff-bfff-ffffffffffff",
+    });
+    const captureCandidate = async (filter: Record<string, unknown>) => {
+      const { calls } = await observeCatalogQueries(() => products(filter));
+      const candidate = calls.find(({ text }) => text.includes("to_char(") && text.includes(" limit "));
+      if (!candidate) throw new Error("Catalog candidate query was not captured");
+      return candidate;
+    };
+
     const client = await pool.connect();
     try {
+      const defaultCandidate = await captureCandidate({ sort: ProductSort.LATEST, after, first: 1 });
+      const categoryCandidate = await captureCandidate({
+        categoryId: FIXTURE.categoryId,
+        sort: ProductSort.LATEST,
+        after,
+        first: 1,
+      });
       await client.query("BEGIN");
       await client.query("SET LOCAL enable_seqscan = off");
       await client.query("SET LOCAL enable_bitmapscan = off");
-      const defaultPlan = await client.query(
-        `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)
-         SELECT product."productId", sku_metrics.active_lowest_price, sku_metrics.active_stock_total
-         FROM "products" product
-         LEFT JOIN LATERAL (
-           SELECT
-             coalesce(min(sku."price"), 0)::double precision AS active_lowest_price,
-             coalesce(sum(sku."stock"), 0)::double precision AS active_stock_total
-           FROM "productSkus" sku
-           WHERE sku."productId" = product."productId" AND sku."isActive" = true
-         ) sku_metrics ON true
-         WHERE product."status" = 'PUBLISHED'
-           AND (product."createdAt" < '2027-01-01T00:00:00Z'::timestamp
-             OR (product."createdAt" = '2027-01-01T00:00:00Z'::timestamp
-               AND product."productId" < 'ffffffff-ffff-ffff-ffff-ffffffffffff'::uuid))
-         ORDER BY product."createdAt" DESC, product."productId" DESC
-         LIMIT 21`,
+      const defaultPlan = await client.query<{ "QUERY PLAN": [{ Plan: ExplainPlan }] }>(
+        `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ${defaultCandidate.text}`,
+        defaultCandidate.values,
       );
-      const categoryPlan = await client.query(
-        `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)
-         SELECT product."productId", sku_metrics.active_lowest_price, sku_metrics.active_stock_total
-         FROM "products" product
-         LEFT JOIN LATERAL (
-           SELECT
-             coalesce(min(sku."price"), 0)::double precision AS active_lowest_price,
-             coalesce(sum(sku."stock"), 0)::double precision AS active_stock_total
-           FROM "productSkus" sku
-           WHERE sku."productId" = product."productId" AND sku."isActive" = true
-         ) sku_metrics ON true
-         WHERE product."status" = 'PUBLISHED' AND product."categoryId" = $1
-           AND (product."createdAt" < '2027-01-01T00:00:00Z'::timestamp
-             OR (product."createdAt" = '2027-01-01T00:00:00Z'::timestamp
-               AND product."productId" < 'ffffffff-ffff-ffff-ffff-ffffffffffff'::uuid))
-         ORDER BY product."createdAt" DESC, product."productId" DESC
-         LIMIT 21`,
-        [FIXTURE.categoryId],
+      const categoryPlan = await client.query<{ "QUERY PLAN": [{ Plan: ExplainPlan }] }>(
+        `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ${categoryCandidate.text}`,
+        categoryCandidate.values,
       );
+      const plans = [
+        {
+          name: "products_catalog_default_keyset_idx",
+          nodes: flattenPlan(defaultPlan.rows[0]["QUERY PLAN"][0].Plan),
+        },
+        {
+          name: "products_catalog_category_keyset_idx",
+          nodes: flattenPlan(categoryPlan.rows[0]["QUERY PLAN"][0].Plan),
+        },
+      ];
 
-      expect(JSON.stringify(defaultPlan.rows)).toContain("products_catalog_default_keyset_idx");
-      expect(JSON.stringify(categoryPlan.rows)).toContain("products_catalog_category_keyset_idx");
+      for (const plan of plans) {
+        const indexScan = plan.nodes.find((node) => node["Index Name"] === plan.name);
+        expect(indexScan?.["Index Cond"]).toContain('ROW("createdAt", "productId") < ROW(');
+        expect(indexScan?.["Rows Removed by Filter"] ?? 0).toBe(0);
+        expect(indexScan?.Filter).toBeUndefined();
+        expect(plan.nodes.map((node) => node["Node Type"])).not.toContain("Sort");
+      }
     } finally {
       await client.query("ROLLBACK");
       client.release();
     }
+  });
+
+  it("shows metric sorts aggregating and sorting every filtered candidate before the page limit", async () => {
+    await pool.query(
+      `INSERT INTO "products"
+        ("productId", "partnerId", "brandId", "categoryId", "title", "description", "status", "approvalStatus", "createdAt")
+       SELECT gen_random_uuid(), $1, $2, $3, 'Metric Ceiling ' || value, 'Metric plan fixture',
+         'PUBLISHED', 'APPROVED', '2026-08-01T00:00:00Z'::timestamp + value * interval '1 microsecond'
+       FROM generate_series(1, 12) value`,
+      [FIXTURE.partnerId, FIXTURE.brandId, FIXTURE.categoryId],
+    );
+    await pool.query(
+      `INSERT INTO "productSkus" ("skuId", "productId", "code", "optionName", "price", "stock", "position")
+       SELECT gen_random_uuid(), "productId", 'METRIC-' || "productId", 'Metric', 100, 1, 0
+       FROM "products"
+       WHERE "title" LIKE 'Metric Ceiling %'`,
+    );
+    const { calls } = await observeCatalogQueries(() =>
+      products({ query: "Metric Ceiling", sort: ProductSort.LOW_PRICE, first: 1 }),
+    );
+    const candidate = calls.find(({ text }) => text.includes("to_char(") && text.includes(" limit "));
+    if (!candidate) throw new Error("Catalog metric candidate query was not captured");
+
+    const planResult = await pool.query<{ "QUERY PLAN": [{ Plan: ExplainPlan }] }>(
+      `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ${candidate.text}`,
+      candidate.values,
+    );
+    const nodes = flattenPlan(planResult.rows[0]["QUERY PLAN"][0].Plan);
+    const sort = nodes.find((node) => node["Node Type"] === "Sort");
+    const aggregate = nodes.find((node) => node["Node Type"] === "Aggregate" && node["Actual Loops"] === 12);
+
+    expect(candidate.values[candidate.values.length - 1]).toBe(2);
+    expect(sort?.["Actual Rows"]).toBe(2);
+    expect(sort?.Plans?.[0]?.["Actual Rows"]).toBe(12);
+    expect(aggregate?.["Actual Loops"]).toBe(12);
   });
 
   it("orders active SKU aggregate edge cases with null metrics represented as zero", async () => {

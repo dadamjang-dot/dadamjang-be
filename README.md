@@ -23,6 +23,21 @@
 
 목록/비교 query는 상세 가격 근거를 포함하지 않습니다. 가격 변경 처리 시 전체 상품 목록 invalidate 대신 `productId + priceRevision` 기준 evidence/offer key만 갱신하는 것을 기본 전략으로 둡니다.
 
+## Catalog pagination·성능 계약
+
+- 한 catalog 응답의 candidate, `totalCount`, page SKU/brand hydration은 read-only `REPEATABLE READ` transaction의 같은 snapshot을 사용합니다.
+- 날짜 정렬은 `(status, createdAt DESC, productId DESC)` 또는 category 포함 복합 index로 cursor seek합니다.
+- `LOW_PRICE`, `HIGH_PRICE`, `POPULAR`은 활성 SKU 집계를 filtered product마다 계산한 뒤 정렬하므로 현재 상한은 O(filtered catalog)입니다. page size 최대 50은 이 집계 대상 수를 제한하지 않습니다.
+- 저장된 snapshot이 없으므로 서로 다른 page 요청 사이에 가격·재고가 바뀌면 metric keyset은 best-effort입니다. 호출자는 `productId`로 중복 제거해야 합니다.
+- catalog 지원 규모와 latency alert 임계치는 아직 측정값이 없어 정의하지 않았습니다. 운영 기준을 정하기 전에 filtered candidate 수, metric-sort p95, temporary-file sort 발생을 측정해야 합니다.
+
+## Database migration 계약
+
+- runner는 한 전용 PostgreSQL session에서 advisory lock을 최대 30초 기다리고 migration 실행을 직렬화합니다.
+- 각 migration은 같은 transaction에서 DDL과 journal을 기록하며 lock 대기는 5초, statement 실행은 5분으로 제한합니다.
+- 이미 journal에 기록될 수 있는 migration SQL은 checksum 계약 때문에 수정하지 않습니다. `0015_catalog_keyset_indexes.sql`은 이 원자성을 유지하는 일반 index build이며 timeout으로 무기한 대기를 막습니다.
+- `CREATE INDEX CONCURRENTLY`는 transaction 밖 DDL과 journal 사이의 crash 복구 및 invalid index 재실행 protocol이 마련되기 전에는 runner에서 지원하지 않습니다.
+
 ## Checkout 정합성 계약
 
 - `checkoutCart(input)`은 `idempotencyKey`를 필수로 받습니다.

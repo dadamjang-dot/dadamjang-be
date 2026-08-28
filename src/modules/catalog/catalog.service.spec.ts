@@ -91,6 +91,16 @@ describe("catalog cursor", () => {
       ProductSort.RECOMMENDED,
     ],
     [
+      "an impossible timestamp",
+      {
+        v: 1,
+        sort: ProductSort.RECOMMENDED,
+        createdAt: "2026-02-31T00:00:00.000000Z",
+        productId: CURSOR_PRODUCT_ID,
+      },
+      ProductSort.RECOMMENDED,
+    ],
+    [
       "an invalid product id",
       { v: 1, sort: ProductSort.RECOMMENDED, createdAt: CURSOR_CREATED_AT, productId: "product-1" },
       ProductSort.RECOMMENDED,

@@ -32,12 +32,13 @@ type MetricProductCursor = {
 };
 
 type ProductCursor = DateProductCursor | MetricProductCursor;
+type CatalogDatabase = Database | Parameters<Parameters<Database["transaction"]>[0]>[0];
 
 const DATE_PRODUCT_SORTS = new Set<ProductSort>([ProductSort.RECOMMENDED, ProductSort.LATEST]);
 const METRIC_PRODUCT_SORTS = new Set<ProductSort>([ProductSort.LOW_PRICE, ProductSort.HIGH_PRICE, ProductSort.POPULAR]);
 const PRODUCT_SORTS = new Set<string>(Object.values(ProductSort));
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-const CURSOR_TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{1,6}Z$/;
+const CURSOR_TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.(\d{6})Z$/;
 const DATE_CURSOR_KEYS = ["v", "sort", "createdAt", "productId"];
 const METRIC_CURSOR_KEYS = [...DATE_CURSOR_KEYS, "sortValue"];
 
@@ -49,6 +50,14 @@ const hasExactKeys = (value: Record<string, unknown>, expected: string[]) => {
   return keys.length === expected.length && keys.every((key) => expected.includes(key));
 };
 
+const isCanonicalCursorTimestamp = (value: string) => {
+  const match = CURSOR_TIMESTAMP_PATTERN.exec(value);
+  if (!match) return false;
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return false;
+  return `${parsed.toISOString().slice(0, -1)}${match[1].slice(3)}Z` === value;
+};
+
 const isProductCursor = (value: unknown): value is ProductCursor => {
   if (
     !isRecord(value) ||
@@ -56,8 +65,7 @@ const isProductCursor = (value: unknown): value is ProductCursor => {
     typeof value.sort !== "string" ||
     !PRODUCT_SORTS.has(value.sort) ||
     typeof value.createdAt !== "string" ||
-    !CURSOR_TIMESTAMP_PATTERN.test(value.createdAt) ||
-    Number.isNaN(Date.parse(value.createdAt)) ||
+    !isCanonicalCursorTimestamp(value.createdAt) ||
     typeof value.productId !== "string" ||
     !UUID_PATTERN.test(value.productId)
   )
@@ -180,76 +188,83 @@ export class CatalogService {
     const first = Math.min(Math.max(filter.first ?? 20, 1), MAX_PAGE_SIZE);
     const selectedSort = filter.sort ?? ProductSort.RECOMMENDED;
     const cursor = filter.after ? decodeProductCursor(filter.after, selectedSort) : undefined;
-    const candidateSkuMetrics = this.activeSkuMetrics("candidateSkuMetrics");
-    const activeLowestPrice = sql<number>`${candidateSkuMetrics.activeLowestPrice}`;
-    const activeStockTotal = sql<number>`${candidateSkuMetrics.activeStockTotal}`;
-    const conditions = this.productConditions(filter, activeLowestPrice);
-    const sortValue =
-      selectedSort === ProductSort.LOW_PRICE || selectedSort === ProductSort.HIGH_PRICE
-        ? activeLowestPrice
-        : selectedSort === ProductSort.POPULAR
-          ? activeStockTotal
-          : undefined;
-    const cursorCondition = cursor ? this.productCursorCondition(cursor, sortValue) : undefined;
-    const order = sortValue
-      ? [
-          selectedSort === ProductSort.LOW_PRICE ? asc(sortValue) : desc(sortValue),
-          desc(products.createdAt),
-          desc(products.productId),
-        ]
-      : [desc(products.createdAt), desc(products.productId)];
-    const cursorCreatedAt = sql<string>`to_char(${products.createdAt}, 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')`.as(
-      "cursorCreatedAt",
-    );
-    const cursorSortValue = sql<number | null>`${sortValue ?? sql`null::double precision`}`.as("cursorSortValue");
-    const countSkuMetrics = this.activeSkuMetrics("countSkuMetrics");
-    const countLowestPrice = sql<number>`${countSkuMetrics.activeLowestPrice}`;
-    const countRowsPromise =
-      filter.minPrice !== undefined || filter.maxPrice !== undefined
-        ? this.db
-            .select({ count: sql<number>`count(*)` })
+    return this.db.transaction(
+      async (tx) => {
+        const candidateSkuMetrics = this.activeSkuMetrics(tx, "candidateSkuMetrics");
+        const activeLowestPrice = sql<number>`${candidateSkuMetrics.activeLowestPrice}`;
+        const activeStockTotal = sql<number>`${candidateSkuMetrics.activeStockTotal}`;
+        const conditions = this.productConditions(filter, activeLowestPrice);
+        const sortValue =
+          selectedSort === ProductSort.LOW_PRICE || selectedSort === ProductSort.HIGH_PRICE
+            ? activeLowestPrice
+            : selectedSort === ProductSort.POPULAR
+              ? activeStockTotal
+              : undefined;
+        const cursorCondition = cursor ? this.productCursorCondition(cursor, sortValue) : undefined;
+        const order = sortValue
+          ? [
+              selectedSort === ProductSort.LOW_PRICE ? asc(sortValue) : desc(sortValue),
+              desc(products.createdAt),
+              desc(products.productId),
+            ]
+          : [desc(products.createdAt), desc(products.productId)];
+        const cursorCreatedAt = sql<string>`to_char(${products.createdAt}, 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')`.as(
+          "cursorCreatedAt",
+        );
+        const cursorSortValue = sql<number | null>`${sortValue ?? sql`null::double precision`}`.as("cursorSortValue");
+        const countSkuMetrics = this.activeSkuMetrics(tx, "countSkuMetrics");
+        const countLowestPrice = sql<number>`${countSkuMetrics.activeLowestPrice}`;
+        const countRowsPromise =
+          filter.minPrice !== undefined || filter.maxPrice !== undefined
+            ? tx
+                .select({ count: sql<number>`count(*)` })
+                .from(products)
+                .leftJoinLateral(countSkuMetrics, sql`true`)
+                .where(and(...this.productConditions(filter, countLowestPrice)))
+            : tx
+                .select({ count: sql<number>`count(*)` })
+                .from(products)
+                .where(and(...this.productConditions(filter)));
+        const [rows, countRows] = await Promise.all([
+          tx
+            .select({ ...getTableColumns(products), cursorCreatedAt, cursorSortValue })
             .from(products)
-            .leftJoinLateral(countSkuMetrics, sql`true`)
-            .where(and(...this.productConditions(filter, countLowestPrice)))
-        : this.db
-            .select({ count: sql<number>`count(*)` })
-            .from(products)
-            .where(and(...this.productConditions(filter)));
-    const [rows, countRows] = await Promise.all([
-      this.db
-        .select({ ...getTableColumns(products), cursorCreatedAt, cursorSortValue })
-        .from(products)
-        .leftJoinLateral(candidateSkuMetrics, sql`true`)
-        .where(and(...conditions, cursorCondition))
-        .orderBy(...order)
-        .limit(first + 1),
-      countRowsPromise,
-    ]);
-    const pageRows = rows.slice(0, first);
-    const nodes = await this.withSkus(
-      pageRows.map(({ cursorCreatedAt: _, cursorSortValue: __, ...product }) => product),
+            .leftJoinLateral(candidateSkuMetrics, sql`true`)
+            .where(and(...conditions, cursorCondition))
+            .orderBy(...order)
+            .limit(first + 1),
+          countRowsPromise,
+        ]);
+        const pageRows = rows.slice(0, first);
+        const nodes = await this.withSkus(
+          pageRows.map(({ cursorCreatedAt: _, cursorSortValue: __, ...product }) => product),
+          tx,
+        );
+        const hasNextPage = rows.length > first;
+        const tailRow = pageRows[pageRows.length - 1];
+        return {
+          nodes,
+          hasNextPage,
+          nextCursor:
+            hasNextPage && tailRow
+              ? encodeProductCursor(
+                  this.toProductCursor(
+                    tailRow.productId,
+                    tailRow.cursorCreatedAt,
+                    selectedSort,
+                    tailRow.cursorSortValue,
+                  ),
+                )
+              : null,
+          totalCount: Number(countRows[0]?.count ?? 0),
+        };
+      },
+      { isolationLevel: "repeatable read", accessMode: "read only" },
     );
-    const hasNextPage = rows.length > first;
-    const tailRow = pageRows[pageRows.length - 1];
-    return {
-      nodes,
-      hasNextPage,
-      nextCursor:
-        hasNextPage && tailRow
-          ? encodeProductCursor(
-              this.toProductCursor(tailRow.productId, tailRow.cursorCreatedAt, selectedSort, tailRow.cursorSortValue),
-            )
-          : null,
-      totalCount: Number(countRows[0]?.count ?? 0),
-    };
   };
 
   private productCursorCondition = (cursor: ProductCursor, sortValue: SQL<number> | undefined) => {
-    const createdAt = sql`${cursor.createdAt}::timestamp`;
-    const tieBreaker = or(
-      sql`${products.createdAt} < ${createdAt}`,
-      and(sql`${products.createdAt} = ${createdAt}`, sql`${products.productId} < ${cursor.productId}`),
-    );
+    const tieBreaker = sql`(${products.createdAt}, ${products.productId}) < (${cursor.createdAt}::timestamp, ${cursor.productId}::uuid)`;
     if (!("sortValue" in cursor)) return tieBreaker;
     if (!sortValue) throw new CustomBadRequestException(CatalogErrorMessage.InvalidCursor);
     return or(
@@ -260,8 +275,8 @@ export class CatalogService {
     );
   };
 
-  private activeSkuMetrics = (alias: string) =>
-    this.db
+  private activeSkuMetrics = (db: CatalogDatabase, alias: string) =>
+    db
       .select({
         activeLowestPrice: sql<number>`coalesce(min(${productSkus.price}), 0)::double precision`.as(
           "activeLowestPrice",
@@ -381,18 +396,21 @@ export class CatalogService {
     return product;
   };
 
-  private withSkus = async (productRows: (typeof products.$inferSelect)[]): Promise<ProductType[]> => {
+  private withSkus = async (
+    productRows: (typeof products.$inferSelect)[],
+    db: CatalogDatabase = this.db,
+  ): Promise<ProductType[]> => {
     if (productRows.length === 0) return [];
     const productIds = productRows.map((product) => product.productId);
     const brandIds = productRows.flatMap((product) => (product.brandId ? [product.brandId] : []));
     const [skus, brandRows] = await Promise.all([
-      this.db
+      db
         .select()
         .from(productSkus)
         .where(and(inArray(productSkus.productId, productIds), eq(productSkus.isActive, true)))
         .orderBy(asc(productSkus.position), asc(productSkus.skuId)),
       brandIds.length
-        ? this.db
+        ? db
             .select({ brandId: brands.brandId, name: brands.name, slug: brands.slug })
             .from(brands)
             .where(inArray(brands.brandId, brandIds))
