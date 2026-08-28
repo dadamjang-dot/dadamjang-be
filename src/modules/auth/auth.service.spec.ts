@@ -233,4 +233,56 @@ describe("AuthService", () => {
       undefined,
     );
   });
+
+  it("issues HS256 access and refresh tokens with distinct typed claims", async () => {
+    const repository = {
+      findRefreshToken: jest.fn().mockResolvedValue(undefined),
+      saveRefreshToken: jest.fn().mockResolvedValue(true),
+    };
+    const jwtService = {
+      signAsync: jest.fn().mockResolvedValueOnce("access-token").mockResolvedValueOnce("refresh-token"),
+      decode: jest.fn().mockReturnValue({ exp: Math.floor(Date.now() / 1000) + 3600 }),
+    };
+    const configService = {
+      getOrThrow: jest.fn((name: string) => {
+        const values: Record<string, string> = {
+          JWT_ACCESS_TOKEN_SECRET: "access-secret",
+          JWT_ACCESS_TOKEN_EXP: "15m",
+          JWT_REFRESH_TOKEN_SECRET: "refresh-secret",
+          JWT_REFRESH_TOKEN_EXP: "7d",
+        };
+        return values[name];
+      }),
+    };
+    const service = new AuthService(
+      repository as never,
+      jwtService as never,
+      configService as never,
+      {} as never,
+      {
+        assertAllowed: jest.fn().mockResolvedValue(undefined),
+      } as never,
+    );
+
+    await service.issueTokensForUser(user, "device-1");
+
+    expect(jwtService.signAsync).toHaveBeenNthCalledWith(1, expect.objectContaining({ tokenUse: "access" }), {
+      secret: "access-secret",
+      expiresIn: "15m",
+      algorithm: "HS256",
+      issuer: "dadamjang",
+      audience: "dadamjang-api",
+    });
+    expect(jwtService.signAsync).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ tokenUse: "refresh", deviceId: "device-1" }),
+      {
+        secret: "refresh-secret",
+        expiresIn: "7d",
+        algorithm: "HS256",
+        issuer: "dadamjang",
+        audience: "dadamjang-refresh",
+      },
+    );
+  });
 });

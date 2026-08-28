@@ -3,7 +3,9 @@ import { ConfigService } from "@nestjs/config";
 import { PassportStrategy } from "@nestjs/passport";
 import type { Request } from "express";
 import { ExtractJwt, Strategy, type StrategyOptions } from "passport-jwt";
-import { AuthRequest, JwtPayload } from "src/modules/auth/auth.types";
+import { CustomUnauthorizedException } from "src/common/errors/custom-exceptions";
+import { AuthErrorMessage } from "src/modules/auth/auth.error";
+import { AuthRequest, isAccessJwtPayload, JWT_ACCESS_AUDIENCE, JWT_ISSUER } from "src/modules/auth/auth.types";
 
 @Injectable()
 export class JwtAccessTokenStrategy extends PassportStrategy(Strategy, "access_token") {
@@ -19,12 +21,16 @@ export class JwtAccessTokenStrategy extends PassportStrategy(Strategy, "access_t
 
       secretOrKey: configService.getOrThrow<string>("JWT_ACCESS_TOKEN_SECRET"),
       ignoreExpiration: false,
+      issuer: JWT_ISSUER,
+      audience: JWT_ACCESS_AUDIENCE,
+      algorithms: ["HS256"],
       passReqToCallback: true,
     } satisfies StrategyOptions);
   }
 
-  validate(req: AuthRequest, payload: JwtPayload) {
+  validate = (req: AuthRequest, payload: unknown) => {
+    if (!isAccessJwtPayload(payload)) throw new CustomUnauthorizedException(AuthErrorMessage.AuthRequired);
     req.user = payload;
     return payload;
-  }
+  };
 }

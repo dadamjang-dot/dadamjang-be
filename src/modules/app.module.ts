@@ -36,11 +36,29 @@ const graphQlErrorCode = (status: number) => {
   return "INTERNAL_SERVER_ERROR";
 };
 
+export const validateConfig = (environment: Record<string, unknown>) => {
+  if (environment.NODE_ENV !== "production") return environment;
+  const accessSecret = environment.JWT_ACCESS_TOKEN_SECRET;
+  const refreshSecret = environment.JWT_REFRESH_TOKEN_SECRET;
+  if (
+    typeof accessSecret !== "string" ||
+    typeof refreshSecret !== "string" ||
+    accessSecret === "replace-me" ||
+    refreshSecret === "replace-me" ||
+    Buffer.byteLength(accessSecret, "utf8") < 32 ||
+    Buffer.byteLength(refreshSecret, "utf8") < 32
+  )
+    throw new Error("Production JWT secrets must be at least 32 bytes and must not use placeholders");
+  if (accessSecret === refreshSecret) throw new Error("JWT access and refresh secrets must be distinct");
+  return environment;
+};
+
 @Module({
   imports: [
     ConfigModule.forRoot({
       isGlobal: true,
       envFilePath: ".env",
+      validate: validateConfig,
     }),
     GraphQLModule.forRoot<ApolloDriverConfig>({
       driver: ApolloDriver,

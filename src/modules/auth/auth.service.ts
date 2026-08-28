@@ -10,7 +10,7 @@ import { EmailService } from "src/modules/email/email.service";
 import { User } from "src/modules/database/schema";
 import { AuthErrorMessage } from "./auth.error";
 import { AuthRepository, type RefreshTokenStore } from "./auth.repository";
-import { AuthPortal, SigninAuthInput } from "./auth.types";
+import { AuthPortal, JWT_ACCESS_AUDIENCE, JWT_ISSUER, JWT_REFRESH_AUDIENCE, SigninAuthInput } from "./auth.types";
 import { UserRole, type UserRoleValue } from "src/auth/role";
 
 type JwtExpiration = Exclude<JwtSignOptions["expiresIn"], undefined>;
@@ -116,17 +116,23 @@ export class AuthService {
   private createTokensForUser = async (user: User, deviceId: string) => {
     const role = (user as User & { role?: UserRoleValue }).role ?? UserRole.User;
     const accessToken = await this.jwtService.signAsync(
-      { userId: user.userId, role, jti: randomUUID() },
+      { userId: user.userId, role, tokenUse: "access", jti: randomUUID() },
       {
         secret: this.configService.getOrThrow<string>("JWT_ACCESS_TOKEN_SECRET"),
         expiresIn: this.configService.getOrThrow<string>("JWT_ACCESS_TOKEN_EXP") as JwtExpiration,
+        algorithm: "HS256",
+        issuer: JWT_ISSUER,
+        audience: JWT_ACCESS_AUDIENCE,
       },
     );
     const refreshToken = await this.jwtService.signAsync(
-      { userId: user.userId, role, deviceId, jti: randomUUID() },
+      { userId: user.userId, role, deviceId, tokenUse: "refresh", jti: randomUUID() },
       {
         secret: this.configService.getOrThrow<string>("JWT_REFRESH_TOKEN_SECRET"),
         expiresIn: this.configService.getOrThrow<string>("JWT_REFRESH_TOKEN_EXP") as JwtExpiration,
+        algorithm: "HS256",
+        issuer: JWT_ISSUER,
+        audience: JWT_REFRESH_AUDIENCE,
       },
     );
     const decoded = this.jwtService.decode(refreshToken) as { exp?: number } | null;

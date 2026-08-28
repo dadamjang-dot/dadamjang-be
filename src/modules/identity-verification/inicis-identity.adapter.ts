@@ -58,6 +58,7 @@ export class InicisIdentityAdapter {
         mid: this.configService.getOrThrow<string>("IDENTITY_INICIS_MID"),
         txId: callback.transactionId,
       }),
+      redirect: "error",
       signal: AbortSignal.timeout(5_000),
     });
     if (!response.ok) throw new CustomUnauthorizedException("본인인증 결과 조회에 실패했습니다.");

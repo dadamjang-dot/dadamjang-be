@@ -16,6 +16,10 @@ const config = {
 describe("InicisIdentityAdapter", () => {
   const adapter = new InicisIdentityAdapter(config);
 
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
   it("maps certificate providers to the official request services", () => {
     const toss = adapter.createRequest({
       sessionId: "session-1",
@@ -56,5 +60,36 @@ describe("InicisIdentityAdapter", () => {
       ),
     ).rejects.toThrow("본인인증 결과 URL이 유효하지 않습니다.");
     expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("rejects an allowed-host redirect without requesting the redirect target", async () => {
+    const fetchSpy = jest.spyOn(global, "fetch").mockImplementation(async (input, init) => {
+      if (String(input).startsWith("https://fcsa.inicis.com")) {
+        if (init?.redirect === "error") throw new TypeError("redirect not allowed");
+        return fetch("http://127.0.0.1/", init);
+      }
+      return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+    });
+
+    await expect(
+      adapter.verify(
+        {
+          sessionId: "session-1",
+          merchantTransactionId: "merchant-1",
+          provider: "NAVER",
+        },
+        {
+          resultCode: "0000",
+          authRequestUrl: "https://fcsa.inicis.com/result",
+          transactionId: "transaction-1",
+          token: "token",
+        },
+      ),
+    ).rejects.toThrow();
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(fetchSpy).toHaveBeenCalledWith(
+      new URL("https://fcsa.inicis.com/result"),
+      expect.objectContaining({ redirect: "error", signal: expect.any(AbortSignal) }),
+    );
   });
 });
