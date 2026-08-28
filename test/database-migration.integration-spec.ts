@@ -99,7 +99,7 @@ describe("database migration PostgreSQL integration", () => {
     const rerunJournal = await migrationPool.query<{ name: string; checksum: string }>(
       `SELECT "name", "checksum" FROM "_migrations" ORDER BY "name"`,
     );
-    expect(firstJournal.rows).toHaveLength(16);
+    expect(firstJournal.rows).toHaveLength(17);
     expect(rerunJournal.rows).toEqual(firstJournal.rows);
   });
 
