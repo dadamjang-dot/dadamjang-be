@@ -1,5 +1,6 @@
 import { CopyObjectCommand, GetObjectCommand, HeadObjectCommand } from "@aws-sdk/client-s3";
 import { ConfigService } from "@nestjs/config";
+import sharp from "sharp";
 import { CustomTooManyRequestsException } from "src/common/errors/custom-exceptions";
 import { AdmissionLimiter, type RequestOrigin } from "src/modules/admission/admission-limiter";
 import { MediaErrorMessage } from "./media.error";
@@ -18,9 +19,13 @@ const origin: RequestOrigin = { ip: "127.0.0.1", deviceId: "media-device" };
 
 const allow = () => ({ assertAllowed: jest.fn().mockResolvedValue(undefined) }) as unknown as AdmissionLimiter;
 
+type SupportedContentType = "image/jpeg" | "image/png" | "image/webp";
+let imageBytes: Record<SupportedContentType, Buffer>;
+
 const createService = (admissionLimiter = allow()) => {
   const values: Record<string, string> = {
     CLOUDFLARE_R2_BUCKET: "dadamjang-staging-images",
+    CLOUDFLARE_R2_PENDING_BUCKET: "dadamjang-staging-pending",
     CLOUDFLARE_R2_PUBLIC_BASE_URL: "https://images.example.com/",
     CLOUDFLARE_IMAGES_TRANSFORM_BASE_URL: "https://images.example.com/cdn-cgi/image/",
     CLOUDFLARE_R2_ENDPOINT: "https://account.r2.cloudflarestorage.com",
@@ -28,10 +33,23 @@ const createService = (admissionLimiter = allow()) => {
     CLOUDFLARE_R2_SECRET_ACCESS_KEY: "secret",
   };
   const configService = {
+    get: jest.fn((key: string) => values[key]),
     getOrThrow: jest.fn((key: string) => values[key]),
   } as unknown as ConfigService;
-  const Constructor = MediaService as unknown as new (config: ConfigService, limiter: AdmissionLimiter) => MediaService;
-  return new Constructor(configService, admissionLimiter);
+  const repository = {
+    adoptFinalObject: jest.fn().mockResolvedValue(undefined),
+    claimGarbage: jest.fn().mockResolvedValue(undefined),
+    completeGarbage: jest.fn().mockResolvedValue(undefined),
+    markPromotionReady: jest.fn().mockResolvedValue(undefined),
+    releaseGarbage: jest.fn().mockResolvedValue(undefined),
+    reservePromotion: jest.fn().mockResolvedValue(undefined),
+  };
+  const Constructor = MediaService as unknown as new (
+    config: ConfigService,
+    limiter: AdmissionLimiter,
+    mediaRepository: typeof repository,
+  ) => MediaService;
+  return new Constructor(configService, admissionLimiter, repository);
 };
 
 const clientOf = (service: MediaService) => (service as unknown as { client: StorageClient }).client;
@@ -44,14 +62,6 @@ const bytesWith = (...parts: readonly [number, readonly number[]][]) => {
 
 const ascii = (value: string) => [...Buffer.from(value, "ascii")];
 
-const magicBytes = {
-  "image/jpeg": bytesWith([0, [0xff, 0xd8, 0xff]]),
-  "image/png": bytesWith([0, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]]),
-  "image/webp": bytesWith([0, ascii("RIFF")], [8, ascii("WEBP")]),
-  "image/heic": bytesWith([0, [0, 0, 0, 24]], [4, ascii("ftyp")], [8, ascii("heic")]),
-  "image/heif": bytesWith([0, [0, 0, 0, 24]], [4, ascii("ftyp")], [8, ascii("mif1")]),
-} as const;
-
 const metadata = (owner: string, contentType: string, size: number) => ({
   "owner-id": owner,
   "declared-content-type": contentType,
@@ -59,11 +69,11 @@ const metadata = (owner: string, contentType: string, size: number) => ({
 });
 
 const validObject = (
-  contentType: keyof typeof magicBytes,
+  contentType: SupportedContentType,
   options: { owner?: string; size?: number; bytes?: Uint8Array; declaredMetadata?: boolean } = {},
 ) => {
-  const size = options.size ?? 1024;
-  const bytes = options.bytes ?? magicBytes[contentType];
+  const bytes = options.bytes ?? imageBytes[contentType];
+  const size = options.size ?? bytes.byteLength;
   return async (command: unknown) => {
     if (command instanceof HeadObjectCommand)
       return {
@@ -77,7 +87,6 @@ const validObject = (
     if (command instanceof GetObjectCommand)
       return {
         ContentLength: bytes.byteLength,
-        ContentRange: `bytes 0-${bytes.byteLength - 1}/${size}`,
         ContentType: contentType,
         ETag: '"object-etag"',
         Body: { transformToByteArray: async () => bytes },
@@ -89,8 +98,9 @@ const validObject = (
 
 const missingObject = () => Object.assign(new Error("missing"), { $metadata: { httpStatusCode: 404 } });
 
-const promotableObject = (contentType: keyof typeof magicBytes, etag = '"object-etag"') => {
-  const size = 1024;
+const promotableObject = (contentType: SupportedContentType, etag = '"object-etag"') => {
+  const bytes = imageBytes[contentType];
+  const size = bytes.byteLength;
   let destination: { contentType: string; key: string; metadata: Record<string, string> } | undefined;
   return async (command: unknown) => {
     if (command instanceof HeadObjectCommand) {
@@ -112,11 +122,9 @@ const promotableObject = (contentType: keyof typeof magicBytes, etag = '"object-
       throw missingObject();
     }
     if (command instanceof GetObjectCommand) {
-      const bytes = magicBytes[contentType];
       const promoted = destination;
       return {
-        ContentLength: bytes.byteLength,
-        ContentRange: `bytes 0-${bytes.byteLength - 1}/${size}`,
+        ContentLength: size,
         ContentType: contentType,
         ETag: promoted?.key === command.input.Key ? '"copied-etag"' : etag,
         Body: { transformToByteArray: async () => bytes },
@@ -136,6 +144,16 @@ const promotableObject = (contentType: keyof typeof magicBytes, etag = '"object-
 };
 
 describe("MediaService", () => {
+  beforeAll(async () => {
+    const source = { create: { width: 4, height: 3, channels: 4 as const, background: "#ff00ffff" } };
+    const [jpeg, png, webp] = await Promise.all([
+      sharp(source).jpeg().toBuffer(),
+      sharp(source).png().toBuffer(),
+      sharp(source).webp().toBuffer(),
+    ]);
+    imageBytes = { "image/jpeg": jpeg, "image/png": png, "image/webp": webp };
+  });
+
   it("creates a Cloudflare Images transformation URL without exposing R2 credentials", () => {
     const service = createService();
     const key = `products/${ownerUserId}/00000000-0000-4000-8000-000000000002.jpg`;
@@ -197,7 +215,7 @@ describe("MediaService", () => {
     expect(() => service.getProductImageUrl(target.key)).toThrow(MediaErrorMessage.InvalidKey);
   });
 
-  it("reads only the first 64 bytes and promotes a verified pending product object", async () => {
+  it("reads and decodes the full object before promoting a pending product image", async () => {
     const service = createService();
     const send = jest.spyOn(clientOf(service), "send").mockImplementation(promotableObject("image/png"));
 
@@ -206,9 +224,8 @@ describe("MediaService", () => {
     expect(finalKey).toMatch(new RegExp(`^products/${ownerUserId}/[0-9a-f]{64}\\.png$`));
     expect(send.mock.calls[1]?.[0]).toMatchObject({
       input: {
-        Bucket: "dadamjang-staging-images",
+        Bucket: "dadamjang-staging-pending",
         Key: pendingProductKey,
-        Range: "bytes=0-63",
         IfMatch: '"object-etag"',
       },
     });
@@ -217,14 +234,14 @@ describe("MediaService", () => {
       input: {
         Bucket: "dadamjang-staging-images",
         Key: finalKey,
-        CopySource: `/dadamjang-staging-images/${pendingProductKey}`,
+        CopySource: `/dadamjang-staging-pending/${pendingProductKey}`,
         CopySourceIfMatch: '"object-etag"',
         MetadataDirective: "REPLACE",
         ContentType: "image/png",
         Metadata: {
           "owner-id": ownerUserId,
           "declared-content-type": "image/png",
-          "declared-size": "1024",
+          "declared-size": String(imageBytes["image/png"].byteLength),
           "promotion-id": finalKey.slice(finalKey.lastIndexOf("/") + 1, -4),
         },
       },
@@ -278,16 +295,19 @@ describe("MediaService", () => {
         const valid = command.input.Key === pendingProductKey;
         return {
           ContentType: "image/png",
-          ContentLength: 1024,
-          Metadata: metadata(valid ? ownerUserId : "00000000-0000-4000-8000-000000000099", "image/png", 1024),
+          ContentLength: imageBytes["image/png"].byteLength,
+          Metadata: metadata(
+            valid ? ownerUserId : "00000000-0000-4000-8000-000000000099",
+            "image/png",
+            imageBytes["image/png"].byteLength,
+          ),
           ETag: '"object-etag"',
         };
       }
       if (command instanceof GetObjectCommand) {
-        const bytes = magicBytes["image/png"];
+        const bytes = imageBytes["image/png"];
         return {
           ContentLength: bytes.byteLength,
-          ContentRange: `bytes 0-${bytes.byteLength - 1}/1024`,
           ContentType: "image/png",
           ETag: '"object-etag"',
           Body: { transformToByteArray: async () => bytes },
@@ -312,8 +332,11 @@ describe("MediaService", () => {
       if (command instanceof HeadObjectCommand && command.input.Key === finalKey)
         return {
           ContentType: "image/png",
-          ContentLength: 1024,
-          Metadata: { ...metadata(ownerUserId, "image/png", 1024), "promotion-id": "0".repeat(64) },
+          ContentLength: imageBytes["image/png"].byteLength,
+          Metadata: {
+            ...metadata(ownerUserId, "image/png", imageBytes["image/png"].byteLength),
+            "promotion-id": "0".repeat(64),
+          },
           ETag: '"copied-etag"',
         };
       return respond(command);
@@ -325,7 +348,7 @@ describe("MediaService", () => {
     expect(send.mock.calls.filter(([command]) => command instanceof CopyObjectCommand)).toHaveLength(1);
   });
 
-  it("accepts a legacy final object without declared metadata after bounded byte verification", async () => {
+  it("accepts a legacy final object without declared metadata after full decoding", async () => {
     const service = createService();
     const send = jest
       .spyOn(clientOf(service), "send")
@@ -334,7 +357,7 @@ describe("MediaService", () => {
     await expect(service.validateProductImageObject(validProductKey, ownerUserId)).resolves.toBe(validProductKey);
     expect(send).toHaveBeenCalledTimes(2);
     expect(send.mock.calls[1]?.[0]).toMatchObject({
-      input: { Key: validProductKey, Range: "bytes=0-63", IfMatch: '"object-etag"' },
+      input: { Bucket: "dadamjang-staging-images", Key: validProductKey, IfMatch: '"object-etag"' },
     });
   });
 
@@ -342,14 +365,26 @@ describe("MediaService", () => {
     ["jpg", "image/jpeg"],
     ["png", "image/png"],
     ["webp", "image/webp"],
-    ["heic", "image/heic"],
-    ["heif", "image/heif"],
   ] as const)("accepts genuine .%s style image bytes", async (extension, contentType) => {
     const service = createService() as HardenedMediaService;
     jest.spyOn(clientOf(service), "send").mockImplementation(validObject(contentType));
     const key = `style-posts/${ownerUserId}/00000000-0000-4000-8000-000000000002.${extension}`;
 
     await expect(service.validateStylePostImageObject(key, ownerUserId)).resolves.toBe(key);
+  });
+
+  it("keeps legacy HEIC delivery keys readable while rejecting new HEIC uploads", async () => {
+    const service = createService();
+    const key = `style-posts/${ownerUserId}/00000000-0000-4000-8000-000000000002.heic`;
+
+    expect(service.getStylePostImageUrl(key)).toContain(key);
+    await expect(
+      service.createStylePostUpload(
+        ownerUserId,
+        { filename: "legacy.heic", contentType: "image/heic", fileSize: 1024 },
+        origin,
+      ),
+    ).rejects.toThrow(MediaErrorMessage.UnsupportedType);
   });
 
   it.each([
@@ -422,6 +457,41 @@ describe("MediaService", () => {
     );
     expect(send.mock.calls[1]?.[0]).toBeInstanceOf(GetObjectCommand);
     expect(transformToByteArray).not.toHaveBeenCalled();
+  });
+
+  it("stops a streamed object as soon as it exceeds the verified size", async () => {
+    const service = createService();
+    let yieldedChunks = 0;
+    const transformToByteArray = jest.fn().mockResolvedValue(Buffer.alloc(1024));
+    const body = {
+      async *[Symbol.asyncIterator]() {
+        for (const chunk of [Buffer.alloc(3), Buffer.alloc(2), Buffer.alloc(1024)]) {
+          yieldedChunks += 1;
+          yield chunk;
+        }
+      },
+      transformToByteArray,
+    };
+    jest.spyOn(clientOf(service), "send").mockImplementation(async (command) => {
+      if (command instanceof HeadObjectCommand)
+        return {
+          ContentType: "image/webp",
+          ContentLength: 4,
+          ETag: '"object-etag"',
+        };
+      return {
+        Body: body,
+        ContentLength: 4,
+        ContentType: "image/webp",
+        ETag: '"object-etag"',
+      };
+    });
+
+    await expect(service.validateProductImageObject(validProductKey, ownerUserId)).rejects.toThrow(
+      MediaErrorMessage.ObjectInvalid,
+    );
+    expect(transformToByteArray).not.toHaveBeenCalled();
+    expect(yieldedChunks).toBe(2);
   });
 
   it("rejects another user's key without issuing HeadObject", async () => {

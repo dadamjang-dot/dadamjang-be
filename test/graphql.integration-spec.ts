@@ -2,11 +2,12 @@ import { CopyObjectCommand, GetObjectCommand, HeadObjectCommand, S3Client } from
 import type { INestApplication } from "@nestjs/common";
 import type { Pool } from "pg";
 import request from "supertest";
+import sharp from "sharp";
 import { createApp } from "src/app";
 import { FIXTURE } from "src/database/fixtures";
 import { migrateTestDatabase, resetTestFixtures, testPool } from "./support/database";
 
-const jpegBytes = Uint8Array.from([0xff, 0xd8, 0xff, ...Array.from({ length: 61 }, () => 0)]);
+let jpegBytes: Buffer;
 
 const styleImageObject = (bytes = jpegBytes) => {
   let destination: { key: string; metadata: Record<string, string> } | undefined;
@@ -16,7 +17,7 @@ const styleImageObject = (bytes = jpegBytes) => {
       if (promoted && promoted.key === command.input.Key)
         return {
           ContentType: "image/jpeg",
-          ContentLength: 1024,
+          ContentLength: bytes.byteLength,
           Metadata: promoted.metadata,
           ETag: '"copied-style-etag"',
         };
@@ -24,11 +25,11 @@ const styleImageObject = (bytes = jpegBytes) => {
         throw Object.assign(new Error("missing"), { $metadata: { httpStatusCode: 404 } });
       return {
         ContentType: "image/jpeg",
-        ContentLength: 1024,
+        ContentLength: bytes.byteLength,
         Metadata: {
           "owner-id": FIXTURE.userId,
           "declared-content-type": "image/jpeg",
-          "declared-size": "1024",
+          "declared-size": String(bytes.byteLength),
         },
         ETag: '"style-etag"',
       };
@@ -36,8 +37,7 @@ const styleImageObject = (bytes = jpegBytes) => {
     if (command instanceof GetObjectCommand)
       return {
         ContentType: "image/jpeg",
-        ContentLength: 64,
-        ContentRange: "bytes 0-63/1024",
+        ContentLength: bytes.byteLength,
         ETag: destination?.key === command.input.Key ? '"copied-style-etag"' : '"style-etag"',
         Body: { transformToByteArray: async () => bytes },
       };
@@ -72,6 +72,11 @@ describe("PostgreSQL GraphQL integration", () => {
   let pool: Pool;
 
   beforeAll(async () => {
+    jpegBytes = await sharp({
+      create: { width: 4, height: 3, channels: 4, background: "#ff00ffff" },
+    })
+      .jpeg()
+      .toBuffer();
     pool = testPool();
     app = await createApp();
     await app.init();
@@ -281,7 +286,7 @@ describe("PostgreSQL GraphQL integration", () => {
       .mocked(S3Client.prototype.send)
       .mockImplementation(
         styleImageObject(
-          Uint8Array.from([...Buffer.from("%PDF", "ascii"), ...Array.from({ length: 60 }, () => 0)]),
+          Buffer.from([...Buffer.from("%PDF", "ascii"), ...Array.from({ length: 60 }, () => 0)]),
         ) as never,
       );
     const invalidMagic = await agent
@@ -329,6 +334,14 @@ describe("PostgreSQL GraphQL integration", () => {
     expect(storedImages.rows[0]?.imageKeys).toEqual([
       expect.stringMatching(/^style-posts\/10000000-0000-4000-8000-000000000001\/[0-9a-f]{64}\.jpg$/),
     ]);
+    const references = await pool.query<{ finalKey: string; status: string }>(
+      `SELECT r."finalKey", p."status"
+       FROM "mediaObjectReferences" r
+       JOIN "mediaObjectPromotions" p ON p."finalKey" = r."finalKey"
+       WHERE r."entityType" = 'STYLE_POST' AND r."entityId" = $1`,
+      [first.body.data.createStylePost.stylePostId],
+    );
+    expect(references.rows).toEqual([{ finalKey: storedImages.rows[0]?.imageKeys[0], status: "READY" }]);
 
     const invalidCursor = Buffer.from(
       JSON.stringify({

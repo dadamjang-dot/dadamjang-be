@@ -225,6 +225,7 @@ export class StylePostsService {
         await tx
           .insert(stylePostProducts)
           .values(productIds.map((productId) => ({ stylePostId: created.stylePostId, productId })));
+        await this.mediaService.replaceImageReferences(tx, "STYLE_POST", created.stylePostId, attachedImageKeys);
         return created;
       });
       return this.get(post.stylePostId, authorId);

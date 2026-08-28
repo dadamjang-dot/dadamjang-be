@@ -194,6 +194,7 @@ export class PartnerService {
       await tx
         .insert(productSkus)
         .values(input.skus.map((sku, position) => ({ ...sku, position, productId: product.productId })));
+      await this.mediaService.replaceImageReferences(tx, "PRODUCT", product.productId, imageKeys);
       return product;
     });
     return this.getProduct(ownerUserId, created.productId);
@@ -231,6 +232,7 @@ export class PartnerService {
       if (!updated) throw new CustomBadRequestException(PartnerErrorMessage.InvalidTransition);
       await tx.delete(productSkus).where(eq(productSkus.productId, productId));
       await tx.insert(productSkus).values(input.skus.map((sku, position) => ({ ...sku, position, productId })));
+      await this.mediaService.replaceImageReferences(tx, "PRODUCT", productId, imageKeys);
     });
     return this.getProduct(ownerUserId, productId);
   };

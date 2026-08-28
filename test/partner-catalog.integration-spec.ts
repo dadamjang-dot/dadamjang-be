@@ -2,6 +2,7 @@ import { CopyObjectCommand, GetObjectCommand, HeadObjectCommand, S3Client } from
 import type { INestApplication } from "@nestjs/common";
 import type { Pool } from "pg";
 import request from "supertest";
+import sharp from "sharp";
 import { createApp } from "src/app";
 import { FIXTURE } from "src/database/fixtures";
 import { resetTestFixtures, testPool } from "./support/database";
@@ -9,17 +10,7 @@ import { resetTestFixtures, testPool } from "./support/database";
 const validImageKey = "products/10000000-0000-4000-8000-000000000001/90000000-0000-4000-8000-000000000001.png";
 const pendingImageKey =
   "pending/products/10000000-0000-4000-8000-000000000001/90000000-0000-4000-8000-000000000003.png";
-const pngBytes = Uint8Array.from([
-  0x89,
-  0x50,
-  0x4e,
-  0x47,
-  0x0d,
-  0x0a,
-  0x1a,
-  0x0a,
-  ...Array.from({ length: 56 }, () => 0),
-]);
+let pngBytes: Buffer;
 
 const validImageObject = () => {
   let destination: { key: string; metadata: Record<string, string> } | undefined;
@@ -29,7 +20,7 @@ const validImageObject = () => {
       if (promoted && promoted.key === command.input.Key)
         return {
           ContentType: "image/png",
-          ContentLength: 1024,
+          ContentLength: pngBytes.byteLength,
           Metadata: promoted.metadata,
           ETag: '"copied-etag"',
         };
@@ -37,11 +28,11 @@ const validImageObject = () => {
         throw Object.assign(new Error("missing"), { $metadata: { httpStatusCode: 404 } });
       return {
         ContentType: "image/png",
-        ContentLength: 1024,
+        ContentLength: pngBytes.byteLength,
         Metadata: {
           "owner-id": FIXTURE.userId,
           "declared-content-type": "image/png",
-          "declared-size": "1024",
+          "declared-size": String(pngBytes.byteLength),
         },
         ETag: '"image-etag"',
       };
@@ -49,8 +40,7 @@ const validImageObject = () => {
     if (command instanceof GetObjectCommand)
       return {
         ContentType: "image/png",
-        ContentLength: 64,
-        ContentRange: "bytes 0-63/1024",
+        ContentLength: pngBytes.byteLength,
         ETag: destination?.key === command.input.Key ? '"copied-etag"' : '"image-etag"',
         Body: { transformToByteArray: async () => pngBytes },
       };
@@ -107,6 +97,11 @@ describe("partner catalog GraphQL integration", () => {
   });
 
   beforeAll(async () => {
+    pngBytes = await sharp({
+      create: { width: 4, height: 3, channels: 4, background: "#ff00ffff" },
+    })
+      .png()
+      .toBuffer();
     pool = testPool();
     app = await createApp();
     await app.init();
@@ -180,6 +175,14 @@ describe("partner catalog GraphQL integration", () => {
       [created.body.data.createPartnerProductDraft.productId],
     );
     expect(stored.rows[0]?.imageKeys).toEqual(imageKeys);
+    const references = await pool.query<{ finalKey: string; status: string }>(
+      `SELECT r."finalKey", p."status"
+       FROM "mediaObjectReferences" r
+       JOIN "mediaObjectPromotions" p ON p."finalKey" = r."finalKey"
+       WHERE r."entityType" = 'PRODUCT' AND r."entityId" = $1`,
+      [created.body.data.createPartnerProductDraft.productId],
+    );
+    expect(references.rows).toEqual([{ finalKey: imageKeys[0], status: "READY" }]);
   });
 
   it("preserves SKU order through the complete product lifecycle", async () => {

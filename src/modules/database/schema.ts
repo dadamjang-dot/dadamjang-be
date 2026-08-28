@@ -169,6 +169,88 @@ export const emailDeliveryOutbox = pgTable(
   ],
 );
 
+export const mediaObjectPromotions = pgTable(
+  "mediaObjectPromotions",
+  {
+    finalKey: text("finalKey").primaryKey(),
+    ownerUserId: uuid("ownerUserId").notNull(),
+    kind: varchar("kind", { length: 20 }).notNull(),
+    contentType: varchar("contentType", { length: 80 }).notNull(),
+    objectSize: integer("objectSize"),
+    finalEtag: text("finalEtag"),
+    sourceBucket: varchar("sourceBucket", { length: 255 }),
+    sourceKey: text("sourceKey"),
+    sourceEtag: text("sourceEtag"),
+    status: varchar("status", { length: 20 }).notNull(),
+    unreferencedAt: timestamp("unreferencedAt", { withTimezone: true }),
+    readyAt: timestamp("readyAt", { withTimezone: true }),
+    gcClaimedAt: timestamp("gcClaimedAt", { withTimezone: true }),
+    gcClaimToken: uuid("gcClaimToken"),
+    gcPreviousStatus: varchar("gcPreviousStatus", { length: 20 }),
+    deletedAt: timestamp("deletedAt", { withTimezone: true }),
+    createdAt: timestamp("createdAt", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    check("media_object_promotions_kind_check", sql`${table.kind} IN ('PRODUCT', 'STYLE_POST')`),
+    check(
+      "media_object_promotions_status_check",
+      sql`${table.status} IN ('PREPARING', 'READY', 'DELETING', 'DELETED')`,
+    ),
+    check("media_object_promotions_size_check", sql`${table.objectSize} IS NULL OR ${table.objectSize} > 0`),
+    check(
+      "media_object_promotions_source_check",
+      sql`(${table.sourceBucket} IS NULL AND ${table.sourceKey} IS NULL AND ${table.sourceEtag} IS NULL)
+        OR (${table.sourceBucket} IS NOT NULL AND ${table.sourceKey} IS NOT NULL AND ${table.sourceEtag} IS NOT NULL)`,
+    ),
+    check(
+      "media_object_promotions_gc_claim_check",
+      sql`(
+          ${table.status} = 'DELETING'
+          AND ${table.gcClaimedAt} IS NOT NULL
+          AND ${table.gcClaimToken} IS NOT NULL
+          AND ${table.gcPreviousStatus} IN ('PREPARING', 'READY')
+        ) OR (
+          ${table.status} <> 'DELETING'
+          AND ${table.gcClaimedAt} IS NULL
+          AND ${table.gcClaimToken} IS NULL
+          AND ${table.gcPreviousStatus} IS NULL
+        )`,
+    ),
+    check(
+      "media_object_promotions_deleted_check",
+      sql`(${table.status} = 'DELETED' AND ${table.deletedAt} IS NOT NULL)
+        OR (${table.status} <> 'DELETED' AND ${table.deletedAt} IS NULL)`,
+    ),
+    index("media_object_promotions_gc_idx")
+      .on(table.unreferencedAt, table.createdAt, table.finalKey)
+      .where(sql`${table.status} IN ('PREPARING', 'READY')`),
+    index("media_object_promotions_stale_claim_idx")
+      .on(table.gcClaimedAt, table.finalKey)
+      .where(sql`${table.status} = 'DELETING'`),
+  ],
+);
+
+export const mediaObjectReferences = pgTable(
+  "mediaObjectReferences",
+  {
+    entityType: varchar("entityType", { length: 20 }).notNull(),
+    entityId: uuid("entityId").notNull(),
+    finalKey: text("finalKey")
+      .notNull()
+      .references(() => mediaObjectPromotions.finalKey, { onDelete: "restrict" }),
+    createdAt: timestamp("createdAt", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    primaryKey({
+      columns: [table.entityType, table.entityId, table.finalKey],
+      name: "media_object_references_pk",
+    }),
+    check("media_object_references_entity_type_check", sql`${table.entityType} IN ('PRODUCT', 'STYLE_POST')`),
+    index("media_object_references_final_key_idx").on(table.finalKey),
+  ],
+);
+
 export const kakaoSignupTokens = pgTable("kakaoSignupToken", {
   tokenHash: text("tokenHash").primaryKey(),
   providerUserId: varchar("providerUserId", { length: 255 }).notNull(),
