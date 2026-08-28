@@ -7,7 +7,7 @@ import { AuthRequest, JwtPayload } from "src/modules/auth/auth.types";
 
 @Injectable()
 export class JwtAccessTokenStrategy extends PassportStrategy(Strategy, "access_token") {
-  constructor(private readonly configService: ConfigService) {
+  constructor(configService: ConfigService) {
     super({
       jwtFromRequest: ExtractJwt.fromExtractors([
         (request: Request) => {

@@ -20,7 +20,7 @@ const refreshTokenFromRequest = (request: Request) => {
 @Injectable()
 export class JwtRefreshTokenStrategy extends PassportStrategy(Strategy, "refresh_token") {
   constructor(
-    private readonly configService: ConfigService,
+    configService: ConfigService,
     private readonly authService: AuthService,
   ) {
     super({

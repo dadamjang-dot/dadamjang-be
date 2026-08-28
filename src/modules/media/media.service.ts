@@ -27,7 +27,7 @@ export class MediaService {
   private readonly publicBaseUrl: string;
   private readonly imageTransformBaseUrl: string;
 
-  constructor(private readonly configService: ConfigService) {
+  constructor(configService: ConfigService) {
     this.bucket = configService.getOrThrow<string>("CLOUDFLARE_R2_BUCKET");
     this.publicBaseUrl = configService.getOrThrow<string>("CLOUDFLARE_R2_PUBLIC_BASE_URL").replace(/\/$/, "");
     this.imageTransformBaseUrl = configService

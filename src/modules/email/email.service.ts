@@ -1,4 +1,4 @@
-import { Inject, Injectable, Logger } from "@nestjs/common";
+import { Inject, Injectable } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import * as bcrypt from "bcrypt";
 import { createHash, randomBytes, randomInt } from "crypto";
@@ -15,7 +15,6 @@ import { EmailVerificationPurpose, type EmailVerificationPurposeValue } from "./
 
 @Injectable()
 export class EmailService {
-  private readonly logger = new Logger(EmailService.name);
   constructor(
     private readonly repository: EmailRepository,
     private readonly configService: ConfigService,

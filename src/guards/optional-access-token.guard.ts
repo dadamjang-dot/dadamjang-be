@@ -4,7 +4,7 @@ import { JwtAccessTokenGuard } from "./access-token.guard";
 
 @Injectable()
 export class OptionalJwtAccessTokenGuard extends JwtAccessTokenGuard {
-  handleRequest<TUser = JwtPayload>(_error: unknown, user: TUser | undefined) {
+  override handleRequest<TUser = JwtPayload>(_error: unknown, user: TUser | undefined) {
     return user;
   }
 }
