@@ -59,7 +59,7 @@
 - PostgreSQL `SKIP LOCKED` claim, stale-claim 복구, 동일 outbox ID 기반 provider idempotency key로 multi-instance 재시도합니다. 전송 성공 여부가 모호하면 proof를 삭제하지 않으며 다음 claim이 같은 payload와 key를 사용합니다.
 - 복구 요청은 등록 여부와 관계없이 같은 admission·outbox 경로와 generic 응답을 사용합니다. 사용자 조회와 미등록 주소 suppress는 응답이 끝난 뒤 worker에서 수행합니다.
 - 운영에서는 `EMAIL_OUTBOX_WORKER_ENABLED=true`를 명시합니다. `0017_email_delivery_outbox.sql`과 새 writer를 함께 배포하고, outbox를 처리할 인스턴스가 최소 하나 이상 실행 중인지 모니터링해야 합니다.
-- `SENT`, `SUPPRESSED`, 최종 `FAILED` 전환 시 수신자, 요청 IP hash, 암호화 payload, proof, 오류 문자열을 즉시 비가역적으로 지웁니다. 상태·시도 횟수·시각은 관측을 위해 7일간 보존한 뒤 worker가 인덱스 기반 `SKIP LOCKED` 배치(최대 100개)로 삭제하며, 삭제 건수를 worker 로그로 기록합니다. `PENDING`과 현재 `PROCESSING` claim은 이 보존 작업에서 제외됩니다.
+- `SENT`, `SUPPRESSED`, 최종 `FAILED` 전환 시 수신자, 요청 IP hash, 암호화 payload, proof, 오류 문자열을 즉시 비가역적으로 지웁니다. Worker는 purge와 claim 전에 구버전 writer가 남긴 terminal 민감 필드를 원래 `updatedAt`을 유지한 채 인덱스 기반 `SKIP LOCKED` 배치(최대 100개)로 반복 scrub하고 0이 아닌 처리 건수를 기록합니다. 상태·시도 횟수·시각은 관측을 위해 7일간 보존한 뒤 같은 worker가 최대 100개씩 삭제하며 삭제 건수를 기록합니다. `PENDING`과 현재 `PROCESSING` claim은 scrub과 보존 삭제에서 제외됩니다.
 
 ## ALB client IP 계약
 

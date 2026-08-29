@@ -191,13 +191,25 @@ describe("database migration PostgreSQL integration", () => {
          AND column_name = 'callbackTokenHash'
        ORDER BY table_name`,
     );
-    const refreshRotationColumns = await migrationPool.query<{ column_name: string; is_nullable: string }>(
-      `SELECT column_name, is_nullable
+    const refreshRotationColumns = await migrationPool.query<{
+      column_name: string;
+      is_nullable: string;
+      table_name: string;
+    }>(
+      `SELECT table_name, column_name, is_nullable
        FROM information_schema.columns
        WHERE table_schema = 'public'
-         AND table_name = 'refreshToken'
-         AND column_name IN ('lastRotationKey', 'lastRotationExpiresAt')
-       ORDER BY column_name`,
+         AND (
+           (table_name = 'refreshToken' AND column_name IN ('lastRotationKey', 'lastRotationExpiresAt'))
+           OR (table_name = 'refreshTokenRotationMarker' AND column_name IN ('userId', 'deviceId', 'rotationKey', 'expiresAt'))
+         )
+       ORDER BY table_name, column_name`,
+    );
+    const refreshRotationForeignKey = await migrationPool.query<{ delete_rule: string }>(
+      `SELECT rc.delete_rule
+       FROM information_schema.referential_constraints rc
+       WHERE rc.constraint_schema = 'public'
+         AND rc.constraint_name = 'refresh_token_rotation_marker_session_fk'`,
     );
 
     expect(catalog.rows).toEqual([{ products: "0", skus: "0" }]);
@@ -207,9 +219,12 @@ describe("database migration PostgreSQL integration", () => {
       { column_name: "callbackTokenHash", is_nullable: "YES" },
     ]);
     expect(refreshRotationColumns.rows).toEqual([
-      { column_name: "lastRotationExpiresAt", is_nullable: "YES" },
-      { column_name: "lastRotationKey", is_nullable: "YES" },
+      { column_name: "deviceId", is_nullable: "NO", table_name: "refreshTokenRotationMarker" },
+      { column_name: "expiresAt", is_nullable: "NO", table_name: "refreshTokenRotationMarker" },
+      { column_name: "rotationKey", is_nullable: "NO", table_name: "refreshTokenRotationMarker" },
+      { column_name: "userId", is_nullable: "NO", table_name: "refreshTokenRotationMarker" },
     ]);
+    expect(refreshRotationForeignKey.rows).toEqual([{ delete_rule: "CASCADE" }]);
   });
 
   it("uses dedicated indexes for bounded anonymous-flow cleanup candidates", async () => {
@@ -271,6 +286,39 @@ describe("database migration PostgreSQL integration", () => {
     );
     expect(JSON.stringify(terminalPlan.rows[0]?.["QUERY PLAN"])).toContain(
       "email_delivery_outbox_terminal_updated_idx",
+    );
+
+    const terminalScrubPlan = await migrationPool.query<{ "QUERY PLAN": unknown }>(
+      `EXPLAIN (FORMAT JSON, COSTS OFF)
+       SELECT "id"
+       FROM "emailDeliveryOutbox"
+       WHERE "status" IN ('SENT', 'SUPPRESSED', 'FAILED')
+         AND (
+           "email" <> 'redacted@invalid'
+           OR "requestIpHash" IS NOT NULL
+           OR "payloadCiphertext" IS NOT NULL
+           OR "proofId" IS NOT NULL
+           OR "lastError" IS NOT NULL
+         )
+       ORDER BY "updatedAt", "id"
+       FOR UPDATE SKIP LOCKED
+       LIMIT 100`,
+    );
+    expect(JSON.stringify(terminalScrubPlan.rows[0]?.["QUERY PLAN"])).toContain(
+      "email_delivery_outbox_terminal_updated_idx",
+    );
+
+    const refreshRotationPlan = await migrationPool.query<{ "QUERY PLAN": unknown }>(
+      `EXPLAIN (FORMAT JSON, COSTS OFF)
+       SELECT "id"
+       FROM "refreshTokenRotationMarker"
+       WHERE "expiresAt" <= now()
+       ORDER BY "expiresAt", "id"
+       FOR UPDATE SKIP LOCKED
+       LIMIT 100`,
+    );
+    expect(JSON.stringify(refreshRotationPlan.rows[0]?.["QUERY PLAN"])).toContain(
+      "refresh_token_rotation_marker_expires_idx",
     );
   });
 

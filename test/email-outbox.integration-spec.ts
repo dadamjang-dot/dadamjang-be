@@ -1,4 +1,4 @@
-import type { INestApplication } from "@nestjs/common";
+import { Logger, type INestApplication } from "@nestjs/common";
 import type { Pool } from "pg";
 import request from "supertest";
 import { createApp } from "src/app";
@@ -248,6 +248,212 @@ describe("durable email delivery outbox integration", () => {
       [queued.rows[0]?.id],
     );
     expect(state.rows[0]).toEqual({ attemptCount: 1, status: "SENT" });
+  });
+
+  it("scrubs historical and rolling-overlap terminal rows without moving their retention clock", async () => {
+    const now = new Date("2026-08-29T12:00:00.000Z");
+    const retainedAt = new Date("2026-08-28T12:00:00.000Z");
+    const log = jest.spyOn(Logger.prototype, "log").mockImplementation(() => undefined);
+    await pool.query(
+      `INSERT INTO "emailDeliveryOutbox"
+        ("kind", "email", "requestIpHash", "payloadCiphertext", "proofId", "status", "availableAt", "expiresAt", "sentAt", "lastError", "updatedAt")
+       VALUES
+        ('SIGNUP_CODE', 'sent-history@example.test', repeat('a', 64), 'sent-ciphertext', 'sent-proof', 'SENT', $1, $1, $2, 'sent-error', $2),
+        ('PASSWORD_RESET_CODE', 'suppressed-history@example.test', repeat('b', 64), 'suppressed-ciphertext', 'suppressed-proof', 'SUPPRESSED', $1, $1, NULL, 'suppressed-error', $2),
+        ('PASSWORD_RESET_LINK', 'failed-history@example.test', repeat('c', 64), 'failed-ciphertext', 'failed-proof', 'FAILED', $1, $1, NULL, 'failed-error', $2),
+        ('SIGNUP_CODE', 'pending-history@example.test', repeat('d', 64), 'pending-ciphertext', 'pending-proof', 'PENDING', $1, $1, NULL, 'pending-error', $2)`,
+      [new Date("2026-08-30T12:00:00.000Z"), retainedAt],
+    );
+    await pool.query(
+      `INSERT INTO "emailDeliveryOutbox"
+        ("kind", "email", "requestIpHash", "payloadCiphertext", "proofId", "status", "claimedAt", "claimToken", "expiresAt", "lastError", "updatedAt")
+       VALUES ('SIGNUP_CODE', 'processing-history@example.test', repeat('e', 64), 'processing-ciphertext',
+         'processing-proof', 'PROCESSING', $1, '00000000-0000-4000-8000-000000000003',
+         $1::timestamptz + interval '1 day', 'processing-error', $2)`,
+      [now, retainedAt],
+    );
+
+    await expect(worker.runOnce(now)).resolves.toBe(false);
+
+    const terminal = await pool.query<{
+      email: string;
+      lastError: string | null;
+      payloadCiphertext: string | null;
+      proofId: string | null;
+      requestIpHash: string | null;
+      status: string;
+      updatedAt: Date;
+    }>(
+      `SELECT "email", "lastError", "payloadCiphertext", "proofId", "requestIpHash", "status", "updatedAt"
+       FROM "emailDeliveryOutbox"
+       WHERE "status" IN ('SENT', 'SUPPRESSED', 'FAILED')
+       ORDER BY "status"`,
+    );
+    expect(terminal.rows).toEqual([
+      {
+        email: "redacted@invalid",
+        lastError: null,
+        payloadCiphertext: null,
+        proofId: null,
+        requestIpHash: null,
+        status: "FAILED",
+        updatedAt: retainedAt,
+      },
+      {
+        email: "redacted@invalid",
+        lastError: null,
+        payloadCiphertext: null,
+        proofId: null,
+        requestIpHash: null,
+        status: "SENT",
+        updatedAt: retainedAt,
+      },
+      {
+        email: "redacted@invalid",
+        lastError: null,
+        payloadCiphertext: null,
+        proofId: null,
+        requestIpHash: null,
+        status: "SUPPRESSED",
+        updatedAt: retainedAt,
+      },
+    ]);
+    const active = await pool.query<{
+      email: string;
+      lastError: string;
+      payloadCiphertext: string;
+      proofId: string;
+      requestIpHash: string;
+      status: string;
+      updatedAt: Date;
+    }>(
+      `SELECT "email", "lastError", "payloadCiphertext", "proofId", "requestIpHash", "status", "updatedAt"
+       FROM "emailDeliveryOutbox"
+       WHERE "status" IN ('PENDING', 'PROCESSING')
+       ORDER BY "status"`,
+    );
+    expect(active.rows).toEqual([
+      {
+        email: "pending-history@example.test",
+        lastError: "pending-error",
+        payloadCiphertext: "pending-ciphertext",
+        proofId: "pending-proof",
+        requestIpHash: "d".repeat(64),
+        status: "PENDING",
+        updatedAt: retainedAt,
+      },
+      {
+        email: "processing-history@example.test",
+        lastError: "processing-error",
+        payloadCiphertext: "processing-ciphertext",
+        proofId: "processing-proof",
+        requestIpHash: "e".repeat(64),
+        status: "PROCESSING",
+        updatedAt: retainedAt,
+      },
+    ]);
+    expect(log).toHaveBeenCalledWith("Scrubbed 3 terminal email deliveries");
+
+    const overlapInserted = await pool.query<{ id: string }>(
+      `INSERT INTO "emailDeliveryOutbox"
+        ("kind", "email", "requestIpHash", "payloadCiphertext", "proofId", "status", "expiresAt", "sentAt", "lastError", "updatedAt")
+       VALUES ('SIGNUP_CODE', 'overlap-writer@example.test', repeat('f', 64), 'overlap-ciphertext',
+         'overlap-proof', 'SENT', $1, $2, 'overlap-error', $2)
+       RETURNING "id"`,
+      [new Date("2026-08-30T12:00:00.000Z"), retainedAt],
+    );
+    await expect(worker.runOnce(now)).resolves.toBe(false);
+    const overlap = await pool.query<{ email: string; updatedAt: Date }>(
+      `SELECT "email", "updatedAt"
+       FROM "emailDeliveryOutbox"
+       WHERE "id" = $1`,
+      [overlapInserted.rows[0]?.id],
+    );
+    expect(overlap.rows[0]).toEqual({ email: "redacted@invalid", updatedAt: retainedAt });
+    expect(log).toHaveBeenCalledWith("Scrubbed 1 terminal email deliveries");
+    log.mockClear();
+
+    await expect(worker.runOnce(now)).resolves.toBe(false);
+
+    expect(log).not.toHaveBeenCalledWith(expect.stringContaining("Scrubbed"));
+  });
+
+  it("scrubs at most 100 terminal rows per worker pass", async () => {
+    const now = new Date("2026-08-29T12:00:00.000Z");
+    await pool.query(
+      `INSERT INTO "emailDeliveryOutbox"
+        ("kind", "email", "requestIpHash", "payloadCiphertext", "proofId", "status", "expiresAt", "lastError", "updatedAt")
+       SELECT 'PASSWORD_RESET_LINK', 'scrub-batch-' || value || '@example.test', repeat('a', 64),
+         'ciphertext', 'proof-' || value, 'FAILED', $1::timestamptz + interval '1 day', 'sensitive error',
+         $1::timestamptz - interval '1 day'
+       FROM generate_series(1, 101) AS value`,
+      [now],
+    );
+
+    await expect(worker.runOnce(now)).resolves.toBe(false);
+    const afterFirst = await pool.query<{ redacted: number; sensitive: number }>(`
+      SELECT
+        count(*) FILTER (WHERE "email" = 'redacted@invalid')::int AS redacted,
+        count(*) FILTER (WHERE "email" <> 'redacted@invalid')::int AS sensitive
+      FROM "emailDeliveryOutbox"
+    `);
+    expect(afterFirst.rows[0]).toEqual({ redacted: 100, sensitive: 1 });
+
+    await expect(worker.runOnce(now)).resolves.toBe(false);
+    const afterSecond = await pool.query<{ redacted: number; sensitive: number }>(`
+      SELECT
+        count(*) FILTER (WHERE "email" = 'redacted@invalid')::int AS redacted,
+        count(*) FILTER (WHERE "email" <> 'redacted@invalid')::int AS sensitive
+      FROM "emailDeliveryOutbox"
+    `);
+    expect(afterSecond.rows[0]).toEqual({ redacted: 101, sensitive: 0 });
+  });
+
+  it("lets concurrent workers scrub separate terminal batches safely", async () => {
+    const now = new Date("2026-08-29T12:00:00.000Z");
+    const retainedAt = new Date("2026-08-28T12:00:00.000Z");
+    await pool.query(
+      `INSERT INTO "emailDeliveryOutbox"
+        ("kind", "email", "requestIpHash", "payloadCiphertext", "proofId", "status", "expiresAt", "lastError", "updatedAt")
+       SELECT 'SIGNUP_CODE', 'concurrent-scrub-' || value || '@example.test', repeat('a', 64),
+         'ciphertext', 'proof-' || value, 'SUPPRESSED', $1::timestamptz + interval '1 day', 'sensitive error', $2
+       FROM generate_series(1, 150) AS value`,
+      [now, retainedAt],
+    );
+
+    await expect(Promise.all([worker.runOnce(now), worker.runOnce(now)])).resolves.toEqual([false, false]);
+
+    const state = await pool.query<{
+      maximumUpdatedAt: Date;
+      minimumUpdatedAt: Date;
+      redacted: number;
+      sensitive: number;
+    }>(`
+      SELECT
+        max("updatedAt") AS "maximumUpdatedAt",
+        min("updatedAt") AS "minimumUpdatedAt",
+        count(*) FILTER (
+          WHERE "email" = 'redacted@invalid'
+            AND "requestIpHash" IS NULL
+            AND "payloadCiphertext" IS NULL
+            AND "proofId" IS NULL
+            AND "lastError" IS NULL
+        )::int AS redacted,
+        count(*) FILTER (
+          WHERE "email" <> 'redacted@invalid'
+             OR "requestIpHash" IS NOT NULL
+             OR "payloadCiphertext" IS NOT NULL
+             OR "proofId" IS NOT NULL
+             OR "lastError" IS NOT NULL
+        )::int AS sensitive
+      FROM "emailDeliveryOutbox"
+    `);
+    expect(state.rows[0]).toEqual({
+      maximumUpdatedAt: retainedAt,
+      minimumUpdatedAt: retainedAt,
+      redacted: 150,
+      sensitive: 0,
+    });
   });
 
   it("deletes at most 100 retained terminal rows without touching active work", async () => {

@@ -431,6 +431,36 @@ export class EmailRepository {
         ),
       );
   };
+  scrubTerminalDeliveries = async () => {
+    const result = await this.db.execute<{ id: string }>(sql`
+      WITH candidates AS (
+        SELECT ${emailDeliveryOutbox.id}
+        FROM ${emailDeliveryOutbox}
+        WHERE ${emailDeliveryOutbox.status} IN ('SENT', 'SUPPRESSED', 'FAILED')
+          AND (
+            ${emailDeliveryOutbox.email} <> ${redactedDelivery.email}
+            OR ${emailDeliveryOutbox.requestIpHash} IS NOT NULL
+            OR ${emailDeliveryOutbox.payloadCiphertext} IS NOT NULL
+            OR ${emailDeliveryOutbox.proofId} IS NOT NULL
+            OR ${emailDeliveryOutbox.lastError} IS NOT NULL
+          )
+        ORDER BY ${emailDeliveryOutbox.updatedAt}, ${emailDeliveryOutbox.id}
+        FOR UPDATE SKIP LOCKED
+        LIMIT ${EMAIL_OUTBOX_TERMINAL_RETENTION_BATCH_SIZE}
+      )
+      UPDATE ${emailDeliveryOutbox}
+      SET
+        "email" = ${redactedDelivery.email},
+        "requestIpHash" = NULL,
+        "payloadCiphertext" = NULL,
+        "proofId" = NULL,
+        "lastError" = NULL
+      FROM candidates
+      WHERE ${emailDeliveryOutbox.id} = candidates.id
+      RETURNING ${emailDeliveryOutbox.id}
+    `);
+    return result.rows.length;
+  };
   purgeTerminalDeliveries = async (now = new Date()) => {
     const retainedAfter = new Date(now.getTime() - EMAIL_OUTBOX_TERMINAL_RETENTION_MS);
     const result = await this.db.execute<{ id: string }>(sql`

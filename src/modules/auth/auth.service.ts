@@ -58,14 +58,14 @@ export class AuthService {
     });
   };
   refresh = async (userId: string, deviceId: string, refreshToken: string) => {
-    const lastRotationKey = hashToken(`${deviceId}\0${refreshToken}`);
+    const rotationKey = hashToken(`${deviceId}\0${refreshToken}`);
     const saved = await this.repository.findRefreshToken(userId, deviceId);
     if (
       !saved ||
       saved.refreshTokenExp.getTime() <= Date.now() ||
       !(await matchesRefreshToken(refreshToken, saved.refreshToken))
     ) {
-      if (await this.repository.hasRecentRotation(userId, deviceId, lastRotationKey))
+      if (await this.repository.hasRecentRotation(userId, deviceId, rotationKey))
         throw new CustomConflictException(AuthErrorMessage.SessionChanged);
       throw new CustomUnauthorizedException(AuthErrorMessage.AuthRequired);
     }
@@ -76,7 +76,7 @@ export class AuthService {
       userId,
       deviceId,
       previousRefreshToken: saved.refreshToken,
-      lastRotationKey,
+      rotationKey,
       refreshToken: tokens.refreshTokenHash,
       refreshTokenExp: tokens.refreshTokenExp,
     });

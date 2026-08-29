@@ -1,12 +1,19 @@
 import { Inject, Injectable } from "@nestjs/common";
 import { and, eq, gt, lt, sql } from "drizzle-orm";
 import { Database, DRIZZLE } from "src/modules/database/database.module";
-import { refreshTokens, users, type RefreshToken, type User } from "src/modules/database/schema";
+import {
+  refreshTokenRotationMarkers,
+  refreshTokens,
+  users,
+  type RefreshToken,
+  type User,
+} from "src/modules/database/schema";
 
-export type RefreshTokenStore = Pick<Database, "insert" | "query" | "update">;
+export type RefreshTokenStore = Pick<Database, "delete" | "insert" | "query" | "update">;
 
 const MIN_SIGNIN_REISSUE_INTERVAL_MS = 1000;
-const REFRESH_ROTATION_GRACE_SECONDS = 10;
+const REFRESH_ROTATION_HISTORY_SECONDS = 60;
+const REFRESH_ROTATION_CLEANUP_BATCH_SIZE = 100;
 
 export type RefreshRotationResult = "rotated" | "concurrent" | "invalid";
 
@@ -64,8 +71,6 @@ export class AuthRepository {
       .set({
         refreshToken: input.refreshToken,
         refreshTokenExp: input.refreshTokenExp,
-        lastRotationExpiresAt: null,
-        lastRotationKey: null,
         updatedAt: sql`clock_timestamp()`,
       })
       .where(
@@ -79,13 +84,22 @@ export class AuthRepository {
         ),
       )
       .returning({ id: refreshTokens.id });
+    if (updated)
+      await store
+        .delete(refreshTokenRotationMarkers)
+        .where(
+          and(
+            eq(refreshTokenRotationMarkers.userId, input.userId),
+            eq(refreshTokenRotationMarkers.deviceId, input.deviceId),
+          ),
+        );
     return Boolean(updated);
   };
   rotateRefreshToken = async (input: {
     userId: string;
     deviceId: string;
     previousRefreshToken: string;
-    lastRotationKey: string;
+    rotationKey: string;
     refreshToken: string;
     refreshTokenExp: Date;
   }): Promise<RefreshRotationResult> =>
@@ -95,8 +109,6 @@ export class AuthRepository {
         .set({
           refreshToken: input.refreshToken,
           refreshTokenExp: input.refreshTokenExp,
-          lastRotationKey: input.lastRotationKey,
-          lastRotationExpiresAt: sql`clock_timestamp() + make_interval(secs => ${REFRESH_ROTATION_GRACE_SECONDS})`,
           updatedAt: sql`clock_timestamp()`,
         })
         .where(
@@ -108,25 +120,45 @@ export class AuthRepository {
           ),
         )
         .returning({ id: refreshTokens.id });
-      if (rotated) return "rotated";
-      return (await this.hasRecentRotation(input.userId, input.deviceId, input.lastRotationKey, tx))
-        ? "concurrent"
-        : "invalid";
+      if (!rotated)
+        return (await this.hasRecentRotation(input.userId, input.deviceId, input.rotationKey, tx))
+          ? "concurrent"
+          : "invalid";
+      await tx.insert(refreshTokenRotationMarkers).values({
+        userId: input.userId,
+        deviceId: input.deviceId,
+        rotationKey: input.rotationKey,
+        expiresAt: sql`clock_timestamp() + make_interval(secs => ${REFRESH_ROTATION_HISTORY_SECONDS})`,
+      });
+      await tx.execute(sql`
+        WITH candidates AS (
+          SELECT ${refreshTokenRotationMarkers.id}
+          FROM ${refreshTokenRotationMarkers}
+          WHERE ${refreshTokenRotationMarkers.expiresAt} <= clock_timestamp()
+          ORDER BY ${refreshTokenRotationMarkers.expiresAt}, ${refreshTokenRotationMarkers.id}
+          FOR UPDATE SKIP LOCKED
+          LIMIT ${REFRESH_ROTATION_CLEANUP_BATCH_SIZE}
+        )
+        DELETE FROM ${refreshTokenRotationMarkers}
+        USING candidates
+        WHERE ${refreshTokenRotationMarkers.id} = candidates.id
+      `);
+      return "rotated";
     });
   hasRecentRotation = async (
     userId: string,
     deviceId: string,
-    lastRotationKey: string,
+    rotationKey: string,
     store: RefreshTokenStore = this.db,
   ) =>
     Boolean(
-      await store.query.refreshTokens.findFirst({
+      await store.query.refreshTokenRotationMarkers.findFirst({
         columns: { id: true },
         where: and(
-          eq(refreshTokens.userId, userId),
-          eq(refreshTokens.deviceId, deviceId),
-          eq(refreshTokens.lastRotationKey, lastRotationKey),
-          sql`${refreshTokens.lastRotationExpiresAt} > clock_timestamp()`,
+          eq(refreshTokenRotationMarkers.userId, userId),
+          eq(refreshTokenRotationMarkers.deviceId, deviceId),
+          eq(refreshTokenRotationMarkers.rotationKey, rotationKey),
+          sql`${refreshTokenRotationMarkers.expiresAt} > clock_timestamp()`,
         ),
       }),
     );

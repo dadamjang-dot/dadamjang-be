@@ -2,6 +2,7 @@ import { sql } from "drizzle-orm";
 import {
   boolean,
   check,
+  foreignKey,
   index,
   integer,
   jsonb,
@@ -35,18 +36,30 @@ export const refreshTokens = pgTable(
     deviceId: varchar("deviceId", { length: 255 }).notNull(),
     refreshToken: text("refreshToken").notNull(),
     refreshTokenExp: timestamp("refreshTokenExp").notNull(),
-    lastRotationKey: text("lastRotationKey"),
-    lastRotationExpiresAt: timestamp("lastRotationExpiresAt"),
     createdAt: timestamp("createdAt").defaultNow().notNull(),
     updatedAt: timestamp("updatedAt").defaultNow().notNull(),
   },
+  (table) => [unique("refreshToken_userId_deviceId_unique").on(table.userId, table.deviceId)],
+);
+
+export const refreshTokenRotationMarkers = pgTable(
+  "refreshTokenRotationMarker",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    userId: uuid("userId").notNull(),
+    deviceId: varchar("deviceId", { length: 255 }).notNull(),
+    rotationKey: text("rotationKey").notNull(),
+    expiresAt: timestamp("expiresAt").notNull(),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+  },
   (table) => [
-    unique("refreshToken_userId_deviceId_unique").on(table.userId, table.deviceId),
-    check(
-      "refresh_token_rotation_marker_check",
-      sql`(${table.lastRotationKey} IS NULL AND ${table.lastRotationExpiresAt} IS NULL)
-        OR (${table.lastRotationKey} IS NOT NULL AND ${table.lastRotationExpiresAt} IS NOT NULL)`,
-    ),
+    foreignKey({
+      columns: [table.userId, table.deviceId],
+      foreignColumns: [refreshTokens.userId, refreshTokens.deviceId],
+      name: "refresh_token_rotation_marker_session_fk",
+    }).onDelete("cascade"),
+    unique("refresh_token_rotation_marker_session_key_unique").on(table.userId, table.deviceId, table.rotationKey),
+    index("refresh_token_rotation_marker_expires_idx").on(table.expiresAt, table.id),
   ],
 );
 
