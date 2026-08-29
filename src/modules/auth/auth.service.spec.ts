@@ -173,6 +173,7 @@ describe("AuthService", () => {
   it("rejects expired and invalid refresh tokens", async () => {
     const expired = createService({
       findRefreshToken: jest.fn().mockResolvedValue({ refreshToken: "hash", refreshTokenExp: new Date(0) }),
+      hasRecentRotation: jest.fn().mockResolvedValue(false),
     });
     await expect(expired.refresh("user-1", "device", "token")).rejects.toThrow(AuthErrorMessage.AuthRequired);
     const hash = await bcrypt.hash("different-token", 4);
@@ -180,6 +181,7 @@ describe("AuthService", () => {
       findRefreshToken: jest
         .fn()
         .mockResolvedValue({ refreshToken: hash, refreshTokenExp: new Date(Date.now() + 60_000) }),
+      hasRecentRotation: jest.fn().mockResolvedValue(false),
     });
     await expect(invalid.refresh("user-1", "device", "token")).rejects.toThrow(AuthErrorMessage.AuthRequired);
   });

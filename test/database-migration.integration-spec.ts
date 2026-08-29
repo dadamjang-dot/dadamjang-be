@@ -191,12 +191,24 @@ describe("database migration PostgreSQL integration", () => {
          AND column_name = 'callbackTokenHash'
        ORDER BY table_name`,
     );
+    const refreshRotationColumns = await migrationPool.query<{ column_name: string; is_nullable: string }>(
+      `SELECT column_name, is_nullable
+       FROM information_schema.columns
+       WHERE table_schema = 'public'
+         AND table_name = 'refreshToken'
+         AND column_name IN ('lastRotationKey', 'lastRotationExpiresAt')
+       ORDER BY column_name`,
+    );
 
     expect(catalog.rows).toEqual([{ products: "0", skus: "0" }]);
     expect(extensions.rows).toEqual([{ extname: "pgcrypto" }]);
     expect(callbackTokenColumns.rows).toEqual([
       { column_name: "callbackTokenHash", is_nullable: "YES" },
       { column_name: "callbackTokenHash", is_nullable: "YES" },
+    ]);
+    expect(refreshRotationColumns.rows).toEqual([
+      { column_name: "lastRotationExpiresAt", is_nullable: "YES" },
+      { column_name: "lastRotationKey", is_nullable: "YES" },
     ]);
   });
 
@@ -246,6 +258,20 @@ describe("database migration PostgreSQL integration", () => {
       );
       expect(JSON.stringify(plan.rows[0]?.["QUERY PLAN"])).toContain(scan.index);
     }
+
+    const terminalPlan = await migrationPool.query<{ "QUERY PLAN": unknown }>(
+      `EXPLAIN (FORMAT JSON, COSTS OFF)
+       SELECT "id"
+       FROM "emailDeliveryOutbox"
+       WHERE "status" IN ('SENT', 'SUPPRESSED', 'FAILED')
+         AND "updatedAt" <= now()
+       ORDER BY "updatedAt", "id"
+       FOR UPDATE SKIP LOCKED
+       LIMIT 100`,
+    );
+    expect(JSON.stringify(terminalPlan.rows[0]?.["QUERY PLAN"])).toContain(
+      "email_delivery_outbox_terminal_updated_idx",
+    );
   });
 
   it("adds nullable callback-token hashes without losing pre-migration auth flows", async () => {

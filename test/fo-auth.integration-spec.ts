@@ -242,14 +242,45 @@ describe("FO auth GraphQL integration", () => {
 
     expect(succeeded).toHaveLength(1);
     expect(rejected).toHaveLength(1);
+    expect(rejected[0]?.body.errors[0].extensions.code).toBe("CONFLICT");
     const currentRefreshToken = succeeded[0]?.body.data.refresh.refreshToken as string;
     expect(currentRefreshToken).not.toBe(refreshToken);
+    const rotation = await pool.query<{
+      active: boolean;
+      bounded: boolean;
+      currentRefreshToken: string;
+      lastRotationKey: string;
+    }>(
+      `SELECT
+        "lastRotationExpiresAt" > now() AS active,
+        "lastRotationExpiresAt" <= now() + interval '10 seconds' AS bounded,
+        "refreshToken" AS "currentRefreshToken",
+        "lastRotationKey"
+       FROM "refreshToken"
+       WHERE "userId" = $1 AND "deviceId" = $2`,
+      [FIXTURE.userId, deviceId],
+    );
+    expect(rotation.rows[0]).toEqual({
+      active: true,
+      bounded: true,
+      currentRefreshToken: hashToken(currentRefreshToken),
+      lastRotationKey: hashToken(`${deviceId}\0${refreshToken}`),
+    });
+    expect(rotation.rows[0]?.lastRotationKey).not.toContain(refreshToken);
 
     const staleLogout = await request(app.getHttpServer())
       .post("/graphql")
       .set("authorization", `Bearer ${refreshToken}`)
       .send({ query: `mutation Logout { logout }` });
     expect(staleLogout.body.errors[0].message).toBe("아이디 또는 비밀번호가 올바르지 않습니다.");
+
+    await pool.query(
+      `UPDATE "refreshToken" SET "lastRotationExpiresAt" = now() - interval '1 second'
+       WHERE "userId" = $1 AND "deviceId" = $2`,
+      [FIXTURE.userId, deviceId],
+    );
+    const expiredReplay = await refresh();
+    expect(expiredReplay.body.errors[0].extensions.code).toBe("UNAUTHENTICATED");
 
     const currentRefresh = await request(app.getHttpServer())
       .post("/graphql")

@@ -6,6 +6,9 @@ import { refreshTokens, users, type RefreshToken, type User } from "src/modules/
 export type RefreshTokenStore = Pick<Database, "insert" | "query" | "update">;
 
 const MIN_SIGNIN_REISSUE_INTERVAL_MS = 1000;
+const REFRESH_ROTATION_GRACE_SECONDS = 10;
+
+export type RefreshRotationResult = "rotated" | "concurrent" | "invalid";
 
 type SaveRefreshTokenInput = {
   userId: string;
@@ -61,6 +64,8 @@ export class AuthRepository {
       .set({
         refreshToken: input.refreshToken,
         refreshTokenExp: input.refreshTokenExp,
+        lastRotationExpiresAt: null,
+        lastRotationKey: null,
         updatedAt: sql`clock_timestamp()`,
       })
       .where(
@@ -80,27 +85,51 @@ export class AuthRepository {
     userId: string;
     deviceId: string;
     previousRefreshToken: string;
+    lastRotationKey: string;
     refreshToken: string;
     refreshTokenExp: Date;
-  }) => {
-    const [rotated] = await this.db
-      .update(refreshTokens)
-      .set({
-        refreshToken: input.refreshToken,
-        refreshTokenExp: input.refreshTokenExp,
-        updatedAt: sql`clock_timestamp()`,
-      })
-      .where(
-        and(
-          eq(refreshTokens.userId, input.userId),
-          eq(refreshTokens.deviceId, input.deviceId),
-          eq(refreshTokens.refreshToken, input.previousRefreshToken),
-          gt(refreshTokens.refreshTokenExp, new Date()),
+  }): Promise<RefreshRotationResult> =>
+    this.db.transaction(async (tx) => {
+      const [rotated] = await tx
+        .update(refreshTokens)
+        .set({
+          refreshToken: input.refreshToken,
+          refreshTokenExp: input.refreshTokenExp,
+          lastRotationKey: input.lastRotationKey,
+          lastRotationExpiresAt: sql`clock_timestamp() + make_interval(secs => ${REFRESH_ROTATION_GRACE_SECONDS})`,
+          updatedAt: sql`clock_timestamp()`,
+        })
+        .where(
+          and(
+            eq(refreshTokens.userId, input.userId),
+            eq(refreshTokens.deviceId, input.deviceId),
+            eq(refreshTokens.refreshToken, input.previousRefreshToken),
+            gt(refreshTokens.refreshTokenExp, new Date()),
+          ),
+        )
+        .returning({ id: refreshTokens.id });
+      if (rotated) return "rotated";
+      return (await this.hasRecentRotation(input.userId, input.deviceId, input.lastRotationKey, tx))
+        ? "concurrent"
+        : "invalid";
+    });
+  hasRecentRotation = async (
+    userId: string,
+    deviceId: string,
+    lastRotationKey: string,
+    store: RefreshTokenStore = this.db,
+  ) =>
+    Boolean(
+      await store.query.refreshTokens.findFirst({
+        columns: { id: true },
+        where: and(
+          eq(refreshTokens.userId, userId),
+          eq(refreshTokens.deviceId, deviceId),
+          eq(refreshTokens.lastRotationKey, lastRotationKey),
+          sql`${refreshTokens.lastRotationExpiresAt} > clock_timestamp()`,
         ),
-      )
-      .returning({ id: refreshTokens.id });
-    return Boolean(rotated);
-  };
+      }),
+    );
   deleteRefreshToken = async (userId: string, deviceId: string, refreshToken: string) => {
     const [deleted] = await this.db
       .delete(refreshTokens)

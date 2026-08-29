@@ -79,16 +79,40 @@ describe("durable email delivery outbox integration", () => {
       expect.stringMatching(/^\d{6}$/),
       expect.stringMatching(/^email-delivery\/[0-9a-f-]+$/),
     );
-    const after = await pool.query<{ email: string; status: string; proofCount: number }>(`
-      SELECT o."email", o."status",
-        (SELECT count(*)::int FROM "emailVerification" v WHERE v."email" = o."email") AS "proofCount"
+    const after = await pool.query<{
+      email: string;
+      lastError: string | null;
+      payloadCiphertext: string | null;
+      proofId: string | null;
+      requestIpHash: string | null;
+      status: string;
+    }>(`
+      SELECT "email", "lastError", "payloadCiphertext", "proofId", "requestIpHash", "status"
       FROM "emailDeliveryOutbox" o
-      ORDER BY o."email"
+      ORDER BY o."status"
     `);
     expect(after.rows).toEqual([
-      { email: "integration@example.test", status: "SENT", proofCount: 1 },
-      { email: "unknown@example.test", status: "SUPPRESSED", proofCount: 0 },
+      {
+        email: "redacted@invalid",
+        lastError: null,
+        payloadCiphertext: null,
+        proofId: null,
+        requestIpHash: null,
+        status: "SENT",
+      },
+      {
+        email: "redacted@invalid",
+        lastError: null,
+        payloadCiphertext: null,
+        proofId: null,
+        requestIpHash: null,
+        status: "SUPPRESSED",
+      },
     ]);
+    const proofs = await pool.query<{ count: number }>(
+      `SELECT count(*)::int AS count FROM "emailVerification" WHERE "email" = 'integration@example.test'`,
+    );
+    expect(proofs.rows[0]?.count).toBe(1);
   });
 
   it("retries an ambiguous signup send with the same proof, payload, and provider idempotency key", async () => {
@@ -107,15 +131,17 @@ describe("durable email delivery outbox integration", () => {
     const firstAttemptAt = new Date(Date.now() + 1_000);
     await worker.runOnce(firstAttemptAt);
     const afterTimeout = await pool.query<{
+      id: string;
       payloadCiphertext: string;
       proofId: string;
       status: string;
     }>(`
-      SELECT "payloadCiphertext", "proofId", "status"
+      SELECT "id", "payloadCiphertext", "proofId", "status"
       FROM "emailDeliveryOutbox"
       WHERE "email" = 'new-signup@example.test'
     `);
     expect(afterTimeout.rows[0]).toEqual({
+      id: expect.any(String),
       payloadCiphertext: expect.any(String),
       proofId: expect.any(String),
       status: "PENDING",
@@ -127,20 +153,25 @@ describe("durable email delivery outbox integration", () => {
     expect(sendCode).toHaveBeenCalledTimes(2);
     expect(sendCode.mock.calls[1]).toEqual(sendCode.mock.calls[0]);
     const completed = await pool.query<{
-      payloadCiphertext: string;
+      email: string;
+      payloadCiphertext: string | null;
       proofCount: number;
-      proofId: string;
+      proofId: string | null;
       status: string;
-    }>(`
-      SELECT o."payloadCiphertext", o."proofId", o."status",
-        (SELECT count(*)::int FROM "emailVerification" v WHERE v."email" = o."email") AS "proofCount"
+    }>(
+      `
+      SELECT o."email", o."payloadCiphertext", o."proofId", o."status",
+        (SELECT count(*)::int FROM "emailVerification" v WHERE v."email" = 'new-signup@example.test') AS "proofCount"
       FROM "emailDeliveryOutbox" o
-      WHERE o."email" = 'new-signup@example.test'
-    `);
+      WHERE o."id" = $1
+    `,
+      [afterTimeout.rows[0]?.id],
+    );
     expect(completed.rows[0]).toEqual({
-      payloadCiphertext: afterTimeout.rows[0]?.payloadCiphertext,
+      email: "redacted@invalid",
+      payloadCiphertext: null,
       proofCount: 1,
-      proofId: afterTimeout.rows[0]?.proofId,
+      proofId: null,
       status: "SENT",
     });
   });
@@ -170,43 +201,121 @@ describe("durable email delivery outbox integration", () => {
       await pool.query(`DROP TRIGGER reject_email_sent_update ON "emailDeliveryOutbox"`);
       await pool.query(`DROP FUNCTION reject_email_sent_update()`);
     }
-    const afterCommitFailure = await pool.query<{ proofCount: number; status: string }>(`
-      SELECT o."status",
+    const afterCommitFailure = await pool.query<{ id: string; proofCount: number; status: string }>(`
+      SELECT o."id", o."status",
         (SELECT count(*)::int FROM "emailVerification" v WHERE v."email" = o."email") AS "proofCount"
       FROM "emailDeliveryOutbox" o
       WHERE o."email" = 'commit-after-send@example.test'
     `);
-    expect(afterCommitFailure.rows[0]).toEqual({ proofCount: 1, status: "PENDING" });
+    expect(afterCommitFailure.rows[0]).toEqual({ id: expect.any(String), proofCount: 1, status: "PENDING" });
     await pool.query(`UPDATE "emailDeliveryOutbox" SET "availableAt" = '2000-01-01T00:00:00Z'`);
 
     await worker.runOnce(new Date(firstAttemptAt.getTime() + 1_000));
 
     expect(sendCode).toHaveBeenCalledTimes(2);
     expect(sendCode.mock.calls[1]).toEqual(sendCode.mock.calls[0]);
-    const completed = await pool.query<{ proofCount: number; status: string }>(`
+    const completed = await pool.query<{ proofCount: number; status: string }>(
+      `
       SELECT o."status",
-        (SELECT count(*)::int FROM "emailVerification" v WHERE v."email" = o."email") AS "proofCount"
+        (SELECT count(*)::int FROM "emailVerification" v
+          WHERE v."email" = 'commit-after-send@example.test') AS "proofCount"
       FROM "emailDeliveryOutbox" o
-      WHERE o."email" = 'commit-after-send@example.test'
-    `);
+      WHERE o."id" = $1
+    `,
+      [afterCommitFailure.rows[0]?.id],
+    );
     expect(completed.rows[0]).toEqual({ proofCount: 1, status: "SENT" });
   });
 
   it("claims one delivery only once across concurrent worker loops", async () => {
     const sendCode = jest.spyOn(sender, "sendCode").mockResolvedValue(undefined);
     await requestEmail(app, "requestSignupEmailCode", "concurrent@example.test", "concurrent-worker-device");
+    const queued = await pool.query<{ id: string }>(
+      `SELECT "id" FROM "emailDeliveryOutbox" WHERE "email" = 'concurrent@example.test'`,
+    );
     const now = new Date(Date.now() + 1_000);
 
     const results = await Promise.all([worker.runOnce(now), worker.runOnce(now)]);
 
     expect(results.sort()).toEqual([false, true]);
     expect(sendCode).toHaveBeenCalledTimes(1);
-    const state = await pool.query<{ attemptCount: number; status: string }>(`
+    const state = await pool.query<{ attemptCount: number; status: string }>(
+      `
       SELECT "attemptCount", "status"
       FROM "emailDeliveryOutbox"
-      WHERE "email" = 'concurrent@example.test'
-    `);
+      WHERE "id" = $1
+    `,
+      [queued.rows[0]?.id],
+    );
     expect(state.rows[0]).toEqual({ attemptCount: 1, status: "SENT" });
+  });
+
+  it("deletes at most 100 retained terminal rows without touching active work", async () => {
+    const now = new Date("2026-08-29T12:00:00.000Z");
+    await pool.query(
+      `INSERT INTO "emailDeliveryOutbox"
+        ("kind", "email", "requestIpHash", "payloadCiphertext", "proofId", "status", "expiresAt", "lastError", "updatedAt")
+       SELECT 'PASSWORD_RESET_LINK', 'retained-' || value || '@example.test', repeat('a', 64),
+         'ciphertext', 'proof-' || value, 'FAILED', $1::timestamptz - interval '8 days', 'sensitive error',
+         $1::timestamptz - interval '8 days'
+       FROM generate_series(1, 101) AS value`,
+      [now],
+    );
+    await pool.query(
+      `INSERT INTO "emailDeliveryOutbox"
+        ("kind", "email", "status", "availableAt", "expiresAt", "updatedAt")
+       VALUES ('SIGNUP_CODE', 'pending@example.test', 'PENDING', $1::timestamptz + interval '1 hour',
+         $1::timestamptz + interval '1 day', $1::timestamptz - interval '8 days')`,
+      [now],
+    );
+    await pool.query(
+      `INSERT INTO "emailDeliveryOutbox"
+        ("kind", "email", "status", "claimedAt", "claimToken", "expiresAt", "updatedAt")
+       VALUES ('SIGNUP_CODE', 'processing@example.test', 'PROCESSING', $1,
+         '00000000-0000-4000-8000-000000000001', $1::timestamptz + interval '1 day',
+         $1::timestamptz - interval '8 days')`,
+      [now],
+    );
+
+    await expect(worker.runOnce(now)).resolves.toBe(false);
+
+    const state = await pool.query<{ pending: number; processing: number; terminal: number }>(`
+      SELECT
+        count(*) FILTER (WHERE "status" = 'PENDING')::int AS pending,
+        count(*) FILTER (WHERE "status" = 'PROCESSING')::int AS processing,
+        count(*) FILTER (WHERE "status" IN ('SENT', 'SUPPRESSED', 'FAILED'))::int AS terminal
+      FROM "emailDeliveryOutbox"
+    `);
+    expect(state.rows[0]).toEqual({ pending: 1, processing: 1, terminal: 1 });
+  });
+
+  it("lets concurrent worker maintenance consume separate terminal batches", async () => {
+    const now = new Date("2026-08-29T12:00:00.000Z");
+    await pool.query(
+      `INSERT INTO "emailDeliveryOutbox" ("kind", "email", "status", "expiresAt", "updatedAt")
+       SELECT 'SIGNUP_CODE', 'concurrent-retained-' || value || '@example.test', 'SUPPRESSED',
+         $1::timestamptz - interval '8 days', $1::timestamptz - interval '8 days'
+       FROM generate_series(1, 150) AS value`,
+      [now],
+    );
+    await pool.query(
+      `INSERT INTO "emailDeliveryOutbox"
+        ("kind", "email", "status", "claimedAt", "claimToken", "expiresAt", "updatedAt")
+       VALUES ('SIGNUP_CODE', 'current-claim@example.test', 'PROCESSING', $1,
+         '00000000-0000-4000-8000-000000000002', $1::timestamptz + interval '1 day',
+         $1::timestamptz - interval '8 days')`,
+      [now],
+    );
+
+    await expect(Promise.all([worker.runOnce(now), worker.runOnce(now)])).resolves.toEqual([false, false]);
+
+    const state = await pool.query<{ processing: number; terminal: number }>(`
+      SELECT
+        count(*) FILTER (WHERE "status" = 'PROCESSING')::int AS processing,
+        count(*) FILTER (WHERE "status" IN ('SENT', 'SUPPRESSED', 'FAILED'))::int AS terminal
+      FROM "emailDeliveryOutbox"
+    `);
+    expect(state.rows[0]).toEqual({ processing: 1, terminal: 0 });
   });
 
   it("never sends signup mail when the outbox insert fails at transaction commit", async () => {

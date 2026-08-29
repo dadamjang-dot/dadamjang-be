@@ -676,10 +676,11 @@ describe("Admin GraphQL integration", () => {
 
     expect(created.body.errors).toBeUndefined();
     expect(sendLink).not.toHaveBeenCalled();
-    const before = await pool.query<{ status: string }>(`
-      SELECT "status" FROM "emailDeliveryOutbox" WHERE "email" = 'worker-admin@example.test'
+    const before = await pool.query<{ id: string; status: string }>(`
+      SELECT "id", "status" FROM "emailDeliveryOutbox" WHERE "email" = 'worker-admin@example.test'
     `);
-    expect(before.rows).toEqual([{ status: "PENDING" }]);
+    expect(before.rows).toEqual([{ id: expect.any(String), status: "PENDING" }]);
+    const deliveryId = before.rows[0]?.id;
 
     await app.get(EmailDeliveryWorker).runOnce(new Date(Date.now() + 1_000));
 
@@ -689,9 +690,9 @@ describe("Admin GraphQL integration", () => {
       expect.stringMatching(/^http:\/\/localhost:3001\/invite\/accept#token=[A-Za-z0-9_-]+$/),
       expect.stringMatching(/^email-delivery\/[0-9a-f-]+$/),
     );
-    const after = await pool.query<{ status: string }>(`
-      SELECT "status" FROM "emailDeliveryOutbox" WHERE "email" = 'worker-admin@example.test'
-    `);
+    const after = await pool.query<{ status: string }>(`SELECT "status" FROM "emailDeliveryOutbox" WHERE "id" = $1`, [
+      deliveryId,
+    ]);
     expect(after.rows).toEqual([{ status: "SENT" }]);
   });
 

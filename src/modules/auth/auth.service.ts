@@ -58,24 +58,30 @@ export class AuthService {
     });
   };
   refresh = async (userId: string, deviceId: string, refreshToken: string) => {
+    const lastRotationKey = hashToken(`${deviceId}\0${refreshToken}`);
     const saved = await this.repository.findRefreshToken(userId, deviceId);
     if (
       !saved ||
       saved.refreshTokenExp.getTime() <= Date.now() ||
       !(await matchesRefreshToken(refreshToken, saved.refreshToken))
-    )
+    ) {
+      if (await this.repository.hasRecentRotation(userId, deviceId, lastRotationKey))
+        throw new CustomConflictException(AuthErrorMessage.SessionChanged);
       throw new CustomUnauthorizedException(AuthErrorMessage.AuthRequired);
+    }
     const user = await this.repository.findUser(userId);
     if (!user) throw new CustomUnauthorizedException(AuthErrorMessage.AuthRequired);
     const tokens = await this.createTokensForUser(user, deviceId);
-    const rotated = await this.repository.rotateRefreshToken({
+    const rotation = await this.repository.rotateRefreshToken({
       userId,
       deviceId,
       previousRefreshToken: saved.refreshToken,
+      lastRotationKey,
       refreshToken: tokens.refreshTokenHash,
       refreshTokenExp: tokens.refreshTokenExp,
     });
-    if (!rotated) throw new CustomUnauthorizedException(AuthErrorMessage.AuthRequired);
+    if (rotation === "concurrent") throw new CustomConflictException(AuthErrorMessage.SessionChanged);
+    if (rotation === "invalid") throw new CustomUnauthorizedException(AuthErrorMessage.AuthRequired);
     return tokens.payload;
   };
   logout = async (userId: string, deviceId: string, refreshToken: string) => {

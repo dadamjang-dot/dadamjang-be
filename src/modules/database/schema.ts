@@ -35,10 +35,19 @@ export const refreshTokens = pgTable(
     deviceId: varchar("deviceId", { length: 255 }).notNull(),
     refreshToken: text("refreshToken").notNull(),
     refreshTokenExp: timestamp("refreshTokenExp").notNull(),
+    lastRotationKey: text("lastRotationKey"),
+    lastRotationExpiresAt: timestamp("lastRotationExpiresAt"),
     createdAt: timestamp("createdAt").defaultNow().notNull(),
     updatedAt: timestamp("updatedAt").defaultNow().notNull(),
   },
-  (table) => [unique("refreshToken_userId_deviceId_unique").on(table.userId, table.deviceId)],
+  (table) => [
+    unique("refreshToken_userId_deviceId_unique").on(table.userId, table.deviceId),
+    check(
+      "refresh_token_rotation_marker_check",
+      sql`(${table.lastRotationKey} IS NULL AND ${table.lastRotationExpiresAt} IS NULL)
+        OR (${table.lastRotationKey} IS NOT NULL AND ${table.lastRotationExpiresAt} IS NOT NULL)`,
+    ),
+  ],
 );
 
 export const authIdentities = pgTable(
@@ -165,6 +174,9 @@ export const emailDeliveryOutbox = pgTable(
     index("email_delivery_outbox_expiry_idx")
       .on(table.expiresAt)
       .where(sql`${table.status} IN ('PENDING', 'PROCESSING')`),
+    index("email_delivery_outbox_terminal_updated_idx")
+      .on(table.updatedAt, table.id)
+      .where(sql`${table.status} IN ('SENT', 'SUPPRESSED', 'FAILED')`),
     index("email_delivery_outbox_email_created_idx").on(table.email, table.createdAt),
   ],
 );

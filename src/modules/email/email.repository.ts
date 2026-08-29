@@ -24,6 +24,16 @@ import {
 type Delivery = typeof emailDeliveryOutbox.$inferSelect;
 type ClaimedDelivery = Delivery & { claimToken: string };
 
+const EMAIL_OUTBOX_TERMINAL_RETENTION_MS = 7 * 24 * 60 * 60_000;
+const EMAIL_OUTBOX_TERMINAL_RETENTION_BATCH_SIZE = 100;
+const redactedDelivery = {
+  email: "redacted@invalid",
+  lastError: null,
+  payloadCiphertext: null,
+  proofId: null,
+  requestIpHash: null,
+} as const;
+
 type DeliveryPreparation = Readonly<{
   codeHash?: string;
   payloadCiphertext: string;
@@ -191,7 +201,7 @@ export class EmailRepository {
     this.db.transaction(async (tx) => {
       await tx
         .update(emailDeliveryOutbox)
-        .set({ claimedAt: null, claimToken: null, status: "FAILED", updatedAt: now })
+        .set({ ...redactedDelivery, claimedAt: null, claimToken: null, status: "FAILED", updatedAt: now })
         .where(
           and(inArray(emailDeliveryOutbox.status, ["PENDING", "PROCESSING"]), lte(emailDeliveryOutbox.expiresAt, now)),
         );
@@ -264,7 +274,7 @@ export class EmailRepository {
       if (!user) {
         await tx
           .update(emailDeliveryOutbox)
-          .set({ claimToken: null, claimedAt: null, status: "SUPPRESSED", updatedAt: now })
+          .set({ ...redactedDelivery, claimToken: null, claimedAt: null, status: "SUPPRESSED", updatedAt: now })
           .where(eq(emailDeliveryOutbox.id, delivery.id));
         return undefined;
       }
@@ -370,7 +380,7 @@ export class EmailRepository {
   completeDelivery = async (id: string, claimToken: string, now = new Date()) => {
     const [completed] = await this.db
       .update(emailDeliveryOutbox)
-      .set({ claimToken: null, claimedAt: null, sentAt: now, status: "SENT", updatedAt: now })
+      .set({ ...redactedDelivery, claimToken: null, claimedAt: null, sentAt: now, status: "SENT", updatedAt: now })
       .where(
         and(
           eq(emailDeliveryOutbox.id, id),
@@ -385,7 +395,7 @@ export class EmailRepository {
   suppressDelivery = async (id: string, claimToken: string, now = new Date()) => {
     await this.db
       .update(emailDeliveryOutbox)
-      .set({ claimToken: null, claimedAt: null, status: "SUPPRESSED", updatedAt: now })
+      .set({ ...redactedDelivery, claimToken: null, claimedAt: null, status: "SUPPRESSED", updatedAt: now })
       .where(
         and(
           eq(emailDeliveryOutbox.id, id),
@@ -405,10 +415,11 @@ export class EmailRepository {
     await this.db
       .update(emailDeliveryOutbox)
       .set({
+        ...(retry ? {} : redactedDelivery),
         availableAt: retry ? retryAt : delivery.expiresAt,
         claimToken: null,
         claimedAt: null,
-        lastError: message,
+        lastError: retry ? message : null,
         status: retry ? "PENDING" : "FAILED",
         updatedAt: now,
       })
@@ -419,6 +430,25 @@ export class EmailRepository {
           eq(emailDeliveryOutbox.status, "PROCESSING"),
         ),
       );
+  };
+  purgeTerminalDeliveries = async (now = new Date()) => {
+    const retainedAfter = new Date(now.getTime() - EMAIL_OUTBOX_TERMINAL_RETENTION_MS);
+    const result = await this.db.execute<{ id: string }>(sql`
+      WITH candidates AS (
+        SELECT ${emailDeliveryOutbox.id}
+        FROM ${emailDeliveryOutbox}
+        WHERE ${emailDeliveryOutbox.status} IN ('SENT', 'SUPPRESSED', 'FAILED')
+          AND ${emailDeliveryOutbox.updatedAt} <= ${retainedAfter}
+        ORDER BY ${emailDeliveryOutbox.updatedAt}, ${emailDeliveryOutbox.id}
+        FOR UPDATE SKIP LOCKED
+        LIMIT ${EMAIL_OUTBOX_TERMINAL_RETENTION_BATCH_SIZE}
+      )
+      DELETE FROM ${emailDeliveryOutbox}
+      USING candidates
+      WHERE ${emailDeliveryOutbox.id} = candidates.id
+      RETURNING ${emailDeliveryOutbox.id}
+    `);
+    return result.rows.length;
   };
   resetPasswordWithToken = (token: string, password: string) =>
     this.db.transaction(async (tx) => {

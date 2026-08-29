@@ -52,6 +52,8 @@ export class EmailDeliveryWorker implements OnModuleInit, OnApplicationShutdown 
   };
 
   runOnce = async (now = new Date()) => {
+    const purged = await this.repository.purgeTerminalDeliveries(now);
+    if (purged > 0) this.logger.log(`Purged ${purged} retained terminal email deliveries`);
     const claimed = await this.repository.claimDelivery(now);
     if (!claimed) return false;
     try {
