@@ -628,6 +628,27 @@ export const productSkus = pgTable(
   ],
 );
 
+export const productPriceEvidenceSnapshots = pgTable(
+  "productPriceEvidenceSnapshots",
+  {
+    productId: uuid("productId")
+      .primaryKey()
+      .references(() => products.productId, { onDelete: "cascade" }),
+    revision: uuid("revision").notNull().unique(),
+    source: varchar("source", { length: 80 }).notNull(),
+    basePrice: integer("basePrice").notNull(),
+    finalPrice: integer("finalPrice").notNull(),
+    recordedAt: timestamp("recordedAt").notNull(),
+    verifiedAt: timestamp("verifiedAt").notNull(),
+  },
+  (table) => [
+    check("product_price_evidence_base_price_check", sql`${table.basePrice} >= 0`),
+    check("product_price_evidence_final_price_check", sql`${table.finalPrice} >= 0`),
+    check("product_price_evidence_price_order_check", sql`${table.basePrice} >= ${table.finalPrice}`),
+    check("product_price_evidence_verification_time_check", sql`${table.verifiedAt} >= ${table.recordedAt}`),
+  ],
+);
+
 export const wishes = pgTable(
   "wishes",
   {

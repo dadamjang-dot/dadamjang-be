@@ -6,7 +6,11 @@ import { sql } from "drizzle-orm";
 import assert from "node:assert/strict";
 
 const rawCursor = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url");
-const createCatalogService = () => new CatalogService({} as never, { getProductImageUrl: jest.fn() } as never);
+const createCatalogService = () =>
+  new CatalogService(
+    { select: jest.fn().mockReturnValue(metadataQuery([])) } as never,
+    { getProductImageUrl: jest.fn() } as never,
+  );
 const CURSOR_CREATED_AT = "2026-07-11T00:00:00.000000Z";
 const CURSOR_PRODUCT_ID = "70000000-0000-4000-8000-000000000001";
 
@@ -218,7 +222,33 @@ describe("catalog cursor", () => {
 describe("catalog product batches", () => {
   it("returns price summaries in requested product order", async () => {
     const createdAt = new Date("2026-08-29T00:00:00Z");
-    const service = createCatalogService();
+    const service = new CatalogService(
+      {
+        select: jest.fn().mockReturnValue(
+          metadataQuery([
+            {
+              productId: "product-a",
+              revision: "90000000-0000-4000-8000-000000000001",
+              source: "catalog_sku_price_snapshot",
+              basePrice: 3000,
+              finalPrice: 1000,
+              recordedAt: new Date("2026-08-30T00:00:00Z"),
+              verifiedAt: new Date("2026-08-30T00:00:00Z"),
+            },
+            {
+              productId: "product-b",
+              revision: "90000000-0000-4000-8000-000000000002",
+              source: "catalog_sku_price_snapshot",
+              basePrice: 2000,
+              finalPrice: 2000,
+              recordedAt: new Date("2026-08-30T00:00:00Z"),
+              verifiedAt: new Date("2026-08-30T00:00:00Z"),
+            },
+          ]),
+        ),
+      } as never,
+      { getProductImageUrl: jest.fn() } as never,
+    );
     jest.spyOn(service, "getProductsByIds").mockResolvedValue([
       {
         productId: "product-b",
@@ -255,10 +285,10 @@ describe("catalog product batches", () => {
         thumbnail: "https://images.test/a.png",
         isOnSale: true,
         isExpressDelivery: false,
-        basePrice: 3000,
+        basePrice: 1000,
         finalPrice: 1000,
-        priceRevision: "product-a:1787961600000:3000:1000",
-        lowestPriceEvidenceSummary: "최저 옵션 기준 2,000원 차이",
+        priceRevision: "90000000-0000-4000-8000-000000000001",
+        lowestPriceEvidenceSummary: "현재 옵션 최저가 기준",
       },
       {
         productId: "product-b",
@@ -268,10 +298,73 @@ describe("catalog product batches", () => {
         isExpressDelivery: true,
         basePrice: 2000,
         finalPrice: 2000,
-        priceRevision: "product-b:1787961600000:2000:2000",
+        priceRevision: "90000000-0000-4000-8000-000000000002",
         lowestPriceEvidenceSummary: "현재 옵션 최저가 기준",
       },
     ]);
+  });
+
+  it("uses persisted snapshots for comparison price summaries", async () => {
+    const createdAt = new Date("2026-08-29T00:00:00Z");
+    const service = new CatalogService(
+      {
+        select: jest.fn().mockReturnValue(
+          metadataQuery([
+            {
+              productId: "product-a",
+              revision: "90000000-0000-4000-8000-000000000003",
+              source: "catalog_sku_price_snapshot",
+              basePrice: 2500,
+              finalPrice: 1250,
+              recordedAt: new Date("2026-08-30T00:00:00Z"),
+              verifiedAt: new Date("2026-08-30T00:00:00Z"),
+            },
+          ]),
+        ),
+      } as never,
+      { getProductImageUrl: jest.fn() } as never,
+    );
+    jest.spyOn(service, "getProductsByIds").mockResolvedValue([
+      {
+        productId: "product-a",
+        title: "A",
+        imageKeys: [],
+        imageUrls: [],
+        isOnSale: true,
+        isExpressDelivery: false,
+        skus: [{ price: 999 }],
+        createdAt,
+      },
+    ] as never);
+
+    await expect(service.getProductPriceSummariesByIds(["product-a"])).resolves.toEqual([
+      expect.objectContaining({
+        basePrice: 1250,
+        finalPrice: 1250,
+        priceRevision: "90000000-0000-4000-8000-000000000003",
+        lowestPriceEvidenceSummary: "현재 옵션 최저가 기준",
+      }),
+    ]);
+  });
+
+  it("rejects batch price summaries when the persisted snapshot is missing", async () => {
+    const service = createCatalogService();
+    jest.spyOn(service, "getProductsByIds").mockResolvedValue([
+      {
+        productId: "product-a",
+        title: "A",
+        imageKeys: [],
+        imageUrls: [],
+        isOnSale: false,
+        isExpressDelivery: false,
+        skus: [{ price: 1000 }],
+        createdAt: new Date("2026-08-29T00:00:00Z"),
+      },
+    ] as never);
+
+    await expect(service.getProductPriceSummariesByIds(["product-a"])).rejects.toThrow(
+      "Product price evidence unavailable",
+    );
   });
 });
 
@@ -360,30 +453,129 @@ describe("catalog SKU boundaries", () => {
 });
 
 describe("catalog price evidence", () => {
-  it("changes the revision when the evidence base price changes", async () => {
-    const service = createCatalogService();
-    const getProduct = jest.spyOn(service, "getProduct");
-    const product = {
+  it("returns the stored price evidence snapshot instead of rebuilding it from the current product", async () => {
+    const recordedAt = new Date("2026-08-20T01:02:03Z");
+    const calculatedAt = new Date("2026-08-20T01:03:00Z");
+    const snapshotQuery = metadataQuery([
+      {
+        productId: "product-a",
+        revision: "90000000-0000-4000-8000-000000000004",
+        source: "catalog_sku_price_snapshot",
+        basePrice: 2500,
+        finalPrice: 1250,
+        recordedAt,
+        verifiedAt: calculatedAt,
+      },
+    ]);
+    const service = new CatalogService({ select: jest.fn().mockReturnValue(snapshotQuery) } as never, {} as never);
+    jest.spyOn(service, "getProduct").mockResolvedValue({
       productId: "product-a",
       title: "A",
       imageKeys: [],
       imageUrls: [],
       isOnSale: true,
       isExpressDelivery: false,
+      skus: [{ price: 999 }],
       createdAt: new Date("2026-08-29T00:00:00Z"),
-    };
-    getProduct
-      .mockResolvedValueOnce({ ...product, skus: [{ price: 1000 }, { price: 2000 }] } as never)
-      .mockResolvedValueOnce({ ...product, skus: [{ price: 1000 }, { price: 3000 }] } as never);
+    } as never);
 
-    const before = await service.getProductPriceSummary("product-a");
-    const after = await service.getProductPriceSummary("product-a");
+    await expect(service.getProductPriceEvidence("product-a")).resolves.toEqual({
+      productId: "product-a",
+      priceRevision: "90000000-0000-4000-8000-000000000004",
+      priceHistory: [
+        { label: "옵션 최고가", price: 2500, recordedAt },
+        { label: "옵션 최저가", price: 1250, recordedAt },
+      ],
+      couponConditions: [],
+      shippingPolicy: null,
+      offerSource: "catalog_sku_price_snapshot",
+      calculatedAt,
+    });
+  });
 
-    expect(after.priceRevision).not.toBe(before.priceRevision);
+  it("rejects price evidence when the persisted snapshot is missing", async () => {
+    const service = createCatalogService();
+    jest.spyOn(service, "getProduct").mockResolvedValue({
+      productId: "product-a",
+      title: "A",
+      imageKeys: [],
+      imageUrls: [],
+      isOnSale: false,
+      isExpressDelivery: false,
+      skus: [{ price: 3000 }, { price: 1000 }],
+      createdAt: new Date("2026-08-29T00:00:00Z"),
+    } as never);
+
+    await expect(service.getProductPriceEvidence("product-a")).rejects.toThrow("Product price evidence unavailable");
+  });
+
+  it("rejects price evidence when no active SKU is available", async () => {
+    const service = createCatalogService();
+    jest.spyOn(service, "getProduct").mockResolvedValue({
+      productId: "product-a",
+      title: "A",
+      imageKeys: [],
+      imageUrls: [],
+      isOnSale: false,
+      isExpressDelivery: false,
+      skus: [],
+      createdAt: new Date("2026-08-29T00:00:00Z"),
+    } as never);
+
+    await expect(service.getProductPriceEvidence("product-a")).rejects.toThrow("Product price evidence unavailable");
+  });
+
+  it("rejects a singular price summary when no active SKU is available", async () => {
+    const service = createCatalogService();
+    jest.spyOn(service, "getProduct").mockResolvedValue({
+      productId: "product-a",
+      title: "A",
+      imageKeys: [],
+      imageUrls: [],
+      isOnSale: false,
+      isExpressDelivery: false,
+      skus: [],
+      createdAt: new Date("2026-08-29T00:00:00Z"),
+    } as never);
+
+    await expect(service.getProductPriceSummary("product-a")).rejects.toThrow("Product price evidence unavailable");
+  });
+
+  it("rejects a singular price summary when the persisted snapshot is missing", async () => {
+    const service = createCatalogService();
+    jest.spyOn(service, "getProduct").mockResolvedValue({
+      productId: "product-a",
+      title: "A",
+      imageKeys: [],
+      imageUrls: [],
+      isOnSale: true,
+      isExpressDelivery: false,
+      skus: [{ price: 1000 }, { price: 2000 }],
+      createdAt: new Date("2026-08-29T00:00:00Z"),
+    } as never);
+
+    await expect(service.getProductPriceSummary("product-a")).rejects.toThrow("Product price evidence unavailable");
   });
 
   it("rejects evidence for a stale price revision", async () => {
-    const service = createCatalogService();
+    const service = new CatalogService(
+      {
+        select: jest.fn().mockReturnValue(
+          metadataQuery([
+            {
+              productId: "product-a",
+              revision: "90000000-0000-4000-8000-000000000005",
+              source: "catalog_sku_price_snapshot",
+              basePrice: 1000,
+              finalPrice: 1000,
+              recordedAt: new Date("2026-08-30T00:00:00Z"),
+              verifiedAt: new Date("2026-08-30T00:00:00Z"),
+            },
+          ]),
+        ),
+      } as never,
+      {} as never,
+    );
     jest.spyOn(service, "getProduct").mockResolvedValue({
       productId: "product-a",
       title: "A",

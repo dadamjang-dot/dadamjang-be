@@ -204,8 +204,8 @@ export class ProductPriceEvidenceType {
   priceHistory!: ProductPriceHistoryItemType[];
   @Field(() => [ProductCouponConditionType])
   couponConditions!: ProductCouponConditionType[];
-  @Field(() => ProductShippingPolicyType)
-  shippingPolicy!: ProductShippingPolicyType;
+  @Field(() => ProductShippingPolicyType, { nullable: true })
+  shippingPolicy!: ProductShippingPolicyType | null;
   @Field()
   offerSource!: string;
   @Field()

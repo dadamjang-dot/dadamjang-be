@@ -227,6 +227,41 @@ describe("database migration PostgreSQL integration", () => {
     expect(refreshRotationForeignKey.rows).toEqual([{ delete_rule: "CASCADE" }]);
   });
 
+  it("backfills the latest price snapshot for an existing published product", async () => {
+    const migrationsBeforePriceSnapshots = (await readMigrationArtifacts())
+      .filter(({ name, retired }) => !retired && name < "0024_product_price_evidence_snapshots.sql")
+      .map(({ name }) => name);
+    await runHistoricalMigrations(migrationPool, undefined, migrationsBeforePriceSnapshots);
+    await seedHistoricalMigration(migrationPool);
+    await migrationPool.query(
+      `INSERT INTO "productSkus" ("productId", "code", "optionName", "price", "stock", "position")
+       VALUES
+         ('70000000-0000-4000-8000-000000000001', 'MIGRATION-LOW', 'Low', 12000, 1, 0),
+         ('70000000-0000-4000-8000-000000000001', 'MIGRATION-HIGH', 'High', 18000, 1, 1)`,
+    );
+
+    await migrate({ pool: migrationPool });
+
+    const snapshots = await migrationPool.query<{
+      basePrice: number;
+      finalPrice: number;
+      revision: string;
+      source: string;
+    }>(
+      `SELECT "basePrice", "finalPrice", "revision", "source"
+       FROM "productPriceEvidenceSnapshots"
+       WHERE "productId" = '70000000-0000-4000-8000-000000000001'`,
+    );
+    expect(snapshots.rows).toEqual([
+      {
+        basePrice: 18000,
+        finalPrice: 12000,
+        revision: expect.stringMatching(/^[0-9a-f-]{36}$/),
+        source: "catalog_sku_price_snapshot",
+      },
+    ]);
+  });
+
   it("uses dedicated indexes for bounded anonymous-flow cleanup candidates", async () => {
     await migrate({ pool: migrationPool });
     await migrationPool.query(`SET enable_seqscan = off`);

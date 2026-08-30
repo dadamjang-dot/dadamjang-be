@@ -276,6 +276,7 @@ export class PartnerService {
           eq(products.brandId, partner.brandId),
           eq(products.status, "DRAFT"),
           eq(products.approvalStatus, from),
+          publish ? this.activeSkuExistsCondition() : undefined,
         ),
       )
       .limit(1);
@@ -295,6 +296,7 @@ export class PartnerService {
           eq(products.brandId, partner.brandId),
           eq(products.status, "DRAFT"),
           eq(products.approvalStatus, from),
+          publish ? this.activeSkuExistsCondition() : undefined,
         ),
       )
       .returning();
@@ -308,6 +310,15 @@ export class PartnerService {
       throw new CustomBadRequestException(PartnerErrorMessage.ApprovalRequiredForProduct);
     return { ...partner, brandId: partner.brandId };
   };
+
+  private activeSkuExistsCondition = () =>
+    exists(
+      this.db
+        .select({ skuId: productSkus.skuId })
+        .from(productSkus)
+        .where(and(eq(productSkus.productId, products.productId), eq(productSkus.isActive, true)))
+        .limit(1),
+    );
 
   private validate = async (ownerUserId: string, input: PartnerProductInput) => {
     if (

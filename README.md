@@ -19,16 +19,23 @@
 
 - `productPriceSummaries(filter)`: 상품 목록/검색용 경량 가격 요약 connection입니다.
 - `comparisonPriceSummaries`: 비교함용 경량 가격 요약 목록입니다.
-- `productPriceEvidence(productId, priceRevision)`: 가격 이력, 쿠폰 조건, 배송 정책, offer 출처를 별도 조회하는 lazy query입니다.
+- `productPriceSummary(productId)`: 상품 상세용 경량 가격 요약입니다.
+- `productPriceEvidence(productId, priceRevision)`: 현재 옵션 최고/최저가 snapshot과 원천·확인 시각을 별도 조회하는 lazy query입니다.
 
 목록/비교 query는 상세 가격 근거를 포함하지 않습니다. 가격 변경 처리 시 전체 상품 목록 invalidate 대신 `productId + priceRevision` 기준 evidence/offer key만 갱신하는 것을 기본 전략으로 둡니다.
 
+`productPriceEvidenceSnapshots`는 게시 상품의 최신 snapshot 한 건만 유지하며 기간별 가격 이력은 저장하지 않습니다. 모든 가격 요약과 evidence는 저장된 snapshot을 필수로 사용하며, snapshot이 없으면 unavailable을 반환하고 현재 SKU로 revision이나 근거를 합성하지 않습니다. 쿠폰은 빈 목록, 배송 정책은 `null`로 반환합니다. 실제 쿠폰·배송 원천이 생기기 전에는 값을 추정하지 않습니다.
+
+실제 비교가 원천이 생기기 전까지 공개 가격 요약의 `basePrice`와 `finalPrice`는 모두 활성 옵션 최저가입니다. 옵션 최고가는 할인 전 가격으로 해석하지 않고 evidence의 옵션 범위에만 표시합니다. 활성 SKU가 없는 게시 상품은 catalog 목록과 `totalCount`에서 제외되며 상세 가격 조회는 unavailable로 처리합니다.
+
+최신 가격 snapshot은 게시 상품의 가격 관련 SKU row write마다 해당 상품의 활성 SKU를 다시 집계합니다. SKU 100개 상한에서는 허용하는 비용이며 statement-level 집계나 비동기 갱신으로 확장하지 않은 현재 write-scalability 상한입니다.
+
 ## Catalog pagination·성능 계약
 
-- 한 catalog 응답의 candidate, `totalCount`, page SKU/brand hydration은 read-only `REPEATABLE READ` transaction의 같은 snapshot을 사용합니다.
+- 한 catalog 응답의 candidate, `totalCount`, page SKU/brand hydration과 가격 요약 snapshot은 read-only `REPEATABLE READ` transaction의 같은 snapshot을 사용합니다.
 - 날짜 정렬은 `(status, createdAt DESC, productId DESC)` 또는 category 포함 복합 index로 cursor seek합니다.
 - `LOW_PRICE`, `HIGH_PRICE`, `POPULAR`은 활성 SKU 집계를 filtered product마다 계산한 뒤 정렬하므로 현재 상한은 O(filtered catalog)입니다. page size 최대 50은 이 집계 대상 수를 제한하지 않습니다.
-- 저장된 snapshot이 없으므로 서로 다른 page 요청 사이에 가격·재고가 바뀌면 metric keyset은 best-effort입니다. 호출자는 `productId`로 중복 제거해야 합니다.
+- pagination 정렬 metric snapshot은 저장하지 않으므로 서로 다른 page 요청 사이에 가격·재고가 바뀌면 metric keyset은 best-effort입니다. 호출자는 `productId`로 중복 제거해야 합니다.
 - catalog 지원 규모와 latency alert 임계치는 아직 측정값이 없어 정의하지 않았습니다. 운영 기준을 정하기 전에 filtered candidate 수, metric-sort p95, temporary-file sort 발생을 측정해야 합니다.
 
 ## Database migration 계약

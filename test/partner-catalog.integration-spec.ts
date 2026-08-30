@@ -314,6 +314,10 @@ describe("partner catalog GraphQL integration", () => {
       "PARTNER-SKU-B",
     ]);
     const productId = create.body.data.createPartnerProductDraft.productId as string;
+    const draftSnapshot = await pool.query(`SELECT 1 FROM "productPriceEvidenceSnapshots" WHERE "productId" = $1`, [
+      productId,
+    ]);
+    expect(draftSnapshot.rowCount).toBe(0);
     const reversed = input(["PARTNER-SKU-B", "PARTNER-SKU-A"]);
     const updateMutation = `mutation UpdatePartnerProduct($productId: String!, $input: PartnerProductInput!) {
       updatePartnerProductDraft(productId: $productId, input: $input) {
@@ -363,6 +367,13 @@ describe("partner catalog GraphQL integration", () => {
       status: "PUBLISHED",
       approvalStatus: "APPROVED",
     });
+    const publishedSnapshot = await pool.query<{ basePrice: number; finalPrice: number; revision: string }>(
+      `SELECT "basePrice", "finalPrice", "revision"
+       FROM "productPriceEvidenceSnapshots"
+       WHERE "productId" = $1`,
+      [productId],
+    );
+    expect(publishedSnapshot.rows).toEqual([{ basePrice: 10001, finalPrice: 10000, revision: expect.any(String) }]);
     const publicProduct = await request(app.getHttpServer())
       .post("/graphql")
       .send({
@@ -383,6 +394,41 @@ describe("partner catalog GraphQL integration", () => {
     expect(publishedUpdate.body.errors[0].extensions.code).toBe("BAD_USER_INPUT");
     expect(publishedSubmit.body.errors[0].extensions.code).toBe("BAD_USER_INPUT");
     expect(repeatedPublish.body.errors[0].extensions.code).toBe("BAD_USER_INPUT");
+  });
+
+  it("blocks partner publishing when no active SKU exists", async () => {
+    const accessToken = await signin();
+    const create = await graphql(
+      accessToken,
+      `
+        mutation CreatePartnerProduct($input: PartnerProductInput!) {
+          createPartnerProductDraft(input: $input) {
+            productId
+          }
+        }
+      `,
+      { input: input(["PARTNER-INACTIVE-SKU"]) },
+    );
+    const productId = create.body.data.createPartnerProductDraft.productId as string;
+    await pool.query(`UPDATE "products" SET "approvalStatus" = 'APPROVED' WHERE "productId" = $1`, [productId]);
+    await pool.query(`UPDATE "productSkus" SET "isActive" = false WHERE "productId" = $1`, [productId]);
+
+    const publish = await graphql(
+      accessToken,
+      `
+        mutation PublishPartnerProduct($productId: String!) {
+          publishPartnerProduct(productId: $productId) {
+            status
+          }
+        }
+      `,
+      { productId },
+    );
+    expect(publish.body.errors[0].extensions.code).toBe("BAD_USER_INPUT");
+    const product = await pool.query<{ status: string }>(`SELECT "status" FROM "products" WHERE "productId" = $1`, [
+      productId,
+    ]);
+    expect(product.rows).toEqual([{ status: "DRAFT" }]);
   });
 
   it("prevents cross-partner reads, counts, and mutations", async () => {

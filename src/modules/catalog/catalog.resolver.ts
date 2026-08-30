@@ -7,6 +7,7 @@ import {
   ProductFilterInput,
   ProductPriceEvidenceType,
   ProductPriceSummaryConnectionType,
+  ProductPriceSummaryType,
   ProductType,
 } from "./catalog.types";
 
@@ -35,6 +36,11 @@ export class CatalogResolver {
     filter?: ProductFilterInput,
   ) {
     return this.catalogService.listProductPriceSummaries(filter ?? {});
+  }
+
+  @Query(() => ProductPriceSummaryType)
+  productPriceSummary(@Args("productId") productId: string) {
+    return this.catalogService.getProductPriceSummary(productId);
   }
 
   @Query(() => ProductType)

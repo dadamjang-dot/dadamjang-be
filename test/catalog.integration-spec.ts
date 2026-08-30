@@ -4,7 +4,7 @@ import request from "supertest";
 import { createApp } from "src/app";
 import { requireResult } from "src/common/invariants/require-result";
 import { FIXTURE } from "src/database/fixtures";
-import { decodeProductCursor, encodeProductCursor } from "src/modules/catalog/catalog.service";
+import { CatalogService, decodeProductCursor, encodeProductCursor } from "src/modules/catalog/catalog.service";
 import { ProductSort } from "src/modules/catalog/catalog.types";
 import { type Database, DRIZZLE } from "src/modules/database/database.module";
 import { resetTestFixtures, testPool } from "./support/database";
@@ -132,6 +132,338 @@ describe("catalog PostgreSQL integration", () => {
   afterAll(async () => {
     await app.close();
     await pool.end();
+  });
+
+  it("exposes a singular product price summary query", async () => {
+    const response = await request(app.getHttpServer())
+      .post("/graphql")
+      .send({
+        query: `query ProductPriceSummary($productId: String!) {
+          productPriceSummary(productId: $productId) { productId name basePrice finalPrice priceRevision }
+        }`,
+        variables: { productId: FIXTURE.productId },
+      })
+      .expect(200);
+
+    expect(response.body.errors).toBeUndefined();
+    expect(response.body.data.productPriceSummary).toMatchObject({
+      productId: FIXTURE.productId,
+      name: "Integration Sale Tee",
+      basePrice: 15000,
+      finalPrice: 15000,
+    });
+    expect(response.body.data.productPriceSummary.priceRevision).toEqual(
+      expect.stringMatching(/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i),
+    );
+    expect(response.body.data.productPriceSummary.priceRevision).not.toContain(":");
+  });
+
+  it("reads list summaries and price snapshots from one repeatable-read transaction", async () => {
+    const initialSnapshot = requireResult(
+      (
+        await pool.query<{ revision: string }>(
+          `SELECT "revision" FROM "productPriceEvidenceSnapshots" WHERE "productId" = $1`,
+          [FIXTURE.productId],
+        )
+      ).rows[0],
+    );
+    const database = app.get<Database>(DRIZZLE);
+    const originalTransaction = database.transaction.bind(database);
+    const transactionSpy = jest.spyOn(database, "transaction");
+    let changedAfterCommit = false;
+    let transactionConfig: unknown;
+    transactionSpy.mockImplementation((async (callback: unknown, config: unknown) => {
+      transactionConfig = config;
+      const result = await originalTransaction(callback as never, config as never);
+      changedAfterCommit = true;
+      await pool.query(`UPDATE "productSkus" SET "price" = 14000 WHERE "skuId" = $1`, [FIXTURE.skuId]);
+      return result;
+    }) as never);
+    const listSummaries = () =>
+      request(app.getHttpServer())
+        .post("/graphql")
+        .send({
+          query: `query ProductPriceSummaries($filter: ProductFilterInput) {
+            productPriceSummaries(filter: $filter) {
+              nodes { productId basePrice finalPrice priceRevision }
+            }
+          }`,
+          variables: { filter: { query: "Integration Sale Tee" } },
+        })
+        .expect(200);
+    let response: Awaited<ReturnType<typeof listSummaries>>;
+    try {
+      response = await listSummaries();
+    } finally {
+      transactionSpy.mockRestore();
+    }
+    const currentSnapshot = requireResult(
+      (
+        await pool.query<{ revision: string }>(
+          `SELECT "revision" FROM "productPriceEvidenceSnapshots" WHERE "productId" = $1`,
+          [FIXTURE.productId],
+        )
+      ).rows[0],
+    );
+
+    expect(response.body.errors).toBeUndefined();
+    expect(changedAfterCommit).toBe(true);
+    expect(transactionConfig).toEqual({ isolationLevel: "repeatable read", accessMode: "read only" });
+    expect(response.body.data.productPriceSummaries.nodes).toEqual([
+      {
+        productId: FIXTURE.productId,
+        basePrice: 15000,
+        finalPrice: 15000,
+        priceRevision: initialSnapshot.revision,
+      },
+    ]);
+    expect(currentSnapshot.revision).not.toBe(initialSnapshot.revision);
+  });
+
+  it("requires persisted snapshots only for price-specific reads", async () => {
+    await pool.query(`DELETE FROM "productPriceEvidenceSnapshots" WHERE "productId" = $1`, [FIXTURE.productId]);
+
+    const generalProducts = await app.get(CatalogService).getProductsByIds([FIXTURE.productId]);
+    const publicProduct = await request(app.getHttpServer())
+      .post("/graphql")
+      .send({ query: `{ product(productId: "${FIXTURE.productId}") { productId skus { skuId } } }` })
+      .expect(200);
+    const priceReads = await Promise.all([
+      request(app.getHttpServer())
+        .post("/graphql")
+        .send({ query: `{ productPriceSummary(productId: "${FIXTURE.productId}") { priceRevision } }` })
+        .expect(200),
+      request(app.getHttpServer())
+        .post("/graphql")
+        .send({ query: `{ productPriceEvidence(productId: "${FIXTURE.productId}") { priceRevision } }` })
+        .expect(200),
+      request(app.getHttpServer())
+        .post("/graphql")
+        .send({
+          query: `{ productPriceSummaries(filter: { query: "Integration Sale Tee" }) { nodes { priceRevision } } }`,
+        })
+        .expect(200),
+    ]);
+
+    expect(generalProducts).toEqual([
+      expect.objectContaining({
+        productId: FIXTURE.productId,
+        skus: [expect.objectContaining({ skuId: FIXTURE.skuId })],
+      }),
+    ]);
+    expect(publicProduct.body.errors).toBeUndefined();
+    await expect(app.get(CatalogService).getProductPriceSummariesByIds([FIXTURE.productId])).rejects.toThrow(
+      "Product price evidence unavailable",
+    );
+    for (const response of priceReads) {
+      expect(response.body.data).toBeNull();
+      expect(response.body.errors[0].message).toBe("Product price evidence unavailable");
+    }
+  });
+
+  it("refreshes the persisted price evidence snapshot from the shared SKU write path", async () => {
+    const before = requireResult(
+      (
+        await pool.query<{ revision: string }>(
+          `SELECT "revision" FROM "productPriceEvidenceSnapshots" WHERE "productId" = $1`,
+          [FIXTURE.productId],
+        )
+      ).rows[0],
+    );
+
+    await pool.query(`UPDATE "productSkus" SET "price" = 14000 WHERE "skuId" = $1`, [FIXTURE.skuId]);
+
+    const snapshot = requireResult(
+      (
+        await pool.query<{
+          basePrice: number;
+          finalPrice: number;
+          revision: string;
+          source: string;
+        }>(
+          `SELECT "basePrice", "finalPrice", "revision", "source"
+           FROM "productPriceEvidenceSnapshots"
+           WHERE "productId" = $1`,
+          [FIXTURE.productId],
+        )
+      ).rows[0],
+    );
+    const summary = await request(app.getHttpServer())
+      .post("/graphql")
+      .send({ query: `{ productPriceSummary(productId: "${FIXTURE.productId}") { priceRevision } }` })
+      .expect(200);
+
+    expect(snapshot).toMatchObject({
+      basePrice: 14000,
+      finalPrice: 14000,
+      source: "catalog_sku_price_snapshot",
+    });
+    expect(snapshot.revision).not.toBe(before.revision);
+    expect(summary.body.data.productPriceSummary.priceRevision).toBe(snapshot.revision);
+  });
+
+  it("serves persisted evidence fields without rebuilding them from current SKUs", async () => {
+    const revision = "90000000-0000-4000-8000-000000000099";
+    const recordedAt = "2026-08-20T01:02:03.000Z";
+    const verifiedAt = "2026-08-20T01:03:00.000Z";
+    await pool.query(
+      `UPDATE "productPriceEvidenceSnapshots"
+       SET "revision" = $4,
+           "source" = 'catalog_sku_price_snapshot',
+           "basePrice" = 2500,
+           "finalPrice" = 1250,
+           "recordedAt" = $2,
+           "verifiedAt" = $3
+       WHERE "productId" = $1`,
+      [FIXTURE.productId, recordedAt, verifiedAt, revision],
+    );
+
+    const response = await request(app.getHttpServer())
+      .post("/graphql")
+      .send({
+        query: `query Evidence($productId: String!, $priceRevision: String) {
+          productPriceSummary(productId: $productId) { basePrice finalPrice priceRevision }
+          productPriceSummaries(filter: { query: "Integration Sale Tee" }) {
+            nodes { productId basePrice finalPrice priceRevision }
+          }
+          productPriceEvidence(productId: $productId, priceRevision: $priceRevision) {
+            productId priceRevision offerSource calculatedAt
+            priceHistory { label price recordedAt }
+            couponConditions { title discountAmount condition }
+            shippingPolicy { title shippingFee condition }
+          }
+        }`,
+        variables: { productId: FIXTURE.productId, priceRevision: revision },
+      })
+      .expect(200);
+
+    expect(response.body.errors).toBeUndefined();
+    expect(response.body.data.productPriceSummary).toEqual({
+      basePrice: 1250,
+      finalPrice: 1250,
+      priceRevision: revision,
+    });
+    expect(response.body.data.productPriceSummaries.nodes).toEqual([
+      { productId: FIXTURE.productId, basePrice: 1250, finalPrice: 1250, priceRevision: revision },
+    ]);
+    expect(response.body.data.productPriceEvidence).toEqual({
+      productId: FIXTURE.productId,
+      priceRevision: revision,
+      offerSource: "catalog_sku_price_snapshot",
+      calculatedAt: verifiedAt,
+      priceHistory: [
+        { label: "옵션 최고가", price: 2500, recordedAt },
+        { label: "옵션 최저가", price: 1250, recordedAt },
+      ],
+      couponConditions: [],
+      shippingPolicy: null,
+    });
+  });
+
+  it("does not rewrite price evidence for stock-only or equivalent price updates", async () => {
+    const before = requireResult(
+      (
+        await pool.query<{ recordedAt: Date; revision: string; source: string; verifiedAt: Date }>(
+          `SELECT "recordedAt", "revision", "source", "verifiedAt"
+           FROM "productPriceEvidenceSnapshots"
+           WHERE "productId" = $1`,
+          [FIXTURE.productId],
+        )
+      ).rows[0],
+    );
+
+    await pool.query(`UPDATE "productSkus" SET "stock" = "stock" + 1 WHERE "skuId" = $1`, [FIXTURE.skuId]);
+    await pool.query(`UPDATE "productSkus" SET "price" = "price" WHERE "skuId" = $1`, [FIXTURE.skuId]);
+
+    const after = requireResult(
+      (
+        await pool.query<{ recordedAt: Date; revision: string; source: string; verifiedAt: Date }>(
+          `SELECT "recordedAt", "revision", "source", "verifiedAt"
+           FROM "productPriceEvidenceSnapshots"
+           WHERE "productId" = $1`,
+          [FIXTURE.productId],
+        )
+      ).rows[0],
+    );
+    expect(after).toEqual(before);
+  });
+
+  it("serializes concurrent price updates across different SKUs", async () => {
+    const secondSkuId = "80000000-0000-4000-8000-000000000099";
+    await pool.query(
+      `INSERT INTO "productSkus" ("skuId", "productId", "code", "optionName", "price", "stock", "position")
+       VALUES ($1, $2, 'CONCURRENT-PRICE-SKU', 'Concurrent', 16000, 1, 1)`,
+      [secondSkuId, FIXTURE.productId],
+    );
+    const firstClient = await pool.connect();
+    const secondClient = await pool.connect();
+    const secondPid = requireResult(
+      (await secondClient.query<{ pid: number }>(`SELECT pg_backend_pid() AS pid`)).rows[0],
+    ).pid;
+    let firstCommitted = false;
+    let secondCommitted = false;
+    let snapshotReleaseTime: Date | undefined;
+    try {
+      await firstClient.query("BEGIN");
+      await secondClient.query("BEGIN");
+      await firstClient.query(`UPDATE "productSkus" SET "price" = 11000 WHERE "skuId" = $1`, [FIXTURE.skuId]);
+      const secondUpdate = secondClient.query(`UPDATE "productSkus" SET "price" = 22000 WHERE "skuId" = $1`, [
+        secondSkuId,
+      ]);
+      let blocked = false;
+      for (let attempt = 0; attempt < 100 && !blocked; attempt += 1) {
+        const state = requireResult(
+          (
+            await pool.query<{ blocked: boolean }>(`SELECT cardinality(pg_blocking_pids($1)) > 0 AS blocked`, [
+              secondPid,
+            ])
+          ).rows[0],
+        );
+        blocked = state.blocked;
+      }
+      expect(blocked).toBe(true);
+      snapshotReleaseTime = requireResult(
+        (await pool.query<{ capturedAt: Date }>(`SELECT clock_timestamp()::timestamp AS "capturedAt"`)).rows[0],
+      ).capturedAt;
+      await firstClient.query("COMMIT");
+      firstCommitted = true;
+      await secondUpdate;
+      await secondClient.query("COMMIT");
+      secondCommitted = true;
+    } finally {
+      if (!firstCommitted) await firstClient.query("ROLLBACK");
+      if (!secondCommitted) await secondClient.query("ROLLBACK");
+      firstClient.release();
+      secondClient.release();
+    }
+
+    const snapshot = requireResult(
+      (
+        await pool.query<{ basePrice: number; finalPrice: number; recordedAt: Date }>(
+          `SELECT "basePrice", "finalPrice", "recordedAt"
+           FROM "productPriceEvidenceSnapshots" WHERE "productId" = $1`,
+          [FIXTURE.productId],
+        )
+      ).rows[0],
+    );
+    expect(snapshot).toMatchObject({ basePrice: 22000, finalPrice: 11000 });
+    expect(snapshot.recordedAt.getTime()).toBeGreaterThanOrEqual(requireResult(snapshotReleaseTime).getTime());
+  });
+
+  it("removes the snapshot and reports unavailable evidence when no active SKU remains", async () => {
+    await pool.query(`UPDATE "productSkus" SET "isActive" = false WHERE "productId" = $1`, [FIXTURE.productId]);
+
+    const snapshot = await pool.query(`SELECT 1 FROM "productPriceEvidenceSnapshots" WHERE "productId" = $1`, [
+      FIXTURE.productId,
+    ]);
+    const response = await request(app.getHttpServer())
+      .post("/graphql")
+      .send({ query: `{ productPriceEvidence(productId: "${FIXTURE.productId}") { priceRevision } }` })
+      .expect(200);
+
+    expect(snapshot.rowCount).toBe(0);
+    expect(response.body.data).toBeNull();
+    expect(response.body.errors[0].message).toBe("Product price evidence unavailable");
   });
 
   it("bounds catalog summary thumbnails while preserving product detail images", async () => {
@@ -350,6 +682,7 @@ describe("catalog PostgreSQL integration", () => {
     expect(candidate?.values[candidate.values.length - 1]).toBe(2);
     expect(skuHydration?.values).toEqual([returnedProductId, true]);
     expect(brandHydration?.values).toEqual([FIXTURE.brandId]);
+    expect(calls.some(({ text }) => text.includes('from "productPriceEvidenceSnapshots"'))).toBe(false);
   });
 
   it("puts the emitted default and category tuple cursor seek in the composite index condition", async () => {
@@ -497,33 +830,55 @@ describe("catalog PostgreSQL integration", () => {
 
     expect(lowPrice.body.data.products.nodes.map(({ productId }: { productId: string }) => productId)).toEqual([
       aggregateProducts.activeZero,
-      aggregateProducts.inactiveOnly,
-      aggregateProducts.noSku,
       aggregateProducts.multi,
       aggregateProducts.single,
     ]);
     expect(highPrice.body.data.productPriceSummaries.nodes).toEqual([
       { productId: aggregateProducts.single, basePrice: 200, finalPrice: 200 },
-      { productId: aggregateProducts.multi, basePrice: 400, finalPrice: 100 },
+      { productId: aggregateProducts.multi, basePrice: 100, finalPrice: 100 },
       { productId: aggregateProducts.activeZero, basePrice: 0, finalPrice: 0 },
-      { productId: aggregateProducts.inactiveOnly, basePrice: 0, finalPrice: 0 },
-      { productId: aggregateProducts.noSku, basePrice: 0, finalPrice: 0 },
     ]);
     expect(popular.body.data.products.nodes.map(({ productId }: { productId: string }) => productId)).toEqual([
       aggregateProducts.multi,
       aggregateProducts.single,
       aggregateProducts.activeZero,
-      aggregateProducts.inactiveOnly,
-      aggregateProducts.noSku,
     ]);
     expect(zeroPrice.body.data.products).toMatchObject({
-      totalCount: 3,
-      nodes: [
-        { productId: aggregateProducts.activeZero, skus: [{ price: 0, stock: 0 }] },
-        { productId: aggregateProducts.inactiveOnly, skus: [] },
-        { productId: aggregateProducts.noSku, skus: [] },
-      ],
+      totalCount: 1,
+      nodes: [{ productId: aggregateProducts.activeZero, skus: [{ price: 0, stock: 0 }] }],
     });
+
+    const unavailable = await Promise.all(
+      [aggregateProducts.inactiveOnly, aggregateProducts.noSku].flatMap((productId) => [
+        request(app.getHttpServer())
+          .post("/graphql")
+          .send({ query: `{ product(productId: "${productId}") { productId } }` })
+          .expect(200),
+        request(app.getHttpServer())
+          .post("/graphql")
+          .send({ query: `{ productPriceSummary(productId: "${productId}") { productId } }` })
+          .expect(200),
+      ]),
+    );
+    for (const response of unavailable) {
+      expect(response.body.data).toBeNull();
+      expect(response.body.errors[0].message).toBe("Product price evidence unavailable");
+    }
+  });
+
+  it("blocks catalog publishing when no active SKU exists", async () => {
+    await pool.query(`UPDATE "products" SET "status" = 'DRAFT', "approvalStatus" = 'APPROVED' WHERE "productId" = $1`, [
+      FIXTURE.productId,
+    ]);
+    await pool.query(`UPDATE "productSkus" SET "isActive" = false WHERE "productId" = $1`, [FIXTURE.productId]);
+
+    await expect(app.get(CatalogService).publishProduct(FIXTURE.partnerId, FIXTURE.productId)).rejects.toThrow(
+      "Product must be approved before publishing",
+    );
+    const product = await pool.query<{ status: string }>(`SELECT "status" FROM "products" WHERE "productId" = $1`, [
+      FIXTURE.productId,
+    ]);
+    expect(product.rows).toEqual([{ status: "DRAFT" }]);
   });
 
   it("applies category, brand, sale, express, and title filters", async () => {
