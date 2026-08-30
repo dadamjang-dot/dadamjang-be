@@ -2,7 +2,10 @@ import { HttpException, HttpStatus, Module } from "@nestjs/common";
 import { ConfigModule } from "@nestjs/config";
 import { GraphQLModule } from "@nestjs/graphql";
 import { ApolloDriver, ApolloDriverConfig } from "@nestjs/apollo";
+import type { ExpressContextFunctionArgument } from "@as-integrations/express5";
 import { GraphQLError } from "graphql";
+import { hasDatabaseErrorCode } from "src/common/errors/database-error";
+import { requestBudgetPlugin, requestBudgetRule } from "src/common/graphql/request-budget";
 import { AuthModule } from "./auth/auth.module";
 import { DatabaseModule } from "./database/database.module";
 import { EmailModule } from "./email/email.module";
@@ -33,26 +36,53 @@ const graphQlErrorCode = (status: number) => {
   return "INTERNAL_SERVER_ERROR";
 };
 
+const productionSecretPlaceholders = new Set(["replace-me", "generate-with-openssl-rand-base64-32"]);
+
+const invalidProductionSecret = (value: unknown) =>
+  typeof value !== "string" || productionSecretPlaceholders.has(value.trim()) || Buffer.byteLength(value, "utf8") < 32;
+
+export const validateConfig = (environment: Record<string, unknown>) => {
+  if (environment.NODE_ENV !== "production") return environment;
+  const accessSecret = environment.JWT_ACCESS_TOKEN_SECRET;
+  const refreshSecret = environment.JWT_REFRESH_TOKEN_SECRET;
+  if (invalidProductionSecret(accessSecret) || invalidProductionSecret(refreshSecret))
+    throw new Error("Production JWT secrets must be at least 32 bytes and must not use placeholders");
+  if (accessSecret === refreshSecret) throw new Error("JWT access and refresh secrets must be distinct");
+  const emailPepper = environment.EMAIL_CODE_PEPPER;
+  const identityPepper = environment.IDENTITY_CI_PEPPER;
+  if (invalidProductionSecret(emailPepper) || invalidProductionSecret(identityPepper))
+    throw new Error("Production peppers must be at least 32 bytes and must not use placeholders");
+  if (emailPepper === identityPepper) throw new Error("Production peppers must be distinct");
+  return environment;
+};
+
 @Module({
   imports: [
     ConfigModule.forRoot({
       isGlobal: true,
       envFilePath: ".env",
+      validate: validateConfig,
     }),
     GraphQLModule.forRoot<ApolloDriverConfig>({
       driver: ApolloDriver,
       autoSchemaFile: true,
-      context: ({ req, res }) => ({ req, res }),
+      plugins: [requestBudgetPlugin],
+      validationRules: [requestBudgetRule],
+      context: ({ req, res }: ExpressContextFunctionArgument) => ({ req, res }),
       formatError: (formattedError, error) => {
         const originalError = error instanceof GraphQLError ? error.originalError : undefined;
         const extensions = Object.fromEntries(
           Object.entries(formattedError.extensions ?? {}).filter(([key]) => key !== "stacktrace"),
         );
+        if (extensions.code === "GRAPHQL_PARSE_FAILED" || extensions.code === "GRAPHQL_VALIDATION_FAILED")
+          return { ...formattedError, extensions };
         if (originalError instanceof HttpException)
           return {
             ...formattedError,
             extensions: { ...extensions, code: graphQlErrorCode(originalError.getStatus()) },
           };
+        if (hasDatabaseErrorCode(originalError, "22P02"))
+          return { message: "Invalid identifier", extensions: { ...extensions, code: "BAD_USER_INPUT" } };
         return { message: "Internal server error", extensions: { code: "INTERNAL_SERVER_ERROR" } };
       },
     }),

@@ -4,7 +4,9 @@ import { CustomNotFoundException } from "src/common/errors/custom-exceptions";
 import { ComparisonErrorMessage } from "./comparison.error";
 import { CatalogService } from "src/modules/catalog/catalog.service";
 import { Database, DRIZZLE } from "src/modules/database/database.module";
-import { activityEvents, comparisonItems, products } from "src/modules/database/schema";
+import { activityEvents, comparisonItems } from "src/modules/database/schema";
+
+const MAX_LEGACY_COLLECTION_SIZE = 100;
 
 @Injectable()
 export class ComparisonService {
@@ -14,66 +16,84 @@ export class ComparisonService {
   ) {}
 
   list = async (userId: string) => {
-    const rows = await this.db
-      .select()
-      .from(comparisonItems)
-      .innerJoin(products, eq(comparisonItems.productId, products.productId))
-      .where(eq(comparisonItems.userId, userId))
-      .orderBy(desc(comparisonItems.createdAt));
-    const productList = (
-      await Promise.all(rows.map(({ products: product }) => this.catalogService.getProduct(product.productId)))
-    ).map((product) => [product.productId, product] as const);
-    const productById = new Map(productList);
+    const rows = (
+      await this.db
+        .select()
+        .from(comparisonItems)
+        .where(eq(comparisonItems.userId, userId))
+        .orderBy(desc(comparisonItems.createdAt))
+        .limit(MAX_LEGACY_COLLECTION_SIZE)
+    ).slice(0, MAX_LEGACY_COLLECTION_SIZE);
+    const productById = new Map(
+      (await this.catalogService.getProductsByIds(rows.map(({ productId }) => productId))).map((product) => [
+        product.productId,
+        product,
+      ]),
+    );
 
-    return rows.map(({ comparisonItems: item }) => ({
-      ...item,
-      product: productById.get(item.productId)!,
-    }));
+    return rows.map((item) => {
+      const product = productById.get(item.productId);
+      if (!product) throw new CustomNotFoundException(ComparisonErrorMessage.ProductNotFound);
+      return { ...item, product };
+    });
   };
 
   listPriceSummaries = async (userId: string) => {
-    const rows = await this.db
-      .select()
-      .from(comparisonItems)
-      .where(eq(comparisonItems.userId, userId))
-      .orderBy(desc(comparisonItems.createdAt));
+    const rows = (
+      await this.db
+        .select()
+        .from(comparisonItems)
+        .where(eq(comparisonItems.userId, userId))
+        .orderBy(desc(comparisonItems.createdAt))
+        .limit(MAX_LEGACY_COLLECTION_SIZE)
+    ).slice(0, MAX_LEGACY_COLLECTION_SIZE);
 
-    return Promise.all(rows.map((row) => this.catalogService.getProductPriceSummary(row.productId)));
+    return this.catalogService.getProductPriceSummariesByIds(rows.map((row) => row.productId));
   };
 
   add = async (userId: string, productId: string) => {
     const product = await this.catalogService.getProduct(productId);
     if (!product || product.status !== "PUBLISHED")
       throw new CustomNotFoundException(ComparisonErrorMessage.ProductNotFound);
-    const [item] = await this.db
-      .insert(comparisonItems)
-      .values({ userId, productId })
-      .onConflictDoNothing()
-      .returning();
-    await this.db.insert(activityEvents).values({
-      actorUserId: userId,
-      eventType: "COMPARISON_ITEM_ADDED",
-      subjectType: "PRODUCT",
-      subjectId: productId,
+    const item = await this.db.transaction(async (tx) => {
+      const [created] = await tx
+        .insert(comparisonItems)
+        .values({ userId, productId })
+        .onConflictDoNothing()
+        .returning();
+      if (created) {
+        await tx.insert(activityEvents).values({
+          actorUserId: userId,
+          eventType: "COMPARISON_ITEM_ADDED",
+          subjectType: "PRODUCT",
+          subjectId: productId,
+        });
+        return created;
+      }
+      const [existing] = await tx
+        .select()
+        .from(comparisonItems)
+        .where(and(eq(comparisonItems.userId, userId), eq(comparisonItems.productId, productId)))
+        .limit(1);
+      if (!existing) throw new Error("Comparison item creation failed");
+      return existing;
     });
-    if (item) return { ...item, product };
-    const [existing] = await this.db
-      .select()
-      .from(comparisonItems)
-      .where(and(eq(comparisonItems.userId, userId), eq(comparisonItems.productId, productId)))
-      .limit(1);
-    return { ...existing, product };
+    return { ...item, product };
   };
 
   remove = async (userId: string, productId: string) => {
-    await this.db
-      .delete(comparisonItems)
-      .where(and(eq(comparisonItems.userId, userId), eq(comparisonItems.productId, productId)));
-    await this.db.insert(activityEvents).values({
-      actorUserId: userId,
-      eventType: "COMPARISON_ITEM_REMOVED",
-      subjectType: "PRODUCT",
-      subjectId: productId,
+    await this.db.transaction(async (tx) => {
+      const [removed] = await tx
+        .delete(comparisonItems)
+        .where(and(eq(comparisonItems.userId, userId), eq(comparisonItems.productId, productId)))
+        .returning({ productId: comparisonItems.productId });
+      if (!removed) return;
+      await tx.insert(activityEvents).values({
+        actorUserId: userId,
+        eventType: "COMPARISON_ITEM_REMOVED",
+        subjectType: "PRODUCT",
+        subjectId: productId,
+      });
     });
     return true;
   };

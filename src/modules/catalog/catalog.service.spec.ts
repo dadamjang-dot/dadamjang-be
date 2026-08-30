@@ -1,166 +1,402 @@
 import { CatalogErrorMessage } from "./catalog.error";
 import { CatalogService, decodeProductCursor, encodeProductCursor } from "./catalog.service";
-import { ProductSort } from "./catalog.types";
-import type { Database } from "src/modules/database/database.module";
-import type { Product, ProductSku } from "src/modules/database/schema";
+import { CreateProductDraftInput, ProductSort } from "./catalog.types";
+import { PgDialect } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
+import assert from "node:assert/strict";
 
-const createQuery = (result: unknown) => {
-  const query = {
+const rawCursor = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url");
+const createCatalogService = () => new CatalogService({} as never, { getProductImageUrl: jest.fn() } as never);
+const CURSOR_CREATED_AT = "2026-07-11T00:00:00.000000Z";
+const CURSOR_PRODUCT_ID = "70000000-0000-4000-8000-000000000001";
+
+const catalogQuery = (rows: readonly unknown[]) => {
+  const result = Promise.resolve(rows);
+  const chain = {
+    activeLowestPrice: sql<number>`0`,
+    activeStockTotal: sql<number>`0`,
+    from: jest.fn(),
+    where: jest.fn(),
+    as: jest.fn(),
+    leftJoinLateral: jest.fn(),
+    orderBy: jest.fn(),
+    limit: jest.fn().mockResolvedValue(rows),
+    then: result.then.bind(result),
+  };
+  chain.from.mockReturnValue(chain);
+  chain.where.mockReturnValue(chain);
+  chain.as.mockReturnValue(chain);
+  chain.leftJoinLateral.mockReturnValue(chain);
+  chain.orderBy.mockReturnValue(chain);
+  return chain;
+};
+
+const metadataQuery = (rows: readonly unknown[]) => {
+  const result = Promise.resolve(rows);
+  const chain = {
     from: jest.fn(),
     where: jest.fn(),
     orderBy: jest.fn(),
-    limit: jest.fn(),
-    then: (onfulfilled?: ((value: unknown) => unknown) | null, onrejected?: ((reason: unknown) => unknown) | null) =>
-      Promise.resolve(result).then(onfulfilled ?? undefined, onrejected ?? undefined),
+    limit: jest.fn((limit: number) => Promise.resolve(rows.slice(0, limit))),
+    then: result.then.bind(result),
   };
-  query.from.mockReturnValue(query);
-  query.where.mockReturnValue(query);
-  query.orderBy.mockReturnValue(query);
-  query.limit.mockReturnValue(query);
-  return query;
+  chain.from.mockReturnValue(chain);
+  chain.where.mockReturnValue(chain);
+  chain.orderBy.mockReturnValue(chain);
+  return chain;
 };
 
-const createDatabase = (productRows: Product[], skuRows: ProductSku[], count = productRows.length) => {
-  let selectCount = 0;
-  return {
-    select: jest.fn((selection?: unknown) => {
-      const result = selection ? [{ count }] : selectCount++ === 0 ? productRows : skuRows;
-      return createQuery(result);
-    }),
-  } as unknown as Database;
-};
+describe("catalog metadata boundaries", () => {
+  it("applies a database limit of 100 to every public metadata array", async () => {
+    const rows = Array.from({ length: 101 }, (_, index) => ({ id: index }));
+    const queries = Array.from({ length: 5 }, () => metadataQuery(rows));
+    const select = jest.fn();
+    for (const query of queries) select.mockReturnValueOnce(query);
+    const service = new CatalogService({ select } as never, {} as never);
 
-const product = (
-  productId: string,
-  createdAt: string,
-  brandId = "brand-1",
-  isOnSale = true,
-  categoryId = "category-1",
-): Product => ({
-  productId,
-  partnerId: "partner-1",
-  brandId,
-  categoryId,
-  title: productId,
-  description: productId,
-  imageUrls: [],
-  imageKeys: [],
-  status: "PUBLISHED",
-  approvalStatus: "APPROVED",
-  rejectionReason: null,
-  isOnSale,
-  isExpressDelivery: true,
-  publishedAt: new Date(createdAt),
-  createdAt: new Date(createdAt),
-  updatedAt: new Date(createdAt),
-});
+    const categoryRows = await service.listCategories();
+    const filterRows = await service.listCatalogFilterOptions();
 
-const sku = (productId: string, skuId: string, price: number, colorId = "color-1", sizeId = "size-1"): ProductSku => ({
-  skuId,
-  productId,
-  code: `${productId}-${skuId}`,
-  colorId,
-  sizeId,
-  optionName: skuId,
-  price,
-  stock: price,
-  position: 0,
-  isActive: true,
-  createdAt: new Date("2026-07-01T00:00:00.000Z"),
-  updatedAt: new Date("2026-07-01T00:00:00.000Z"),
+    expect(categoryRows).toHaveLength(100);
+    expect(filterRows.categories).toHaveLength(100);
+    expect(filterRows.brands).toHaveLength(100);
+    expect(filterRows.colors).toHaveLength(100);
+    expect(filterRows.sizes).toHaveLength(100);
+    for (const query of queries) expect(query.limit).toHaveBeenCalledWith(100);
+  });
 });
 
 describe("catalog cursor", () => {
-  it("round-trips a stable product cursor", () => {
-    const cursor = { createdAt: "2026-07-11T00:00:00.000Z", productId: "product-1" };
-    expect(decodeProductCursor(encodeProductCursor(cursor))).toEqual(cursor);
+  it.each([
+    {
+      v: 1 as const,
+      sort: ProductSort.RECOMMENDED,
+      createdAt: CURSOR_CREATED_AT,
+      productId: CURSOR_PRODUCT_ID,
+    },
+    {
+      v: 1 as const,
+      sort: ProductSort.LATEST,
+      createdAt: CURSOR_CREATED_AT,
+      productId: CURSOR_PRODUCT_ID,
+    },
+    {
+      v: 1 as const,
+      sort: ProductSort.LOW_PRICE,
+      sortValue: 120,
+      createdAt: CURSOR_CREATED_AT,
+      productId: CURSOR_PRODUCT_ID,
+    },
+    {
+      v: 1 as const,
+      sort: ProductSort.HIGH_PRICE,
+      sortValue: 120,
+      createdAt: CURSOR_CREATED_AT,
+      productId: CURSOR_PRODUCT_ID,
+    },
+    {
+      v: 1 as const,
+      sort: ProductSort.POPULAR,
+      sortValue: 5,
+      createdAt: CURSOR_CREATED_AT,
+      productId: CURSOR_PRODUCT_ID,
+    },
+  ] as const)("round-trips a versioned $sort cursor", (cursor) => {
+    expect(decodeProductCursor(encodeProductCursor(cursor), cursor.sort)).toEqual(cursor);
   });
 
   it("rejects malformed cursors", () => {
-    expect(() => decodeProductCursor("not-a-cursor")).toThrow(CatalogErrorMessage.InvalidCursor);
-  });
-
-  it("filters, counts, sorts, and paginates the same catalog result set", async () => {
-    const productRows = [
-      product("product-1", "2026-07-11T00:00:00.000Z"),
-      product("product-2", "2026-07-10T00:00:00.000Z"),
-      product("product-3", "2026-07-09T00:00:00.000Z", "brand-2", false),
-    ];
-    const skuRows = [sku("product-1", "sku-1", 100), sku("product-2", "sku-2", 200), sku("product-3", "sku-3", 50)];
-    const filter = {
-      brandIds: ["brand-1"],
-      colorIds: ["color-1"],
-      sizeIds: ["size-1"],
-      minPrice: 100,
-      maxPrice: 200,
-      saleOnly: true,
-      expressOnly: true,
-      sort: ProductSort.LOW_PRICE,
-      first: 1,
-    };
-    const firstPage = await new CatalogService(createDatabase(productRows, skuRows, 2)).listProducts(filter);
-
-    expect(firstPage.totalCount).toBe(2);
-    expect(firstPage.nodes.map(({ productId }) => productId)).toEqual(["product-1"]);
-    expect(firstPage.hasNextPage).toBe(true);
-    expect(firstPage.nextCursor).toBeTruthy();
-
-    const summaryPage = await new CatalogService(createDatabase(productRows, skuRows, 2)).listProductPriceSummaries(
-      filter,
+    expect(() => decodeProductCursor("not-a-cursor", ProductSort.RECOMMENDED)).toThrow(
+      CatalogErrorMessage.InvalidCursor,
     );
-
-    expect(summaryPage.totalCount).toBe(2);
-    expect(summaryPage.nodes.map(({ productId }) => productId)).toEqual(["product-1"]);
-
-    const secondPage = await new CatalogService(createDatabase(productRows, skuRows, 2)).listProducts({
-      ...filter,
-      after: firstPage.nextCursor ?? undefined,
-    });
-
-    expect(secondPage.totalCount).toBe(2);
-    expect(secondPage.nodes.map(({ productId }) => productId)).toEqual(["product-2"]);
-    expect(secondPage.hasNextPage).toBe(false);
-    expect(secondPage.nextCursor).toBeNull();
   });
 
-  it("sorts high price pages by the displayed final price", async () => {
-    const productRows = [
-      product("discounted", "2026-07-11T00:00:00.000Z"),
-      product("regular", "2026-07-10T00:00:00.000Z"),
-    ];
-    const skuRows = [
-      sku("discounted", "sale", 17_900),
-      sku("discounted", "base", 34_900),
-      sku("regular", "default", 24_900),
-    ];
-    const filter = { sort: ProductSort.HIGH_PRICE, first: 1 };
-
-    const firstPage = await new CatalogService(createDatabase(productRows, skuRows)).listProductPriceSummaries(filter);
-
-    expect(firstPage.nodes.map(({ productId }) => productId)).toEqual(["regular"]);
-    expect(firstPage.nextCursor).toBeTruthy();
-
-    const secondPage = await new CatalogService(createDatabase(productRows, skuRows)).listProductPriceSummaries({
-      ...filter,
-      after: firstPage.nextCursor ?? undefined,
-    });
-
-    expect(secondPage.nodes.map(({ productId }) => productId)).toEqual(["discounted"]);
+  it.each([
+    ["an unversioned shape", { createdAt: CURSOR_CREATED_AT, productId: CURSOR_PRODUCT_ID }, ProductSort.RECOMMENDED],
+    [
+      "an unknown field",
+      {
+        v: 1,
+        sort: ProductSort.RECOMMENDED,
+        createdAt: CURSOR_CREATED_AT,
+        productId: CURSOR_PRODUCT_ID,
+        extra: true,
+      },
+      ProductSort.RECOMMENDED,
+    ],
+    [
+      "a missing metric",
+      { v: 1, sort: ProductSort.LOW_PRICE, createdAt: CURSOR_CREATED_AT, productId: CURSOR_PRODUCT_ID },
+      ProductSort.LOW_PRICE,
+    ],
+    [
+      "a metric on a date sort",
+      {
+        v: 1,
+        sort: ProductSort.LATEST,
+        sortValue: 1,
+        createdAt: CURSOR_CREATED_AT,
+        productId: CURSOR_PRODUCT_ID,
+      },
+      ProductSort.LATEST,
+    ],
+    [
+      "an unsupported version",
+      { v: 2, sort: ProductSort.RECOMMENDED, createdAt: CURSOR_CREATED_AT, productId: CURSOR_PRODUCT_ID },
+      ProductSort.RECOMMENDED,
+    ],
+    [
+      "an invalid timestamp",
+      { v: 1, sort: ProductSort.RECOMMENDED, createdAt: "2026-07-11", productId: CURSOR_PRODUCT_ID },
+      ProductSort.RECOMMENDED,
+    ],
+    [
+      "an impossible timestamp",
+      {
+        v: 1,
+        sort: ProductSort.RECOMMENDED,
+        createdAt: "2026-02-31T00:00:00.000000Z",
+        productId: CURSOR_PRODUCT_ID,
+      },
+      ProductSort.RECOMMENDED,
+    ],
+    [
+      "an invalid product id",
+      { v: 1, sort: ProductSort.RECOMMENDED, createdAt: CURSOR_CREATED_AT, productId: "product-1" },
+      ProductSort.RECOMMENDED,
+    ],
+    [
+      "a non-finite metric",
+      {
+        v: 1,
+        sort: ProductSort.POPULAR,
+        sortValue: null,
+        createdAt: CURSOR_CREATED_AT,
+        productId: CURSOR_PRODUCT_ID,
+      },
+      ProductSort.POPULAR,
+    ],
+    [
+      "an unknown sort",
+      { v: 1, sort: "UNKNOWN", createdAt: CURSOR_CREATED_AT, productId: CURSOR_PRODUCT_ID },
+      ProductSort.RECOMMENDED,
+    ],
+    [
+      "a missing product id",
+      { v: 1, sort: ProductSort.RECOMMENDED, createdAt: CURSOR_CREATED_AT },
+      ProductSort.RECOMMENDED,
+    ],
+    [
+      "a string metric",
+      {
+        v: 1,
+        sort: ProductSort.HIGH_PRICE,
+        sortValue: "120",
+        createdAt: CURSOR_CREATED_AT,
+        productId: CURSOR_PRODUCT_ID,
+      },
+      ProductSort.HIGH_PRICE,
+    ],
+    ["a null payload", null, ProductSort.RECOMMENDED],
+  ])("rejects %s", (_, value, sort) => {
+    expect(() => decodeProductCursor(rawCursor(value), sort)).toThrow(CatalogErrorMessage.InvalidCursor);
   });
 
-  it("matches products from any selected category", async () => {
-    const productRows = [
-      product("product-1", "2026-07-11T00:00:00.000Z", "brand-1", true, "category-1"),
-      product("product-2", "2026-07-10T00:00:00.000Z", "brand-1", true, "category-2"),
-      product("product-3", "2026-07-09T00:00:00.000Z", "brand-1", true, "category-3"),
-    ];
-    const skuRows = [sku("product-1", "sku-1", 100), sku("product-2", "sku-2", 200), sku("product-3", "sku-3", 300)];
-
-    const page = await new CatalogService(createDatabase(productRows, skuRows, 2)).listProducts({
-      categoryIds: ["category-1", "category-2"],
+  it("rejects cursor reuse across sorts", () => {
+    const cursor = rawCursor({
+      v: 1,
+      sort: ProductSort.LOW_PRICE,
+      sortValue: 120,
+      createdAt: CURSOR_CREATED_AT,
+      productId: CURSOR_PRODUCT_ID,
     });
 
-    expect(page.totalCount).toBe(2);
-    expect(page.nodes.map(({ productId }) => productId)).toEqual(["product-1", "product-2"]);
+    expect(() => decodeProductCursor(cursor, ProductSort.HIGH_PRICE)).toThrow(CatalogErrorMessage.InvalidCursor);
+  });
+});
+
+describe("catalog product batches", () => {
+  it("returns price summaries in requested product order", async () => {
+    const createdAt = new Date("2026-08-29T00:00:00Z");
+    const service = createCatalogService();
+    jest.spyOn(service, "getProductsByIds").mockResolvedValue([
+      {
+        productId: "product-b",
+        title: "B",
+        imageKeys: [],
+        imageUrls: [],
+        isOnSale: false,
+        isExpressDelivery: true,
+        skus: [{ price: 2000 }],
+        createdAt,
+      },
+      {
+        productId: "product-a",
+        title: "A",
+        imageKeys: [],
+        imageUrls: ["https://images.test/a.png"],
+        isOnSale: true,
+        isExpressDelivery: false,
+        skus: [{ price: 3000 }, { price: 1000 }],
+        createdAt,
+      },
+    ] as never);
+
+    await expect(
+      (
+        service as CatalogService & {
+          getProductPriceSummariesByIds: (productIds: string[]) => Promise<unknown>;
+        }
+      ).getProductPriceSummariesByIds(["product-a", "product-b"]),
+    ).resolves.toEqual([
+      {
+        productId: "product-a",
+        name: "A",
+        thumbnail: "https://images.test/a.png",
+        isOnSale: true,
+        isExpressDelivery: false,
+        basePrice: 3000,
+        finalPrice: 1000,
+        priceRevision: "product-a:1787961600000:3000:1000",
+        lowestPriceEvidenceSummary: "최저 옵션 기준 2,000원 차이",
+      },
+      {
+        productId: "product-b",
+        name: "B",
+        thumbnail: null,
+        isOnSale: false,
+        isExpressDelivery: true,
+        basePrice: 2000,
+        finalPrice: 2000,
+        priceRevision: "product-b:1787961600000:2000:2000",
+        lowestPriceEvidenceSummary: "현재 옵션 최저가 기준",
+      },
+    ]);
+  });
+});
+
+describe("catalog ranking budget", () => {
+  it("sets a local statement timeout before catalog ranking queries", async () => {
+    const execute = jest.fn().mockResolvedValue(undefined);
+    const select = jest
+      .fn()
+      .mockReturnValueOnce(catalogQuery([]))
+      .mockReturnValueOnce(catalogQuery([]))
+      .mockReturnValueOnce(catalogQuery([{ count: 0 }]))
+      .mockReturnValueOnce(catalogQuery([]));
+    const transaction = jest.fn(async (callback: (tx: unknown) => Promise<unknown>) => callback({ execute, select }));
+    const service = new CatalogService({ transaction } as never, {} as never);
+
+    await expect(service.listProducts({ sort: ProductSort.POPULAR })).resolves.toEqual({
+      nodes: [],
+      hasNextPage: false,
+      nextCursor: null,
+      totalCount: 0,
+    });
+
+    expect(execute).toHaveBeenCalledTimes(1);
+    const statement = execute.mock.calls[0]?.[0];
+    assert(statement);
+    expect(new PgDialect().sqlToQuery(statement)).toMatchObject({
+      sql: "select set_config('statement_timeout', $1, true)",
+      params: ["5000ms"],
+    });
+    expect(execute.mock.invocationCallOrder[0]).toBeLessThan(select.mock.invocationCallOrder[0]!);
+  });
+});
+
+describe("catalog SKU boundaries", () => {
+  const inputWithSkuCount = (count: number): CreateProductDraftInput => ({
+    categoryId: "category-1",
+    title: "Product",
+    description: "Description",
+    imageUrls: [],
+    skus: Array.from({ length: count }, (_, index) => ({
+      code: `sku-${index}`,
+      optionName: "Option",
+      price: 0,
+      stock: 0,
+    })),
+  });
+
+  it.each([1, 100])("accepts %i SKUs", async (count) => {
+    const transaction = jest.fn().mockResolvedValue({});
+    const service = new CatalogService({ transaction } as never, {} as never);
+
+    await expect(service.createDraft("partner-1", inputWithSkuCount(count))).resolves.toEqual({});
+    expect(transaction).toHaveBeenCalledTimes(1);
+  });
+
+  const invalidInputs: [string, CreateProductDraftInput][] = [
+    ["zero SKUs", inputWithSkuCount(0)],
+    ["101 SKUs", inputWithSkuCount(101)],
+    [
+      "an overlong code",
+      { ...inputWithSkuCount(1), skus: [{ ...inputWithSkuCount(1).skus[0]!, code: "c".repeat(81) }] },
+    ],
+    [
+      "an overlong option",
+      { ...inputWithSkuCount(1), skus: [{ ...inputWithSkuCount(1).skus[0]!, optionName: "o".repeat(161) }] },
+    ],
+    ["a negative price", { ...inputWithSkuCount(1), skus: [{ ...inputWithSkuCount(1).skus[0]!, price: -1 }] }],
+    [
+      "an excessive price",
+      { ...inputWithSkuCount(1), skus: [{ ...inputWithSkuCount(1).skus[0]!, price: 2_147_483_648 }] },
+    ],
+    ["negative stock", { ...inputWithSkuCount(1), skus: [{ ...inputWithSkuCount(1).skus[0]!, stock: -1 }] }],
+    [
+      "excessive stock",
+      { ...inputWithSkuCount(1), skus: [{ ...inputWithSkuCount(1).skus[0]!, stock: 2_147_483_648 }] },
+    ],
+  ];
+
+  it.each(invalidInputs)("rejects %s before database work", async (_case, input) => {
+    const transaction = jest.fn();
+    const service = new CatalogService({ transaction } as never, {} as never);
+
+    await expect(service.createDraft("partner-1", input)).rejects.toThrow();
+    expect(transaction).not.toHaveBeenCalled();
+  });
+});
+
+describe("catalog price evidence", () => {
+  it("changes the revision when the evidence base price changes", async () => {
+    const service = createCatalogService();
+    const getProduct = jest.spyOn(service, "getProduct");
+    const product = {
+      productId: "product-a",
+      title: "A",
+      imageKeys: [],
+      imageUrls: [],
+      isOnSale: true,
+      isExpressDelivery: false,
+      createdAt: new Date("2026-08-29T00:00:00Z"),
+    };
+    getProduct
+      .mockResolvedValueOnce({ ...product, skus: [{ price: 1000 }, { price: 2000 }] } as never)
+      .mockResolvedValueOnce({ ...product, skus: [{ price: 1000 }, { price: 3000 }] } as never);
+
+    const before = await service.getProductPriceSummary("product-a");
+    const after = await service.getProductPriceSummary("product-a");
+
+    expect(after.priceRevision).not.toBe(before.priceRevision);
+  });
+
+  it("rejects evidence for a stale price revision", async () => {
+    const service = createCatalogService();
+    jest.spyOn(service, "getProduct").mockResolvedValue({
+      productId: "product-a",
+      title: "A",
+      imageKeys: [],
+      imageUrls: [],
+      isOnSale: true,
+      isExpressDelivery: false,
+      skus: [{ price: 1000 }],
+      createdAt: new Date("2026-08-29T00:00:00Z"),
+    } as never);
+
+    await expect(service.getProductPriceEvidence("product-a", "stale-revision")).rejects.toThrow(
+      "Product price has changed",
+    );
   });
 });

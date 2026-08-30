@@ -1,14 +1,4 @@
-import { Field, InputType, ObjectType } from "@nestjs/graphql";
-
-@InputType()
-export class RecordActivityEventInput {
-  @Field()
-  eventType!: string;
-  @Field()
-  subjectType!: string;
-  @Field()
-  subjectId!: string;
-}
+import { Field, ObjectType } from "@nestjs/graphql";
 
 @ObjectType()
 export class ActivityEventType {

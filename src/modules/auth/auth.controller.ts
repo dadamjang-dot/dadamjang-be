@@ -24,11 +24,12 @@ export class AuthController {
   async kakaoCallback(@Req() req: KakaoRequest, @Res({ passthrough: true }) res: Response) {
     const flowId = req.cookies.kakao_oauth_flow;
     if (!flowId) throw new CustomUnauthorizedException(AuthErrorMessage.InvalidOauthState);
-    await this.kakaoFlowService.acceptCallback(flowId, req.user);
+    const { callbackToken } = await this.kakaoFlowService.acceptCallback(flowId, req.user);
     const redirectUrl = new URL(
       this.configService.get<string>("DADAMJANG_FO_AUTH_REDIRECT_URL") ?? "dadamjang://auth/kakao-callback",
     );
     redirectUrl.searchParams.set("flowId", flowId);
+    redirectUrl.searchParams.set("callbackToken", callbackToken);
     res.clearCookie("kakao_oauth_state", authCookieOptions);
     res.clearCookie("kakao_oauth_flow", authCookieOptions);
     return res.redirect(redirectUrl.toString());

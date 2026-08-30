@@ -1,4 +1,5 @@
 import { Field, InputType, Int, ObjectType } from "@nestjs/graphql";
+import type { OrderStatus, PaymentStatus } from "src/modules/order/order.constant";
 
 @InputType()
 export class ReviewPartnerInput {
@@ -25,7 +26,7 @@ export class TransitionOrderInput {
   @Field()
   orderId!: string;
   @Field()
-  nextStatus!: string;
+  nextStatus!: OrderStatus;
 }
 
 @InputType()
@@ -303,15 +304,15 @@ export class AdminOrderSummaryType {
   @Field()
   buyerEmail!: string;
   @Field()
-  status!: string;
+  status!: OrderStatus;
   @Field()
-  paymentStatus!: string;
+  paymentStatus!: PaymentStatus;
   @Field(() => Int)
   totalAmount!: number;
   @Field(() => Int)
   itemCount!: number;
   @Field(() => [String])
-  allowedNextStatuses!: string[];
+  allowedNextStatuses!: OrderStatus[];
   @Field()
   createdAt!: Date;
 }

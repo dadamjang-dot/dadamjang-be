@@ -2,21 +2,26 @@ import { Injectable } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { JwtService, JwtSignOptions } from "@nestjs/jwt";
 import * as bcrypt from "bcrypt";
-import { randomBytes, randomUUID } from "crypto";
-import { CustomBadRequestException, CustomUnauthorizedException } from "src/common/errors/custom-exceptions";
+import { randomUUID, timingSafeEqual } from "crypto";
+import { CustomConflictException, CustomUnauthorizedException } from "src/common/errors/custom-exceptions";
+import { hashToken } from "src/common/security/token-hash";
+import { AdmissionLimiter, type RequestOrigin } from "src/modules/admission/admission-limiter";
 import { EmailService } from "src/modules/email/email.service";
 import { User } from "src/modules/database/schema";
 import { AuthErrorMessage } from "./auth.error";
-import { AuthRepository } from "./auth.repository";
-import {
-  AuthPortal,
-  KakaoBeginResult,
-  KakaoProfile,
-  KakaoSignupAuthInput,
-  SigninAuthInput,
-  SignupAuthInput,
-} from "./auth.types";
-import { UserRole, type UserRoleValue } from "src/auth/role";
+import { AuthRepository, type RefreshTokenStore } from "./auth.repository";
+import { AuthPortal, JWT_ACCESS_AUDIENCE, JWT_ISSUER, JWT_REFRESH_AUDIENCE, SigninAuthInput } from "./auth.types";
+import { hasBuyerCapability, UserRole, type UserRoleValue } from "src/auth/role";
+
+type JwtExpiration = Exclude<JwtSignOptions["expiresIn"], undefined>;
+
+const invalidPasswordHash = "$2b$10$nmo8L8VvFVH2sB.e3T0hP.TQMDhHxk88WTtFBkDgnjAlnHDR4W/rW";
+
+const matchesRefreshToken = async (token: string, saved: string) => {
+  if (saved.startsWith("$2")) return bcrypt.compare(token, saved);
+  const digest = hashToken(token);
+  return saved.length === digest.length && timingSafeEqual(Buffer.from(saved), Buffer.from(digest));
+};
 
 @Injectable()
 export class AuthService {
@@ -25,107 +30,128 @@ export class AuthService {
     private readonly jwtService: JwtService,
     private readonly configService: ConfigService,
     private readonly emailService: EmailService,
+    private readonly admissionLimiter: AdmissionLimiter,
   ) {}
-  signup = async (input: SignupAuthInput, deviceId: string) => {
-    const user = await this.mapDuplicate(async () =>
-      this.emailService.consumeSignupToken(input.emailVerificationToken, input.email, {
-        userId: randomUUID(),
-        userid: input.userid,
-        password: await bcrypt.hash(input.password, 10),
-      }),
+  signin = async (input: SigninAuthInput, deviceId: string, origin: RequestOrigin) => {
+    const userid = this.emailService.normalizeUserid(input.userid);
+    const limit = input.portal === AuthPortal.Fo ? 20 : 5;
+    await this.admissionLimiter.assertAllowed(
+      `AUTH_SIGNIN_${input.portal}`,
+      [
+        { scopeType: "signin-ip", value: origin.ip, limit, windowMs: 15 * 60_000 },
+        { scopeType: "signin-account", value: userid, limit, windowMs: 15 * 60_000 },
+        { scopeType: "signin-device", value: origin.deviceId ?? deviceId, limit, windowMs: 15 * 60_000 },
+      ],
+      AuthErrorMessage.AuthRequired,
     );
-    if (!user) throw new CustomUnauthorizedException(AuthErrorMessage.InvalidEmailVerificationToken);
-    return this.issueTokensForUser(user, deviceId);
-  };
-  signin = async (input: SigninAuthInput, deviceId: string) => {
-    const user = await this.repository.findByUserid(this.emailService.normalizeUserid(input.userid));
-    if (!user || !(await bcrypt.compare(input.password, user.password)))
+    const signinStartedAt = await this.repository.signinStartedAt();
+    const user = await this.repository.findByUserid(userid);
+    if (!user) {
+      await bcrypt.compare(input.password, invalidPasswordHash);
       throw new CustomUnauthorizedException(AuthErrorMessage.AuthRequired);
-    this.assertPortalRole((user as User & { role?: UserRoleValue }).role ?? UserRole.User, input.portal);
-    return this.issueTokensForUser(user, deviceId);
-  };
-  beginKakao = async (profile: KakaoProfile, deviceId: string): Promise<KakaoBeginResult> => {
-    const user = await this.repository.findKakaoUser(profile.providerUserId);
-    if (user) return { existingUser: true, tokenPayload: await this.issueTokensForUser(user, deviceId) };
-    if (!profile.email) throw new CustomBadRequestException("카카오 계정 이메일 제공 동의가 필요합니다.");
-    const kakaoSignupToken = randomBytes(32).toString("base64url");
-    await this.repository.createKakaoSignupToken(
-      kakaoSignupToken,
-      profile.providerUserId,
-      this.emailService.normalizeEmail(profile.email),
-    );
-    return { existingUser: false, kakaoSignupToken };
-  };
-  completeKakaoSignup = async (input: KakaoSignupAuthInput, deviceId: string) => {
-    const user = await this.mapDuplicate(async () =>
-      this.repository.consumeKakaoSignupTokenAndCreateUser(input.kakaoSignupToken, {
-        userId: randomUUID(),
-        userid: this.emailService.normalizeUserid(input.userid),
-        password: await bcrypt.hash(randomBytes(32).toString("base64url"), 10),
-      }),
-    );
-    if (!user) throw new CustomUnauthorizedException("카카오 가입 토큰이 유효하지 않습니다.");
-    return this.issueTokensForUser(user, deviceId);
+    }
+    return this.withSigninLock(user.userId, deviceId, async (store) => {
+      if (!(await bcrypt.compare(input.password, user.password)))
+        throw new CustomUnauthorizedException(AuthErrorMessage.AuthRequired);
+      this.assertPortalRole((user as User & { role?: UserRoleValue }).role ?? UserRole.User, input.portal);
+      return this.issueTokensForUser(user, deviceId, store, signinStartedAt);
+    });
   };
   refresh = async (userId: string, deviceId: string, refreshToken: string) => {
+    const rotationKey = hashToken(`${deviceId}\0${refreshToken}`);
     const saved = await this.repository.findRefreshToken(userId, deviceId);
     if (
       !saved ||
       saved.refreshTokenExp.getTime() <= Date.now() ||
-      !(await bcrypt.compare(refreshToken, saved.refreshToken))
-    )
+      !(await matchesRefreshToken(refreshToken, saved.refreshToken))
+    ) {
+      if (await this.repository.hasRecentRotation(userId, deviceId, rotationKey))
+        throw new CustomConflictException(AuthErrorMessage.SessionChanged);
       throw new CustomUnauthorizedException(AuthErrorMessage.AuthRequired);
+    }
     const user = await this.repository.findUser(userId);
     if (!user) throw new CustomUnauthorizedException(AuthErrorMessage.AuthRequired);
-    return this.issueTokensForUser(user, deviceId);
+    const tokens = await this.createTokensForUser(user, deviceId);
+    const rotation = await this.repository.rotateRefreshToken({
+      userId,
+      deviceId,
+      previousRefreshToken: saved.refreshToken,
+      rotationKey,
+      refreshToken: tokens.refreshTokenHash,
+      refreshTokenExp: tokens.refreshTokenExp,
+    });
+    if (rotation === "concurrent") throw new CustomConflictException(AuthErrorMessage.SessionChanged);
+    if (rotation === "invalid") throw new CustomUnauthorizedException(AuthErrorMessage.AuthRequired);
+    return tokens.payload;
   };
-  logout = async (userId: string, deviceId: string) => {
-    await this.repository.deleteRefreshToken(userId, deviceId);
+  logout = async (userId: string, deviceId: string, refreshToken: string) => {
+    const saved = await this.repository.findRefreshToken(userId, deviceId);
+    if (
+      !saved ||
+      saved.refreshTokenExp.getTime() <= Date.now() ||
+      !(await matchesRefreshToken(refreshToken, saved.refreshToken)) ||
+      !(await this.repository.deleteRefreshToken(userId, deviceId, saved.refreshToken))
+    )
+      throw new CustomUnauthorizedException(AuthErrorMessage.AuthRequired);
     return true;
   };
-  compareUserRefreshToken = async (userId: string, deviceId: string, token: string) => {
-    const saved = await this.repository.findRefreshToken(userId, deviceId);
-    return !!saved && saved.refreshTokenExp.getTime() > Date.now() && bcrypt.compare(token, saved.refreshToken);
-  };
   getViewer = async (userId: string) => this.repository.findUser(userId);
-  issueTokensForUser = async (user: User, deviceId: string) => {
+  withSigninLock = async <T>(userId: string, deviceId: string, action: (store: RefreshTokenStore) => Promise<T>) => {
+    const result = await this.repository.withSigninLock(userId, deviceId, action);
+    if (!result.acquired) throw new CustomConflictException(AuthErrorMessage.SessionChanged);
+    return result.value;
+  };
+  signinStartedAt = () => this.repository.signinStartedAt();
+  issueTokensForUser = async (user: User, deviceId: string, store?: RefreshTokenStore, signinStartedAt?: Date) => {
+    const previous = await this.repository.findRefreshToken(user.userId, deviceId, store);
+    const tokens = await this.createTokensForUser(user, deviceId);
+    const saved = await this.repository.saveRefreshToken(
+      {
+        userId: user.userId,
+        deviceId,
+        ...(previous === undefined ? {} : { previousRefreshToken: previous.refreshToken }),
+        ...(signinStartedAt === undefined ? {} : { signinStartedAt }),
+        refreshToken: tokens.refreshTokenHash,
+        refreshTokenExp: tokens.refreshTokenExp,
+      },
+      store,
+    );
+    if (!saved) throw new CustomConflictException(AuthErrorMessage.SessionChanged);
+    return tokens.payload;
+  };
+  private createTokensForUser = async (user: User, deviceId: string) => {
     const role = (user as User & { role?: UserRoleValue }).role ?? UserRole.User;
     const accessToken = await this.jwtService.signAsync(
-      { userId: user.userId, role },
+      { userId: user.userId, role, tokenUse: "access", jti: randomUUID() },
       {
         secret: this.configService.getOrThrow<string>("JWT_ACCESS_TOKEN_SECRET"),
-        expiresIn: this.configService.getOrThrow<string>("JWT_ACCESS_TOKEN_EXP") as JwtSignOptions["expiresIn"],
+        expiresIn: this.configService.getOrThrow<string>("JWT_ACCESS_TOKEN_EXP") as JwtExpiration,
+        algorithm: "HS256",
+        issuer: JWT_ISSUER,
+        audience: JWT_ACCESS_AUDIENCE,
       },
     );
     const refreshToken = await this.jwtService.signAsync(
-      { userId: user.userId, role, deviceId },
+      { userId: user.userId, role, deviceId, tokenUse: "refresh", jti: randomUUID() },
       {
         secret: this.configService.getOrThrow<string>("JWT_REFRESH_TOKEN_SECRET"),
-        expiresIn: this.configService.getOrThrow<string>("JWT_REFRESH_TOKEN_EXP") as JwtSignOptions["expiresIn"],
+        expiresIn: this.configService.getOrThrow<string>("JWT_REFRESH_TOKEN_EXP") as JwtExpiration,
+        algorithm: "HS256",
+        issuer: JWT_ISSUER,
+        audience: JWT_REFRESH_AUDIENCE,
       },
     );
     const decoded = this.jwtService.decode(refreshToken) as { exp?: number } | null;
     if (!decoded?.exp) throw new CustomUnauthorizedException(AuthErrorMessage.RefreshTokenExpUndefined);
-    await this.repository.saveRefreshToken({
-      userId: user.userId,
-      deviceId,
-      refreshToken: await bcrypt.hash(refreshToken, 10),
+    return {
+      payload: { accessToken, refreshToken, role },
+      refreshTokenHash: hashToken(refreshToken),
       refreshTokenExp: new Date(decoded.exp * 1000),
-    });
-    return { accessToken, refreshToken, role };
-  };
-  private mapDuplicate = async <T>(operation: () => Promise<T>) => {
-    try {
-      return await operation();
-    } catch (error) {
-      if (typeof error === "object" && error !== null && "code" in error && error.code === "23505")
-        throw new CustomBadRequestException(AuthErrorMessage.DuplicateUser);
-      throw error;
-    }
+    };
   };
   private assertPortalRole = (role: UserRoleValue, portal: AuthPortal) => {
     const allowed =
-      (portal === AuthPortal.Fo && role === UserRole.User) ||
+      (portal === AuthPortal.Fo && hasBuyerCapability(role)) ||
       (portal === AuthPortal.Partner && role === UserRole.Partner) ||
       (portal === AuthPortal.Bo && role === UserRole.Admin);
     if (!allowed) throw new CustomUnauthorizedException(AuthErrorMessage.AuthRequired);

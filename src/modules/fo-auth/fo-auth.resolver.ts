@@ -1,7 +1,8 @@
 import { Args, Context, Mutation, Query, Resolver } from "@nestjs/graphql";
 import { UseGuards } from "@nestjs/common";
 import type { Request, Response } from "express";
-import { JwtAccessTokenGuard } from "src/guards/accessToken.guard";
+import { JwtAccessTokenGuard } from "src/guards/access-token.guard";
+import { requestOriginFromRequest } from "src/modules/admission/admission-limiter";
 import { deviceIdFromRequest, setTokenCookies } from "src/modules/auth/auth-http";
 import type { AuthRequest } from "src/modules/auth/auth.types";
 import { TokenPayload } from "src/modules/auth/auth.types";
@@ -20,7 +21,7 @@ export class FoAuthResolver {
 
   @Mutation(() => TokenPayload)
   async signinFo(@Args("input") input: SigninFoInput, @Context("req") req: Request, @Context("res") res: Response) {
-    const result = await this.service.signin(input, deviceIdFromRequest(req));
+    const result = await this.service.signin(input, deviceIdFromRequest(req), requestOriginFromRequest(req));
     setTokenCookies(res, result);
     return result;
   }

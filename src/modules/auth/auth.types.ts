@@ -1,15 +1,42 @@
 import { Field, InputType, ObjectType } from "@nestjs/graphql";
 import { Request } from "express";
 import { registerEnumType } from "@nestjs/graphql";
-import type { UserRoleValue } from "src/auth/role";
+import { UserRole, type UserRoleValue } from "src/auth/role";
 
-export type JwtPayload = { userId: string; role: UserRoleValue; deviceId?: string };
+export const JWT_ISSUER = "dadamjang";
+export const JWT_ACCESS_AUDIENCE = "dadamjang-api";
+export const JWT_REFRESH_AUDIENCE = "dadamjang-refresh";
+
+export type AccessJwtPayload = { userId: string; role: UserRoleValue; tokenUse: "access" };
+export type RefreshJwtPayload = {
+  userId: string;
+  role: UserRoleValue;
+  deviceId: string;
+  tokenUse: "refresh";
+};
+export type JwtPayload = AccessJwtPayload | RefreshJwtPayload;
+
+const roles = new Set<string>(Object.values(UserRole));
+const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null;
+const isIdentifier = (value: unknown): value is string => typeof value === "string" && value.length > 0;
+const isRole = (value: unknown): value is UserRoleValue => typeof value === "string" && roles.has(value);
+
+export const isAccessJwtPayload = (value: unknown): value is AccessJwtPayload =>
+  isRecord(value) && value.tokenUse === "access" && isIdentifier(value.userId) && isRole(value.role);
+
+export const isRefreshJwtPayload = (value: unknown): value is RefreshJwtPayload =>
+  isRecord(value) &&
+  value.tokenUse === "refresh" &&
+  isIdentifier(value.userId) &&
+  isIdentifier(value.deviceId) &&
+  isRole(value.role);
+
 export type AuthRequest = Request & {
-  user: JwtPayload;
+  user: AccessJwtPayload;
   cookies: { access_token?: string; refresh_token?: string };
 };
 export type RefreshAuthRequest = Request & {
-  user: JwtPayload & { deviceId: string };
+  user: RefreshJwtPayload;
   cookies: { refresh_token?: string };
   refreshToken: string;
 };
@@ -28,8 +55,6 @@ export type KakaoRequest = Request & {
   user: KakaoProfile;
   cookies: { kakao_oauth_flow?: string };
 };
-export type KakaoBeginResult =
-  { existingUser: true; tokenPayload: TokenPayload } | { existingUser: false; kakaoSignupToken: string };
 
 export enum AuthPortal {
   Fo = "FO",
@@ -38,26 +63,6 @@ export enum AuthPortal {
 }
 
 registerEnumType(AuthPortal, { name: "AuthPortal" });
-
-@InputType()
-export class SignupAuthInput {
-  @Field()
-  userid!: string;
-  @Field()
-  email!: string;
-  @Field()
-  password!: string;
-  @Field()
-  emailVerificationToken!: string;
-}
-
-@InputType()
-export class KakaoSignupAuthInput {
-  @Field()
-  userid!: string;
-  @Field()
-  kakaoSignupToken!: string;
-}
 
 @InputType()
 export class SigninAuthInput {

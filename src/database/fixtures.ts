@@ -37,29 +37,6 @@ export const ADMIN_FIXTURE = {
   inviteToken: "integration-admin-invite-token",
 } as const;
 
-export const seedMigrationPrerequisite = async (pool: Pool) => {
-  const password = await bcrypt.hash(FIXTURE.password, 4);
-  await pool.query(`INSERT INTO "users" ("userId", "userid", "email", "password") VALUES ($1, $2, $3, $4)`, [
-    FIXTURE.userId,
-    FIXTURE.userid,
-    "integration@example.test",
-    password,
-  ]);
-  const category = await pool.query<{ categoryId: string }>(
-    `SELECT "categoryId" FROM "categories" ORDER BY "sortOrder", "categoryId" LIMIT 1`,
-  );
-  const categoryId = category.rows[0]?.categoryId;
-  if (!categoryId) throw new Error("Migration prerequisite category missing");
-  await pool.query(
-    `INSERT INTO "partners" ("partnerId", "ownerUserId", "businessEmail", "businessRegistrationNumber", "tradeName", "status") VALUES ($1, $2, $3, $4, $5, 'APPROVED')`,
-    [FIXTURE.partnerId, FIXTURE.userId, "partner@example.test", "1000000000", "Integration Partner"],
-  );
-  await pool.query(
-    `INSERT INTO "products" ("productId", "partnerId", "categoryId", "title", "description", "status", "approvalStatus", "publishedAt") VALUES ($1, $2, $3, $4, $5, 'PUBLISHED', 'APPROVED', now())`,
-    [FIXTURE.productId, FIXTURE.partnerId, categoryId, "Migration Source Product", "Migration source fixture"],
-  );
-};
-
 export const resetFixtures = async (pool: Pool) => {
   const tables = await pool.query<{ tablename: string }>(
     `SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tablename <> '_migrations'`,

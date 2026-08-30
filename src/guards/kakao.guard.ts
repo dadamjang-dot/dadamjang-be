@@ -8,7 +8,7 @@ import { authCookieOptions } from "src/modules/auth/cookie-options";
 
 @Injectable()
 export class KakaoGuard extends AuthGuard("kakao") {
-  getAuthenticateOptions(context: ExecutionContext) {
+  override getAuthenticateOptions(context: ExecutionContext) {
     const request = context.switchToHttp().getRequest<Request>();
     const response = context.switchToHttp().getResponse<Response>();
 

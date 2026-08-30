@@ -1,14 +1,17 @@
 import { Injectable } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { PassportStrategy } from "@nestjs/passport";
-import { Request } from "express";
-import { ExtractJwt, Strategy, StrategyOptions } from "passport-jwt";
+import type { Request } from "express";
+import { ExtractJwt, Strategy, type StrategyOptions } from "passport-jwt";
 import { CustomUnauthorizedException } from "src/common/errors/custom-exceptions";
 import { AuthErrorMessage } from "src/modules/auth/auth.error";
-import { AuthService } from "src/modules/auth/auth.service";
-import { AuthRequest, JwtPayload } from "src/modules/auth/auth.types";
+import { isRefreshJwtPayload, JWT_ISSUER, JWT_REFRESH_AUDIENCE, RefreshJwtPayload } from "src/modules/auth/auth.types";
 
-type RefreshRequest = AuthRequest & { refreshToken?: string };
+type RefreshRequest = Request & {
+  cookies: { refresh_token?: string };
+  user: RefreshJwtPayload;
+  refreshToken?: string;
+};
 
 const refreshTokenFromRequest = (request: Request) => {
   const authorization = request.headers.authorization;
@@ -19,33 +22,29 @@ const refreshTokenFromRequest = (request: Request) => {
 
 @Injectable()
 export class JwtRefreshTokenStrategy extends PassportStrategy(Strategy, "refresh_token") {
-  constructor(
-    private readonly configService: ConfigService,
-    private readonly authService: AuthService,
-  ) {
+  constructor(configService: ConfigService) {
     super({
       jwtFromRequest: ExtractJwt.fromExtractors([refreshTokenFromRequest]),
       secretOrKey: configService.getOrThrow<string>("JWT_REFRESH_TOKEN_SECRET"),
       ignoreExpiration: false,
+      issuer: JWT_ISSUER,
+      audience: JWT_REFRESH_AUDIENCE,
+      algorithms: ["HS256"],
       passReqToCallback: true,
     } satisfies StrategyOptions);
   }
 
-  async validate(req: RefreshRequest, payload: JwtPayload & { deviceId: string }) {
+  validate = (req: RefreshRequest, payload: unknown) => {
     const refreshToken = refreshTokenFromRequest(req);
 
     if (!refreshToken) {
       throw new CustomUnauthorizedException(AuthErrorMessage.RefreshTokenUndefined);
     }
+    if (!isRefreshJwtPayload(payload)) throw new CustomUnauthorizedException(AuthErrorMessage.AuthRequired);
 
-    const result = await this.authService.compareUserRefreshToken(payload.userId, payload.deviceId, refreshToken);
-
-    if (!result) {
-      throw new CustomUnauthorizedException(AuthErrorMessage.RefreshTokenWrong);
-    }
     req.user = payload;
     req.refreshToken = refreshToken;
 
     return payload;
-  }
+  };
 }

@@ -3,7 +3,7 @@ import { GqlExecutionContext } from "@nestjs/graphql";
 import { Reflector } from "@nestjs/core";
 import { CustomForbiddenException } from "src/common/errors/custom-exceptions";
 import { ROLES_KEY } from "src/auth/roles.decorator";
-import type { UserRoleValue } from "src/auth/role";
+import { hasBuyerCapability, UserRole, type UserRoleValue } from "src/auth/role";
 import type { AuthRequest } from "src/modules/auth/auth.types";
 
 @Injectable()
@@ -18,7 +18,9 @@ export class RolesGuard implements CanActivate {
     if (!roles?.length) return true;
 
     const request = GqlExecutionContext.create(context).getContext<{ req: AuthRequest }>().req;
-    if (!request.user?.role || !roles.includes(request.user.role)) {
+    const role = request.user?.role;
+    const allowed = role && (roles.includes(role) || (roles.includes(UserRole.User) && hasBuyerCapability(role)));
+    if (!allowed) {
       throw new CustomForbiddenException("접근 권한이 없습니다.");
     }
 

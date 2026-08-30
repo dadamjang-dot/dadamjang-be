@@ -3,7 +3,7 @@ import { Args, Context, Mutation, Query, Resolver } from "@nestjs/graphql";
 import { UserRole } from "src/auth/role";
 import { Roles } from "src/auth/roles.decorator";
 import { CustomUnauthorizedException } from "src/common/errors/custom-exceptions";
-import { JwtAccessTokenGuard } from "src/guards/accessToken.guard";
+import { JwtAccessTokenGuard } from "src/guards/access-token.guard";
 import { RolesGuard } from "src/guards/roles.guard";
 import { PartnerErrorMessage } from "./partner.error";
 import { PartnerService } from "./partner.service";

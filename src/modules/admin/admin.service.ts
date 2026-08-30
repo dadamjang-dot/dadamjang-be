@@ -6,8 +6,9 @@ import {
   CustomBadRequestException,
   CustomConflictException,
   CustomNotFoundException,
-  CustomServiceUnavailableException,
 } from "src/common/errors/custom-exceptions";
+import { hasDatabaseErrorCode } from "src/common/errors/database-error";
+import { requireResult } from "src/common/invariants/require-result";
 import { hashToken } from "src/common/security/token-hash";
 import { CreateCategoryInput } from "src/modules/catalog/catalog.types";
 import { Database, DRIZZLE } from "src/modules/database/database.module";
@@ -24,7 +25,12 @@ import {
   users,
 } from "src/modules/database/schema";
 import { EmailService } from "src/modules/email/email.service";
-import { ALLOWED_TRANSITIONS } from "src/modules/order/order.constant";
+import {
+  getAllowedOrderTransitions,
+  getOrderTransitionRule,
+  isOrderStatus,
+  isPaymentStatus,
+} from "src/modules/order/order.constant";
 import { getCannotTransitionMessage } from "src/modules/order/order.error";
 import { AdminErrorMessage } from "./admin.error";
 import {
@@ -77,12 +83,6 @@ const rejectionReason = (approved: boolean, value?: string) => {
   if (reason.length < 1 || reason.length > 500)
     throw new CustomBadRequestException(AdminErrorMessage.RejectionReasonRequired);
   return reason;
-};
-
-const isDatabaseError = (error: unknown, code: string, depth = 0): boolean => {
-  if (typeof error !== "object" || error === null || depth > 4) return false;
-  if ("code" in error && error.code === code) return true;
-  return "cause" in error && isDatabaseError(error.cause, code, depth + 1);
 };
 
 @Injectable()
@@ -279,7 +279,7 @@ export class AdminService {
         .limit(first + 1),
       this.count(orders, and(...base)),
     ]);
-    const nodes = rows.map((row) => ({ ...row, allowedNextStatuses: ALLOWED_TRANSITIONS[row.status] ?? [] }));
+    const nodes = rows.map((row) => ({ ...row, allowedNextStatuses: getAllowedOrderTransitions(row.status) }));
     return this.toConnection(nodes, first, totalCount, (node) => node.orderId);
   };
 
@@ -307,7 +307,7 @@ export class AdminService {
       this.db.select().from(orderItems).where(eq(orderItems.orderId, orderId)).orderBy(asc(orderItems.createdAt)),
       this.entityAuditLogs("ORDER", orderId),
     ]);
-    return { ...order, allowedNextStatuses: ALLOWED_TRANSITIONS[order.status] ?? [], items, auditLogs: history };
+    return { ...order, allowedNextStatuses: getAllowedOrderTransitions(order.status), items, auditLogs: history };
   };
 
   listCategories = () =>
@@ -396,15 +396,19 @@ export class AdminService {
         })
         .where(and(eq(partners.partnerId, input.partnerId), eq(partners.status, "PENDING")))
         .returning();
-      if (!partner) await this.throwPartnerMutationError(input.partnerId);
+      if (!partner) return this.throwPartnerMutationError(input.partnerId);
       if (input.approved) {
         let brandId = partner.brandId;
         if (!brandId) {
-          const [brand] = await tx
-            .insert(brands)
-            .values({ name: partner.tradeName, slug: `partner-${partner.partnerId}`, isActive: true })
-            .onConflictDoUpdate({ target: brands.slug, set: { name: partner.tradeName, isActive: true } })
-            .returning();
+          const brand = requireResult(
+            (
+              await tx
+                .insert(brands)
+                .values({ name: partner.tradeName, slug: `partner-${partner.partnerId}`, isActive: true })
+                .onConflictDoUpdate({ target: brands.slug, set: { name: partner.tradeName, isActive: true } })
+                .returning()
+            )[0],
+          );
           brandId = brand.brandId;
           await tx
             .update(partners)
@@ -439,7 +443,7 @@ export class AdminService {
         })
         .where(and(eq(products.productId, input.productId), eq(products.approvalStatus, "PENDING")))
         .returning();
-      if (!product) await this.throwProductMutationError(input.productId);
+      if (!product) return this.throwProductMutationError(input.productId);
       await tx.insert(auditLogs).values({
         actorUserId: adminUserId,
         action: input.approved ? "PRODUCT_APPROVED" : "PRODUCT_REJECTED",
@@ -455,12 +459,29 @@ export class AdminService {
     await this.db.transaction(async (tx) => {
       const [current] = await tx.select().from(orders).where(eq(orders.orderId, input.orderId)).limit(1);
       if (!current) throw new CustomNotFoundException(AdminErrorMessage.OrderNotFound);
-      if (!ALLOWED_TRANSITIONS[current.status]?.includes(input.nextStatus))
+      if (!isOrderStatus(input.nextStatus))
         throw new CustomBadRequestException(getCannotTransitionMessage(current.status, input.nextStatus));
+      if (!isOrderStatus(current.status) || !isPaymentStatus(current.paymentStatus))
+        throw new Error("Order has an invalid persisted state");
+      const rule = getOrderTransitionRule(current.status, input.nextStatus);
+      if (!rule) throw new CustomBadRequestException(getCannotTransitionMessage(current.status, input.nextStatus));
+      if (current.paymentStatus !== rule.requiredPaymentStatus)
+        throw new CustomConflictException(AdminErrorMessage.OrderChanged);
       const [updated] = await tx
         .update(orders)
-        .set({ status: input.nextStatus, updatedAt: new Date() })
-        .where(and(eq(orders.orderId, input.orderId), eq(orders.status, current.status)))
+        .set({
+          status: input.nextStatus,
+          paymentStatus: rule.paymentStatus,
+          paymentFailureReason: rule.paymentFailureReason,
+          updatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(orders.orderId, input.orderId),
+            eq(orders.status, current.status),
+            eq(orders.paymentStatus, current.paymentStatus),
+          ),
+        )
         .returning();
       if (!updated) throw new CustomConflictException(AdminErrorMessage.OrderChanged);
       await tx.insert(auditLogs).values({
@@ -468,7 +489,13 @@ export class AdminService {
         action: "ORDER_STATUS_CHANGED",
         entityType: "ORDER",
         entityId: updated.orderId,
-        metadata: { previousStatus: current.status, nextStatus: updated.status },
+        metadata: {
+          previousStatus: current.status,
+          nextStatus: updated.status,
+          previousPaymentStatus: current.paymentStatus,
+          nextPaymentStatus: updated.paymentStatus,
+          paymentFailureReason: updated.paymentFailureReason,
+        },
       });
     });
     return this.getOrder(input.orderId);
@@ -480,7 +507,7 @@ export class AdminService {
     try {
       await this.db.transaction(async (tx) => {
         if (values.parentId) await this.assertCategoryExists(tx, values.parentId);
-        const [category] = await tx.insert(categories).values(values).returning();
+        const category = requireResult((await tx.insert(categories).values(values).returning())[0]);
         categoryId = category.categoryId;
         await tx.insert(auditLogs).values({
           actorUserId: adminUserId,
@@ -491,7 +518,8 @@ export class AdminService {
         });
       });
     } catch (error) {
-      if (isDatabaseError(error, "23505")) throw new CustomBadRequestException(AdminErrorMessage.DuplicateCategorySlug);
+      if (hasDatabaseErrorCode(error, "23505"))
+        throw new CustomBadRequestException(AdminErrorMessage.DuplicateCategorySlug);
       throw error;
     }
     return this.getCategory(categoryId);
@@ -500,6 +528,7 @@ export class AdminService {
   updateCategory = async (adminUserId: string, input: UpdateCategoryInput) => {
     try {
       await this.db.transaction(async (tx) => {
+        await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${"category-hierarchy"}, 6))`);
         const [current] = await tx
           .select()
           .from(categories)
@@ -515,15 +544,19 @@ export class AdminService {
         const values = this.categoryValues({
           name: input.name ?? current.name,
           slug: input.slug ?? current.slug,
-          parentId: nextParentId ?? undefined,
+          ...(nextParentId === null ? {} : { parentId: nextParentId }),
           sortOrder: input.sortOrder ?? current.sortOrder,
           isActive: input.isActive ?? current.isActive,
         });
-        const [updated] = await tx
-          .update(categories)
-          .set({ ...values, parentId: nextParentId, updatedAt: new Date() })
-          .where(eq(categories.categoryId, input.categoryId))
-          .returning();
+        const updated = requireResult(
+          (
+            await tx
+              .update(categories)
+              .set({ ...values, parentId: nextParentId, updatedAt: new Date() })
+              .where(eq(categories.categoryId, input.categoryId))
+              .returning()
+          )[0],
+        );
         await tx.insert(auditLogs).values({
           actorUserId: adminUserId,
           action: "CATEGORY_UPDATED",
@@ -533,7 +566,8 @@ export class AdminService {
         });
       });
     } catch (error) {
-      if (isDatabaseError(error, "23505")) throw new CustomBadRequestException(AdminErrorMessage.DuplicateCategorySlug);
+      if (hasDatabaseErrorCode(error, "23505"))
+        throw new CustomBadRequestException(AdminErrorMessage.DuplicateCategorySlug);
       throw error;
     }
     return this.getCategory(input.categoryId);
@@ -550,33 +584,33 @@ export class AdminService {
     if (existingUser) throw new CustomBadRequestException(AdminErrorMessage.InviteEmailAlreadyRegistered);
     let inviteId = "";
     await this.db.transaction(async (tx) => {
-      const [invite] = await tx
-        .insert(adminInvites)
-        .values({
-          email,
-          tokenHash: hashToken(token),
-          invitedByUserId: adminUserId,
-          expiresAt: new Date(Date.now() + 72 * 60 * 60 * 1000),
-        })
-        .onConflictDoUpdate({
-          target: adminInvites.email,
-          set: {
-            tokenHash: hashToken(token),
-            invitedByUserId: adminUserId,
-            expiresAt: new Date(Date.now() + 72 * 60 * 60 * 1000),
-            acceptedAt: null,
-            acceptedByUserId: null,
-            revokedAt: null,
-            createdAt: new Date(),
-          },
-        })
-        .returning();
+      const invite = requireResult(
+        (
+          await tx
+            .insert(adminInvites)
+            .values({
+              email,
+              tokenHash: hashToken(token),
+              invitedByUserId: adminUserId,
+              expiresAt: new Date(Date.now() + 72 * 60 * 60 * 1000),
+            })
+            .onConflictDoUpdate({
+              target: adminInvites.email,
+              set: {
+                tokenHash: hashToken(token),
+                invitedByUserId: adminUserId,
+                expiresAt: new Date(Date.now() + 72 * 60 * 60 * 1000),
+                acceptedAt: null,
+                acceptedByUserId: null,
+                revokedAt: null,
+                createdAt: new Date(),
+              },
+            })
+            .returning()
+        )[0],
+      );
       inviteId = invite.inviteId;
-      try {
-        await this.emailService.sendAdminInvite(email, token);
-      } catch {
-        throw new CustomServiceUnavailableException(AdminErrorMessage.InviteEmailFailed);
-      }
+      await this.emailService.queueAdminInvite(tx, email, token, invite.inviteId);
       await tx.insert(auditLogs).values({
         actorUserId: adminUserId,
         action: "ADMIN_INVITED",
@@ -674,7 +708,7 @@ export class AdminService {
         });
       });
     } catch (error) {
-      if (isDatabaseError(error, "23505")) throw new CustomBadRequestException("Userid is already in use");
+      if (hasDatabaseErrorCode(error, "23505")) throw new CustomBadRequestException("Userid is already in use");
       throw error;
     }
     return this.getInvite(inviteId);

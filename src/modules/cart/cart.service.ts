@@ -4,6 +4,7 @@ import { CustomBadRequestException, CustomNotFoundException } from "src/common/e
 import { Database, DRIZZLE } from "src/modules/database/database.module";
 import { activityEvents, brands, cartItems, carts, productSkus, products } from "src/modules/database/schema";
 import { CartErrorMessage, getInsufficientStockMessage } from "./cart.error";
+import { assertCartItemCount, calculateCartTotal, MAX_CART_ITEMS } from "./cart-invariants";
 import { CartType, UpsertCartItemInput } from "./cart.types";
 
 @Injectable()
@@ -18,7 +19,9 @@ export class CartService {
       .innerJoin(productSkus, eq(cartItems.skuId, productSkus.skuId))
       .innerJoin(products, eq(productSkus.productId, products.productId))
       .leftJoin(brands, eq(products.brandId, brands.brandId))
-      .where(eq(cartItems.cartId, cart.cartId));
+      .where(eq(cartItems.cartId, cart.cartId))
+      .limit(MAX_CART_ITEMS + 1);
+    assertCartItemCount(rows.length);
     const items = rows.map(({ brands: brand, cartItems: item, productSkus: sku, products: product }) => ({
       ...item,
       sku,
@@ -31,7 +34,7 @@ export class CartService {
     return {
       cartId: cart.cartId,
       items,
-      totalAmount: items.reduce((sum, item) => sum + item.sku.price * item.quantity, 0),
+      totalAmount: calculateCartTotal(items.map((item) => ({ price: item.sku.price, quantity: item.quantity }))),
     };
   };
 
@@ -47,34 +50,65 @@ export class CartService {
     if (row.products.status !== "PUBLISHED") throw new CustomBadRequestException(CartErrorMessage.ProductUnavailable);
     if (row.productSkus.stock < input.quantity)
       throw new CustomBadRequestException(getInsufficientStockMessage(row.productSkus.code));
-    const cart = await this.getOrCreateCart(userId);
-    await this.db
-      .insert(cartItems)
-      .values({ cartId: cart.cartId, skuId: input.skuId, quantity: input.quantity })
-      .onConflictDoUpdate({
-        target: [cartItems.cartId, cartItems.skuId],
-        set: { quantity: input.quantity, updatedAt: new Date() },
+    await this.db.transaction(async (tx) => {
+      const cart = await this.getOrCreateLockedCart(tx, userId);
+      const currentItems = await tx
+        .select({ skuId: cartItems.skuId, quantity: cartItems.quantity, price: productSkus.price })
+        .from(cartItems)
+        .innerJoin(productSkus, eq(cartItems.skuId, productSkus.skuId))
+        .where(eq(cartItems.cartId, cart.cartId))
+        .limit(MAX_CART_ITEMS + 1);
+      assertCartItemCount(currentItems.length);
+      const existingItem = currentItems.find((item) => item.skuId === input.skuId);
+      if (!existingItem) assertCartItemCount(currentItems.length + 1);
+      calculateCartTotal(
+        existingItem
+          ? currentItems.map((item) =>
+              item.skuId === input.skuId ? { price: item.price, quantity: input.quantity } : item,
+            )
+          : [...currentItems, { price: row.productSkus.price, quantity: input.quantity }],
+      );
+      await tx
+        .insert(cartItems)
+        .values({ cartId: cart.cartId, skuId: input.skuId, quantity: input.quantity })
+        .onConflictDoUpdate({
+          target: [cartItems.cartId, cartItems.skuId],
+          set: { quantity: input.quantity, updatedAt: new Date() },
+        });
+      await tx.insert(activityEvents).values({
+        actorUserId: userId,
+        eventType: "CART_ITEM_UPSERTED",
+        subjectType: "SKU",
+        subjectId: input.skuId,
+        payload: { quantity: input.quantity },
       });
-    await this.db.insert(activityEvents).values({
-      actorUserId: userId,
-      eventType: "CART_ITEM_UPSERTED",
-      subjectType: "SKU",
-      subjectId: input.skuId,
-      payload: { quantity: input.quantity },
     });
     return this.getCart(userId);
   };
 
   removeItem = async (userId: string, skuId: string) => {
-    const cart = await this.getOrCreateCart(userId);
-    await this.db.delete(cartItems).where(and(eq(cartItems.cartId, cart.cartId), eq(cartItems.skuId, skuId)));
-    await this.db.insert(activityEvents).values({
-      actorUserId: userId,
-      eventType: "CART_ITEM_REMOVED",
-      subjectType: "SKU",
-      subjectId: skuId,
+    await this.db.transaction(async (tx) => {
+      const cart = await this.getOrCreateLockedCart(tx, userId);
+      const [removed] = await tx
+        .delete(cartItems)
+        .where(and(eq(cartItems.cartId, cart.cartId), eq(cartItems.skuId, skuId)))
+        .returning({ skuId: cartItems.skuId });
+      if (!removed) return;
+      await tx.insert(activityEvents).values({
+        actorUserId: userId,
+        eventType: "CART_ITEM_REMOVED",
+        subjectType: "SKU",
+        subjectId: skuId,
+      });
     });
     return this.getCart(userId);
+  };
+
+  private getOrCreateLockedCart = async (tx: Pick<Database, "insert" | "select">, userId: string) => {
+    await tx.insert(carts).values({ userId }).onConflictDoNothing();
+    const [cart] = await tx.select().from(carts).where(eq(carts.userId, userId)).limit(1).for("update");
+    if (!cart) throw new Error(CartErrorMessage.CartCreationFailed);
+    return cart;
   };
 
   private getOrCreateCart = async (userId: string) => {

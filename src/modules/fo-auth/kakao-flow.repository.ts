@@ -1,6 +1,9 @@
 import { Inject, Injectable } from "@nestjs/common";
-import { and, eq, gt, isNull } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, isNull, ne, sql } from "drizzle-orm";
+import { hasBuyerCapability } from "src/auth/role";
 import { hashToken } from "src/common/security/token-hash";
+import type { RefreshTokenStore } from "src/modules/auth/auth.repository";
+import type { TokenPayload } from "src/modules/auth/auth.types";
 import { Database, DRIZZLE } from "src/modules/database/database.module";
 import {
   authIdentities,
@@ -11,6 +14,7 @@ import {
   userConsentAcceptances,
   users,
   verifiedIdentities,
+  type User,
 } from "src/modules/database/schema";
 import type { KakaoProfile } from "src/modules/auth/auth.types";
 import type { ConsentAcceptanceInput } from "./fo-auth.types";
@@ -28,14 +32,68 @@ type KakaoSignupInput = {
   readonly consents: readonly ConsentAcceptanceInput[];
 };
 
+type IssueTokens = (user: User, store: RefreshTokenStore) => Promise<TokenPayload>;
+
 @Injectable()
 export class KakaoFlowRepository {
   constructor(@Inject(DRIZZLE) private readonly db: Database) {}
 
-  createFlow = async (deviceIdHash: string, expiresAt: Date) =>
-    (await this.db.insert(kakaoLoginFlows).values({ deviceIdHash, expiresAt }).returning())[0];
+  createFlow = (deviceIdHash: string, expiresAt: Date) =>
+    this.db.transaction(async (tx) => {
+      const now = new Date();
+      await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${deviceIdHash}, 3))`);
+      const [existing] = await tx
+        .select()
+        .from(kakaoLoginFlows)
+        .where(
+          and(
+            eq(kakaoLoginFlows.deviceIdHash, deviceIdHash),
+            eq(kakaoLoginFlows.status, "PENDING"),
+            isNull(kakaoLoginFlows.consumedAt),
+            gt(kakaoLoginFlows.expiresAt, now),
+          ),
+        )
+        .orderBy(desc(kakaoLoginFlows.createdAt))
+        .limit(1);
+      if (existing) return existing;
+      await tx.execute(sql`
+        WITH expired_candidates AS MATERIALIZED (
+          SELECT "flowId"
+          FROM "kakaoLoginFlows"
+          WHERE "expiresAt" <= ${now}
+          ORDER BY "expiresAt", "flowId"
+          FOR UPDATE SKIP LOCKED
+          LIMIT 100
+        ), consumed_candidates AS MATERIALIZED (
+          SELECT "flowId"
+          FROM "kakaoLoginFlows"
+          WHERE "consumedAt" IS NOT NULL
+            AND NOT EXISTS (
+              SELECT 1
+              FROM expired_candidates
+              WHERE expired_candidates."flowId" = "kakaoLoginFlows"."flowId"
+            )
+          ORDER BY "consumedAt", "flowId"
+          FOR UPDATE SKIP LOCKED
+          LIMIT (SELECT 100 - count(*) FROM expired_candidates)
+        ), cleanup_candidates AS (
+          SELECT "flowId" FROM expired_candidates
+          UNION ALL
+          SELECT "flowId" FROM consumed_candidates
+        )
+        DELETE FROM "kakaoLoginFlows"
+        USING cleanup_candidates
+        WHERE "kakaoLoginFlows"."flowId" = cleanup_candidates."flowId"
+      `);
+      return (await tx.insert(kakaoLoginFlows).values({ deviceIdHash, expiresAt }).returning())[0];
+    });
 
-  acceptCallback = async (flowId: string, profile: KakaoProfile, email?: string) => {
+  acceptCallback = async (
+    flowId: string,
+    profile: KakaoProfile,
+    email: string | undefined,
+    callbackTokenHash: string,
+  ) => {
     const [existing] = await this.db
       .select({ userId: users.userId })
       .from(authIdentities)
@@ -51,6 +109,7 @@ export class KakaoFlowRepository {
           emailVerified: profile.emailVerified,
           userId: existing?.userId,
           status: existing ? "EXISTING_USER" : "SIGNUP_REQUIRED",
+          callbackTokenHash,
           callbackAt: new Date(),
           updatedAt: new Date(),
         })
@@ -66,25 +125,45 @@ export class KakaoFlowRepository {
     )[0];
   };
 
-  completeLoginFlow = (flowId: string, deviceIdHash: string, signupToken: string) =>
+  completeLoginFlow = (
+    flowId: string,
+    deviceIdHash: string,
+    callbackToken: string,
+    signupToken: string,
+    issueTokens: IssueTokens,
+  ) =>
     this.db.transaction(async (tx) => {
-      const flow = await tx.query.kakaoLoginFlows.findFirst({
-        where: and(
-          eq(kakaoLoginFlows.flowId, flowId),
-          eq(kakaoLoginFlows.deviceIdHash, deviceIdHash),
-          isNull(kakaoLoginFlows.consumedAt),
-          gt(kakaoLoginFlows.expiresAt, new Date()),
-        ),
-      });
+      const now = new Date();
+      await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${deviceIdHash}, 0))`);
+      const [flow] = await tx
+        .update(kakaoLoginFlows)
+        .set({ callbackTokenHash: null, consumedAt: now, updatedAt: now })
+        .where(
+          and(
+            eq(kakaoLoginFlows.flowId, flowId),
+            eq(kakaoLoginFlows.deviceIdHash, deviceIdHash),
+            eq(kakaoLoginFlows.callbackTokenHash, hashToken(callbackToken)),
+            inArray(kakaoLoginFlows.status, ["EXISTING_USER", "SIGNUP_REQUIRED"]),
+            isNull(kakaoLoginFlows.consumedAt),
+            gt(kakaoLoginFlows.expiresAt, now),
+          ),
+        )
+        .returning();
       if (!flow?.providerUserId) throw new InvalidFoAuthProofError();
+      await tx
+        .update(kakaoLoginFlows)
+        .set({ consumedAt: now, updatedAt: now })
+        .where(
+          and(
+            eq(kakaoLoginFlows.deviceIdHash, deviceIdHash),
+            ne(kakaoLoginFlows.flowId, flowId),
+            isNull(kakaoLoginFlows.consumedAt),
+          ),
+        );
       if (flow.status === "EXISTING_USER" && flow.userId) {
         const user = await tx.query.users.findFirst({ where: eq(users.userId, flow.userId) });
         if (!user) throw new InvalidFoAuthProofError();
-        await tx
-          .update(kakaoLoginFlows)
-          .set({ consumedAt: new Date(), updatedAt: new Date() })
-          .where(eq(kakaoLoginFlows.flowId, flowId));
-        return { kind: "existing" as const, user };
+        return { kind: "existing" as const, tokenPayload: await issueTokens(user, tx) };
       }
       if (flow.status !== "SIGNUP_REQUIRED") throw new InvalidFoAuthProofError();
       await tx.insert(kakaoSignupTokens).values({
@@ -95,10 +174,6 @@ export class KakaoFlowRepository {
         deviceIdHash,
         expiresAt: new Date(Date.now() + 15 * 60 * 1000),
       });
-      await tx
-        .update(kakaoLoginFlows)
-        .set({ consumedAt: new Date(), updatedAt: new Date() })
-        .where(eq(kakaoLoginFlows.flowId, flowId));
       return {
         kind: "signup" as const,
         email: flow.email ?? undefined,
@@ -106,42 +181,69 @@ export class KakaoFlowRepository {
       };
     });
 
-  completeSignup = (input: KakaoSignupInput) =>
+  completeSignup = (input: KakaoSignupInput, issueTokens: IssueTokens) =>
     this.db.transaction(async (tx) => {
-      const signup = await tx.query.kakaoSignupTokens.findFirst({
-        where: and(
-          eq(kakaoSignupTokens.tokenHash, hashToken(input.kakaoSignupToken)),
-          eq(kakaoSignupTokens.deviceIdHash, input.deviceIdHash),
-          isNull(kakaoSignupTokens.usedAt),
-          gt(kakaoSignupTokens.expiresAt, new Date()),
-        ),
-      });
+      const now = new Date();
+      await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${input.deviceIdHash}, 0))`);
+      const [signup] = await tx
+        .update(kakaoSignupTokens)
+        .set({ usedAt: now })
+        .where(
+          and(
+            eq(kakaoSignupTokens.tokenHash, hashToken(input.kakaoSignupToken)),
+            eq(kakaoSignupTokens.deviceIdHash, input.deviceIdHash),
+            isNull(kakaoSignupTokens.usedAt),
+            gt(kakaoSignupTokens.expiresAt, now),
+          ),
+        )
+        .returning();
       if (!signup) throw new InvalidFoAuthProofError();
-      const identity = await tx.query.identityVerificationSessions.findFirst({
-        where: and(
-          eq(identityVerificationSessions.proofTokenHash, hashToken(input.identityVerificationToken)),
-          eq(identityVerificationSessions.purpose, "SIGNUP"),
-          eq(identityVerificationSessions.deviceIdHash, input.deviceIdHash),
-          eq(identityVerificationSessions.status, "VERIFIED"),
-          eq(identityVerificationSessions.isFourteenOrOlder, true),
-          isNull(identityVerificationSessions.consumedAt),
-          gt(identityVerificationSessions.expiresAt, new Date()),
-        ),
-      });
+      await tx
+        .update(kakaoSignupTokens)
+        .set({ usedAt: now })
+        .where(
+          and(
+            eq(kakaoSignupTokens.deviceIdHash, input.deviceIdHash),
+            ne(kakaoSignupTokens.tokenHash, signup.tokenHash),
+            isNull(kakaoSignupTokens.usedAt),
+          ),
+        );
+      const [identity] = await tx
+        .update(identityVerificationSessions)
+        .set({ consumedAt: now, updatedAt: now })
+        .where(
+          and(
+            eq(identityVerificationSessions.proofTokenHash, hashToken(input.identityVerificationToken)),
+            eq(identityVerificationSessions.purpose, "SIGNUP"),
+            eq(identityVerificationSessions.deviceIdHash, input.deviceIdHash),
+            eq(identityVerificationSessions.status, "VERIFIED"),
+            eq(identityVerificationSessions.isFourteenOrOlder, true),
+            isNull(identityVerificationSessions.consumedAt),
+            gt(identityVerificationSessions.expiresAt, now),
+          ),
+        )
+        .returning();
       if (!identity?.ciHash || !identity.certificateProvider) throw new InvalidFoAuthProofError();
+      await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${identity.ciHash}, 1))`);
       const email = signup.emailVerified ? signup.email : input.email;
       if (!email) throw new InvalidFoAuthProofError();
       const emailProof = signup.emailVerified
         ? undefined
-        : await tx.query.emailVerificationTokens.findFirst({
-            where: and(
-              eq(emailVerificationTokens.tokenHash, hashToken(input.emailVerificationToken ?? "")),
-              eq(emailVerificationTokens.email, email),
-              eq(emailVerificationTokens.purpose, "SIGNUP"),
-              isNull(emailVerificationTokens.usedAt),
-              gt(emailVerificationTokens.expiresAt, new Date()),
-            ),
-          });
+        : (
+            await tx
+              .update(emailVerificationTokens)
+              .set({ usedAt: now })
+              .where(
+                and(
+                  eq(emailVerificationTokens.tokenHash, hashToken(input.emailVerificationToken ?? "")),
+                  eq(emailVerificationTokens.email, email),
+                  eq(emailVerificationTokens.purpose, "SIGNUP"),
+                  isNull(emailVerificationTokens.usedAt),
+                  gt(emailVerificationTokens.expiresAt, now),
+                ),
+              )
+              .returning()
+          )[0];
       if (!signup.emailVerified && !emailProof) throw new InvalidFoAuthProofError();
       const [existing] = await tx
         .select({ user: users })
@@ -164,7 +266,7 @@ export class KakaoFlowRepository {
             .returning()
         )[0];
       if (!user) throw new InvalidFoAuthProofError();
-      if (user.role !== "USER") throw new InvalidFoAuthProofError();
+      if (!hasBuyerCapability(user.role)) throw new InvalidFoAuthProofError();
       const linkedIdentity = await tx.query.authIdentities.findFirst({
         where: and(eq(authIdentities.provider, "kakao"), eq(authIdentities.providerUserId, signup.providerUserId)),
       });
@@ -177,10 +279,14 @@ export class KakaoFlowRepository {
           verifiedAt: identity.verifiedAt ?? new Date(),
         });
       }
-      await tx
-        .insert(authIdentities)
-        .values({ userId: user.userId, provider: "kakao", providerUserId: signup.providerUserId })
-        .onConflictDoNothing({ target: [authIdentities.provider, authIdentities.providerUserId] });
+      if (!linkedIdentity) {
+        const [createdIdentity] = await tx
+          .insert(authIdentities)
+          .values({ userId: user.userId, provider: "kakao", providerUserId: signup.providerUserId })
+          .onConflictDoNothing({ target: [authIdentities.provider, authIdentities.providerUserId] })
+          .returning({ userId: authIdentities.userId });
+        if (!createdIdentity) throw new InvalidFoAuthProofError();
+      }
       for (const consent of input.consents) {
         const agreedAt = consent.agreed ? new Date() : null;
         await tx
@@ -191,20 +297,6 @@ export class KakaoFlowRepository {
             set: { agreed: consent.agreed, agreedAt, recordedAt: new Date() },
           });
       }
-      await tx
-        .update(kakaoSignupTokens)
-        .set({ usedAt: new Date() })
-        .where(eq(kakaoSignupTokens.tokenHash, signup.tokenHash));
-      await tx
-        .update(identityVerificationSessions)
-        .set({ consumedAt: new Date(), updatedAt: new Date() })
-        .where(eq(identityVerificationSessions.sessionId, identity.sessionId));
-      if (emailProof) {
-        await tx
-          .update(emailVerificationTokens)
-          .set({ usedAt: new Date() })
-          .where(eq(emailVerificationTokens.tokenHash, emailProof.tokenHash));
-      }
-      return user;
+      return issueTokens(user, tx);
     });
 }

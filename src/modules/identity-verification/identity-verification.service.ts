@@ -3,6 +3,7 @@ import { ConfigService } from "@nestjs/config";
 import { createHmac, randomBytes } from "crypto";
 import { CustomBadRequestException, CustomUnauthorizedException } from "src/common/errors/custom-exceptions";
 import { hashToken } from "src/common/security/token-hash";
+import { AdmissionLimiter, type RequestOrigin } from "src/modules/admission/admission-limiter";
 import { InicisIdentityAdapter } from "./inicis-identity.adapter";
 import { IdentityVerificationRepository } from "./identity-verification.repository";
 import {
@@ -19,9 +20,18 @@ export class IdentityVerificationService {
     private readonly repository: IdentityVerificationRepository,
     private readonly adapter: InicisIdentityAdapter,
     private readonly configService: ConfigService,
+    private readonly admissionLimiter: AdmissionLimiter,
   ) {}
 
-  start = async (input: StartIdentityVerificationInput, deviceId: string) => {
+  start = async (input: StartIdentityVerificationInput, deviceId: string, origin: RequestOrigin) => {
+    await this.admissionLimiter.assertAllowed(
+      "IDENTITY_VERIFICATION_START",
+      [
+        { scopeType: "start-ip", value: origin.ip, limit: 20, windowMs: 15 * 60_000 },
+        { scopeType: "start-device", value: deviceId, limit: 20, windowMs: 15 * 60_000 },
+      ],
+      "본인인증 요청 횟수를 초과했습니다.",
+    );
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
     const session = await this.repository.createSession({
       purpose: input.purpose,
@@ -37,7 +47,7 @@ export class IdentityVerificationService {
     return {
       sessionId: session.sessionId,
       launchUrl: `${apiBaseUrl}/api/auth/identity/inicis/start/${session.sessionId}`,
-      expiresAt,
+      expiresAt: session.expiresAt,
     };
   };
 
@@ -50,9 +60,9 @@ export class IdentityVerificationService {
     return { sessionId, status, expiresAt: session.expiresAt };
   };
 
-  complete = async (sessionId: string, deviceId: string) => {
+  complete = async (sessionId: string, deviceId: string, callbackToken: string) => {
     const token = randomBytes(32).toString("base64url");
-    const completed = await this.repository.completeSession(sessionId, hashToken(deviceId), token);
+    const completed = await this.repository.completeSession(sessionId, hashToken(deviceId), callbackToken, token);
     if (!completed) throw new CustomUnauthorizedException("본인인증 완료 상태가 유효하지 않습니다.");
     return { identityVerificationToken: token };
   };
@@ -62,13 +72,15 @@ export class IdentityVerificationService {
     if (!session || session.status !== "PENDING" || session.expiresAt.getTime() <= Date.now())
       throw new CustomUnauthorizedException("본인인증 세션이 유효하지 않습니다.");
     if (this.isMockEnabled()) {
+      const callbackToken = randomBytes(32).toString("base64url");
       await this.repository.markVerified({
         sessionId,
         ciHash: this.hashCi(`local-ci-${session.deviceIdHash}`),
         certificateProvider: session.provider,
         isFourteenOrOlder: true,
+        callbackTokenHash: hashToken(callbackToken),
       });
-      return { kind: "mock" as const };
+      return { kind: "mock" as const, callbackToken };
     }
     return {
       kind: "inicis" as const,
@@ -83,7 +95,6 @@ export class IdentityVerificationService {
   callback = async (sessionId: string, input: InicisCallbackInput) => {
     const session = await this.repository.findSession(sessionId);
     if (!session) throw new CustomUnauthorizedException("본인인증 세션이 유효하지 않습니다.");
-    if (session.status === "VERIFIED") return session;
     if (session.status !== "PENDING" || session.expiresAt.getTime() <= Date.now())
       throw new CustomUnauthorizedException("본인인증 세션이 유효하지 않습니다.");
     try {
@@ -95,14 +106,16 @@ export class IdentityVerificationService {
         },
         input,
       );
+      const callbackToken = randomBytes(32).toString("base64url");
       const verified = await this.repository.markVerified({
         sessionId,
         ciHash: this.hashCi(result.ci),
         certificateProvider: result.certificateProvider,
         isFourteenOrOlder: this.isFourteenOrOlder(result.birthday),
+        callbackTokenHash: hashToken(callbackToken),
       });
       if (!verified) throw new CustomUnauthorizedException("본인인증 결과를 저장하지 못했습니다.");
-      return verified;
+      return { callbackToken };
     } catch (error) {
       await this.repository.markFailed(sessionId, input.resultCode || "INVALID_RESULT");
       throw error;
@@ -125,10 +138,14 @@ export class IdentityVerificationService {
 
   private isFourteenOrOlder = (birthday: string) => {
     if (!/^\d{8}$/u.test(birthday)) return false;
-    const birthDate = new Date(`${birthday.slice(0, 4)}-${birthday.slice(4, 6)}-${birthday.slice(6, 8)}T00:00:00Z`);
-    const threshold = new Date();
-    threshold.setUTCFullYear(threshold.getUTCFullYear() - 14);
-    return birthDate.getTime() <= threshold.getTime();
+    const year = Number(birthday.slice(0, 4));
+    const month = Number(birthday.slice(4, 6));
+    const day = Number(birthday.slice(6, 8));
+    const birthDate = new Date(Date.UTC(year, month - 1, day));
+    if (birthDate.getUTCFullYear() !== year || birthDate.getUTCMonth() !== month - 1 || birthDate.getUTCDate() !== day)
+      return false;
+    const today = new Date();
+    return birthDate.getTime() <= Date.UTC(today.getUTCFullYear() - 14, today.getUTCMonth(), today.getUTCDate());
   };
 
   private isMockEnabled = () =>

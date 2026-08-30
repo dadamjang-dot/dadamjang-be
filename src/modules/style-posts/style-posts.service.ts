@@ -2,7 +2,9 @@ import { Inject, Injectable } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { createHmac, timingSafeEqual } from "crypto";
 import { and, asc, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
+import { hasDatabaseErrorCode } from "src/common/errors/database-error";
 import { CustomBadRequestException, CustomNotFoundException } from "src/common/errors/custom-exceptions";
+import { requireResult } from "src/common/invariants/require-result";
 import { Database, DRIZZLE } from "src/modules/database/database.module";
 import {
   brands,
@@ -15,6 +17,7 @@ import {
   users,
 } from "src/modules/database/schema";
 import { MediaService } from "src/modules/media/media.service";
+import { IMAGE_SUMMARY_WIDTH } from "src/modules/media/media.constant";
 import { MAX_PAGE_SIZE } from "./style-posts.constant";
 import { StylePostErrorMessage } from "./style-posts.error";
 import {
@@ -31,10 +34,12 @@ import {
 } from "./style-posts.types";
 
 const PURCHASED_ORDER_STATUSES = ["PAID", "FULFILLING", "COMPLETED"] as const;
+const MAX_LEGACY_COLLECTION_SIZE = 100;
 const STYLE_POST_CATEGORIES = new Set<string>(Object.values(StylePostCategory));
 const STYLE_POST_SORTS = new Set<string>(Object.values(StylePostSort));
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const STYLE_POST_ID_REFERENCE = sql.raw('"stylePosts"."stylePostId"');
+const ANONYMOUS_RANKING_TIMEOUT = "5000ms";
 
 type StylePostCursor = {
   category: StylePostCategory | null;
@@ -135,9 +140,6 @@ const decodeLikedStylePostCursor = (value: string, secret: string): LikedStylePo
 
 const unique = (values: string[]) => [...new Set(values)];
 
-const isDuplicateError = (error: unknown) =>
-  typeof error === "object" && error !== null && "code" in error && error.code === "23505";
-
 @Injectable()
 export class StylePostsService {
   constructor(
@@ -183,7 +185,7 @@ export class StylePostsService {
     if (hashtags.some((tag) => !/^[가-힣A-Za-z0-9_]{1,20}$/.test(tag)))
       throw new CustomBadRequestException(StylePostErrorMessage.InvalidHashtag);
 
-    const purchasedProducts = await this.getPurchasedProductRows(authorId);
+    const purchasedProducts = await this.getPurchasedProductRows(authorId, productIds);
     const purchasedById = new Map(purchasedProducts.map((product) => [product.productId, product]));
     if (productIds.some((productId) => !purchasedById.has(productId)))
       throw new CustomBadRequestException(StylePostErrorMessage.ProductNotPurchased);
@@ -197,32 +199,38 @@ export class StylePostsService {
     if (brandTagIds.some((brandId) => !purchasedBrandIds.has(brandId)))
       throw new CustomBadRequestException(StylePostErrorMessage.BrandTagNotPurchased);
 
-    const imageUrls = imageKeys.map((key) => this.mediaService.getStylePostImageUrl(key));
+    const attachedImageKeys = await this.mediaService.validateStylePostImageObjects(imageKeys, authorId);
+    const imageUrls = attachedImageKeys.map((key) => this.mediaService.getStylePostImageUrl(key));
     try {
       const post = await this.db.transaction(async (tx) => {
-        const [created] = await tx
-          .insert(stylePosts)
-          .values({
-            authorId,
-            title: content.slice(0, 200),
-            content,
-            imageUrls,
-            category: input.category,
-            hashtags,
-            brandTagIds,
-            imageKeys,
-            idempotencyKey,
-            isPartner,
-          })
-          .returning();
+        const created = requireResult(
+          (
+            await tx
+              .insert(stylePosts)
+              .values({
+                authorId,
+                title: content.slice(0, 200),
+                content,
+                imageUrls,
+                category: input.category,
+                hashtags,
+                brandTagIds,
+                imageKeys: attachedImageKeys,
+                idempotencyKey,
+                isPartner,
+              })
+              .returning()
+          )[0],
+        );
         await tx
           .insert(stylePostProducts)
           .values(productIds.map((productId) => ({ stylePostId: created.stylePostId, productId })));
+        await this.mediaService.replaceImageReferences(tx, "STYLE_POST", created.stylePostId, attachedImageKeys);
         return created;
       });
       return this.get(post.stylePostId, authorId);
     } catch (error) {
-      if (!isDuplicateError(error)) throw error;
+      if (!hasDatabaseErrorCode(error, "23505")) throw error;
       const [duplicate] = await this.db
         .select()
         .from(stylePosts)
@@ -237,8 +245,7 @@ export class StylePostsService {
     if (!UUID_PATTERN.test(stylePostId)) throw new CustomBadRequestException(StylePostErrorMessage.InvalidStylePostId);
     const [post] = await this.db.select().from(stylePosts).where(eq(stylePosts.stylePostId, stylePostId)).limit(1);
     if (!post) throw new CustomNotFoundException(StylePostErrorMessage.NotFound);
-    const [result] = await this.hydrate([post], viewerId);
-    return result;
+    return requireResult((await this.hydrate([post], viewerId))[0]);
   };
 
   list = async (
@@ -306,12 +313,18 @@ export class StylePostsService {
               ),
             )
         : undefined;
-    const pageKeys = await this.db
-      .select({ stylePostId: stylePosts.stylePostId, createdAt: stylePosts.createdAt, sortValue })
-      .from(stylePosts)
-      .where(and(categoryCondition, snapshotCondition, cursorCondition))
-      .orderBy(desc(sortValue), desc(stylePosts.createdAt), desc(stylePosts.stylePostId))
-      .limit(pageSize + 1);
+    const pageKeys = await this.db.transaction(
+      async (tx) => {
+        await tx.execute(sql`select set_config('statement_timeout', ${ANONYMOUS_RANKING_TIMEOUT}, true)`);
+        return tx
+          .select({ stylePostId: stylePosts.stylePostId, createdAt: stylePosts.createdAt, sortValue })
+          .from(stylePosts)
+          .where(and(categoryCondition, snapshotCondition, cursorCondition))
+          .orderBy(desc(sortValue), desc(stylePosts.createdAt), desc(stylePosts.stylePostId))
+          .limit(pageSize + 1);
+      },
+      { accessMode: "read only" },
+    );
     const rowIds = pageKeys.map(({ stylePostId }) => stylePostId);
     const rows = rowIds.length
       ? await this.db.select().from(stylePosts).where(inArray(stylePosts.stylePostId, rowIds))
@@ -322,7 +335,7 @@ export class StylePostsService {
     const pageRows = pageKeysForPage
       .map(({ stylePostId }) => rowsById.get(stylePostId))
       .filter((row): row is typeof stylePosts.$inferSelect => Boolean(row));
-    const posts = await this.hydrate(pageRows, viewerId);
+    const posts = await this.hydrate(pageRows, viewerId, IMAGE_SUMMARY_WIDTH);
     const hasNextPage = visibleKeys.length > pageSize;
     const tail = pageKeysForPage[pageKeysForPage.length - 1];
     return {
@@ -401,7 +414,7 @@ export class StylePostsService {
     const tail = visibleKeys[visibleKeys.length - 1];
     const hasNextPage = pageKeys.length > pageSize;
     return {
-      nodes: await this.hydrate(pageRows, userId),
+      nodes: await this.hydrate(pageRows, userId, IMAGE_SUMMARY_WIDTH),
       hasNextPage,
       nextCursor:
         hasNextPage && tail
@@ -419,27 +432,47 @@ export class StylePostsService {
   };
 
   like = async (stylePostId: string, userId: string) => {
-    await this.get(stylePostId);
-    await this.db.insert(stylePostLikes).values({ stylePostId, userId }).onConflictDoNothing();
+    await this.setLikeState(stylePostId, userId, true);
     return this.get(stylePostId, userId);
   };
 
   unlike = async (stylePostId: string, userId: string) => {
-    await this.get(stylePostId);
-    await this.db
-      .update(stylePostLikes)
-      .set({ deletedAt: new Date() })
-      .where(
-        and(
-          eq(stylePostLikes.stylePostId, stylePostId),
-          eq(stylePostLikes.userId, userId),
-          isNull(stylePostLikes.deletedAt),
-        ),
-      );
+    await this.setLikeState(stylePostId, userId, false);
     return this.get(stylePostId, userId);
   };
 
-  private getPurchasedProductRows = async (userId: string): Promise<PurchasedStyleProductRow[]> => {
+  private setLikeState = async (stylePostId: string, userId: string, liked: boolean) => {
+    if (!UUID_PATTERN.test(stylePostId)) throw new CustomBadRequestException(StylePostErrorMessage.InvalidStylePostId);
+    await this.db.transaction(async (tx) => {
+      await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${`${stylePostId}:${userId}`}, 5))`);
+      const [post] = await tx
+        .select({ stylePostId: stylePosts.stylePostId })
+        .from(stylePosts)
+        .where(eq(stylePosts.stylePostId, stylePostId))
+        .limit(1);
+      if (!post) throw new CustomNotFoundException(StylePostErrorMessage.NotFound);
+      if (liked) {
+        await tx.insert(stylePostLikes).values({ stylePostId, userId }).onConflictDoNothing();
+        return;
+      }
+      await tx
+        .update(stylePostLikes)
+        .set({ deletedAt: new Date() })
+        .where(
+          and(
+            eq(stylePostLikes.stylePostId, stylePostId),
+            eq(stylePostLikes.userId, userId),
+            isNull(stylePostLikes.deletedAt),
+          ),
+        );
+    });
+  };
+
+  private getPurchasedProductRows = async (
+    userId: string,
+    productIds?: string[],
+  ): Promise<PurchasedStyleProductRow[]> => {
+    const lastPurchasedAt = sql<Date>`max(${orders.createdAt})`.mapWith(orders.createdAt);
     const rows = await this.db
       .select({
         productId: products.productId,
@@ -448,22 +481,30 @@ export class StylePostsService {
         brandId: brands.brandId,
         brandName: brands.name,
         categoryId: products.categoryId,
-        lastPurchasedAt: orders.createdAt,
+        lastPurchasedAt,
       })
       .from(orderItems)
       .innerJoin(orders, eq(orderItems.orderId, orders.orderId))
       .innerJoin(products, eq(orderItems.productId, products.productId))
       .leftJoin(brands, eq(products.brandId, brands.brandId))
-      .where(and(eq(orders.userId, userId), inArray(orders.status, [...PURCHASED_ORDER_STATUSES])))
-      .orderBy(desc(orders.createdAt));
-    const latest = new Map<string, PurchasedStyleProductRow>();
-    for (const row of rows) {
-      if (!latest.has(row.productId)) latest.set(row.productId, row);
-    }
-    return [...latest.values()];
+      .where(
+        and(
+          eq(orders.userId, userId),
+          inArray(orders.status, [...PURCHASED_ORDER_STATUSES]),
+          productIds ? inArray(orderItems.productId, productIds) : undefined,
+        ),
+      )
+      .groupBy(products.productId, products.title, products.imageUrls, brands.brandId, brands.name, products.categoryId)
+      .orderBy(desc(lastPurchasedAt))
+      .limit(MAX_LEGACY_COLLECTION_SIZE);
+    return rows.slice(0, MAX_LEGACY_COLLECTION_SIZE);
   };
 
-  private hydrate = async (rows: (typeof stylePosts.$inferSelect)[], viewerId?: string): Promise<StylePostType[]> => {
+  private hydrate = async (
+    rows: (typeof stylePosts.$inferSelect)[],
+    viewerId?: string,
+    thumbnailWidth?: number,
+  ): Promise<StylePostType[]> => {
     if (rows.length === 0) return [];
     const postIds = rows.map((row) => row.stylePostId);
     const authorIds = unique(rows.map((row) => row.authorId));
@@ -540,7 +581,10 @@ export class StylePostsService {
         content: row.content,
         category: row.category as StylePostCategory,
         imageUrls,
-        thumbnailUrl: imageUrls[0] ?? null,
+        thumbnailUrl:
+          thumbnailWidth && row.imageKeys[0]
+            ? this.mediaService.getStylePostImageUrl(row.imageKeys[0], thumbnailWidth)
+            : (imageUrls[0] ?? null),
         hashtags: row.hashtags ?? [],
         brandTags,
         products: productsByPost.get(row.stylePostId) ?? [],

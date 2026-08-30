@@ -4,6 +4,8 @@ import request from "supertest";
 import { createApp } from "src/app";
 import { hashToken } from "src/common/security/token-hash";
 import { ADMIN_FIXTURE, FIXTURE, seedAdminFixtures } from "src/database/fixtures";
+import { EmailDeliveryWorker } from "src/modules/email/email.outbox";
+import type { EmailSender } from "src/modules/email/email.sender";
 import { resetTestFixtures, testPool } from "./support/database";
 
 type Agent = ReturnType<typeof request.agent>;
@@ -25,6 +27,21 @@ const adminToken = (agent: Agent) => signin(agent, "Bo", ADMIN_FIXTURE.userid, A
 const graphql = (app: INestApplication, token: string, query: string, variables?: Record<string, unknown>) =>
   request(app.getHttpServer()).post("/graphql").set("Authorization", `Bearer ${token}`).send({ query, variables });
 
+const waitForAdvisoryWaiters = async (pool: Pool, expected: number) => {
+  for (let attempt = 0; attempt < 500; attempt += 1) {
+    const result = await pool.query<{ count: number }>(
+      `SELECT count(*)::int AS count
+       FROM pg_stat_activity
+       WHERE datname = current_database()
+         AND pid <> pg_backend_pid()
+         AND wait_event = 'advisory'`,
+    );
+    if ((result.rows[0]?.count ?? 0) >= expected) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`Timed out waiting for ${expected} advisory lock waiters`);
+};
+
 describe("Admin GraphQL integration", () => {
   let app: INestApplication;
   let pool: Pool;
@@ -36,6 +53,7 @@ describe("Admin GraphQL integration", () => {
   });
 
   beforeEach(async () => {
+    jest.restoreAllMocks();
     await resetTestFixtures(pool);
     await seedAdminFixtures(pool);
   });
@@ -155,6 +173,109 @@ describe("Admin GraphQL integration", () => {
     expect(state.rows[0]).toEqual({ status: "APPROVED", role: "PARTNER", auditCount: 1 });
   });
 
+  it("preserves buyer and partner access after approval and token refresh", async () => {
+    const ownerDeviceId = "approved-partner-buyer";
+    const ownerSession = await request(app.getHttpServer())
+      .post("/graphql")
+      .set("x-device-id", ownerDeviceId)
+      .send({
+        query: `mutation Signin($input: SigninAuthInput!) {
+          signin(input: $input) { accessToken refreshToken role }
+        }`,
+        variables: {
+          input: {
+            userid: ADMIN_FIXTURE.partnerOwnerUserid,
+            password: ADMIN_FIXTURE.password,
+            portal: "Fo",
+          },
+        },
+      });
+    expect(ownerSession.body.errors).toBeUndefined();
+    const originalAccessToken = ownerSession.body.data.signin.accessToken as string;
+    const originalRefreshToken = ownerSession.body.data.signin.refreshToken as string;
+    const added = await graphql(
+      app,
+      originalAccessToken,
+      `mutation { upsertCartItem(input: { skuId: "${FIXTURE.skuId}", quantity: 1 }) { cartId } }`,
+    );
+    expect(added.body.errors).toBeUndefined();
+
+    const adminAccessToken = await adminToken(request.agent(app.getHttpServer()));
+    const approved = await graphql(
+      app,
+      adminAccessToken,
+      `
+        mutation Review($input: ReviewPartnerInput!) {
+          reviewPartner(input: $input) {
+            partnerId
+            status
+          }
+        }
+      `,
+      { input: { partnerId: ADMIN_FIXTURE.partnerId, approved: true } },
+    );
+    expect(approved.body.errors).toBeUndefined();
+
+    const refreshed = await request(app.getHttpServer())
+      .post("/graphql")
+      .set("Authorization", `Bearer ${originalRefreshToken}`)
+      .send({ query: `mutation { refresh { accessToken role } }` });
+    expect(refreshed.body.errors).toBeUndefined();
+    expect(refreshed.body.data.refresh.role).toBe("PARTNER");
+    const partnerAccessToken = refreshed.body.data.refresh.accessToken as string;
+    const buyerData = await graphql(
+      app,
+      partnerAccessToken,
+      `
+        {
+          cart {
+            items {
+              quantity
+            }
+          }
+          orders {
+            orderId
+          }
+          myPartnerDashboard {
+            draftCount
+          }
+        }
+      `,
+    );
+    expect(buyerData.body.errors).toBeUndefined();
+    expect(buyerData.body.data).toMatchObject({
+      cart: { items: [{ quantity: 1 }] },
+      orders: [],
+      myPartnerDashboard: { draftCount: 0 },
+    });
+
+    const signinFo = await request(app.getHttpServer())
+      .post("/graphql")
+      .set("x-device-id", "approved-partner-signin-fo")
+      .send({
+        query: `mutation SigninFo($input: SigninFoInput!) { signinFo(input: $input) { role } }`,
+        variables: { input: { email: ADMIN_FIXTURE.partnerOwnerEmail, password: ADMIN_FIXTURE.password } },
+      });
+    expect(signinFo.body.errors).toBeUndefined();
+    expect(signinFo.body.data.signinFo.role).toBe("PARTNER");
+
+    const legacyFoSignin = await request(app.getHttpServer())
+      .post("/graphql")
+      .set("x-device-id", "approved-partner-signin-legacy")
+      .send({
+        query: `mutation Signin($input: SigninAuthInput!) { signin(input: $input) { role } }`,
+        variables: {
+          input: {
+            userid: ADMIN_FIXTURE.partnerOwnerUserid,
+            password: ADMIN_FIXTURE.password,
+            portal: "Fo",
+          },
+        },
+      });
+    expect(legacyFoSignin.body.errors).toBeUndefined();
+    expect(legacyFoSignin.body.data.signin.role).toBe("PARTNER");
+  });
+
   it("reviews a product once and requires a bounded rejection reason", async () => {
     const token = await adminToken(request.agent(app.getHttpServer()));
     const mutation = `mutation Review($input: ReviewProductInput!) {
@@ -205,6 +326,81 @@ describe("Admin GraphQL integration", () => {
     expect(audit.rowCount).toBe(1);
   });
 
+  it("does not let an admin mark a payment-pending order as paid", async () => {
+    await pool.query(
+      `UPDATE "orders" SET status = 'PAYMENT_PENDING', "paymentStatus" = 'PENDING' WHERE "orderId" = $1`,
+      [ADMIN_FIXTURE.orderId],
+    );
+    const token = await adminToken(request.agent(app.getHttpServer()));
+    const mutation = `mutation Transition($input: TransitionOrderInput!) {
+      transitionOrder(input: $input) { orderId status paymentStatus }
+    }`;
+    const response = await graphql(app, token, mutation, {
+      input: { orderId: ADMIN_FIXTURE.orderId, nextStatus: "PAID" },
+    });
+    expect(response.body.errors[0].extensions.code).toBe("BAD_USER_INPUT");
+    const unknown = await graphql(app, token, mutation, {
+      input: { orderId: ADMIN_FIXTURE.orderId, nextStatus: "REFUNDED" },
+    });
+    expect(unknown.body.errors[0].extensions.code).toBe("BAD_USER_INPUT");
+    const order = await pool.query<{ paymentStatus: string; status: string }>(
+      `SELECT status, "paymentStatus" FROM "orders" WHERE "orderId" = $1`,
+      [ADMIN_FIXTURE.orderId],
+    );
+    expect(order.rows[0]).toEqual({ paymentStatus: "PENDING", status: "PAYMENT_PENDING" });
+  });
+
+  it.each([
+    {
+      nextStatus: "FAILED",
+      paymentStatus: "FAILED",
+      paymentFailureReason: "Payment marked failed by an administrator",
+    },
+    { nextStatus: "CANCELLED", paymentStatus: "CANCELLED", paymentFailureReason: null },
+  ])(
+    "atomically keeps a payment-pending order coherent when transitioning to $nextStatus",
+    async ({ nextStatus, paymentStatus, paymentFailureReason }) => {
+      await pool.query(
+        `UPDATE "orders" SET status = 'PAYMENT_PENDING', "paymentStatus" = 'PENDING' WHERE "orderId" = $1`,
+        [ADMIN_FIXTURE.orderId],
+      );
+      const token = await adminToken(request.agent(app.getHttpServer()));
+      const mutation = `mutation Transition($input: TransitionOrderInput!) {
+        transitionOrder(input: $input) {
+          orderId status paymentStatus paymentFailureReason auditLogs { metadataJson }
+        }
+      }`;
+      const response = await graphql(app, token, mutation, {
+        input: { orderId: ADMIN_FIXTURE.orderId, nextStatus },
+      });
+      expect(response.body.errors).toBeUndefined();
+      expect(response.body.data.transitionOrder).toMatchObject({
+        status: nextStatus,
+        paymentStatus,
+        paymentFailureReason,
+      });
+      const metadata = JSON.parse(response.body.data.transitionOrder.auditLogs[0].metadataJson) as Record<
+        string,
+        unknown
+      >;
+      expect(metadata).toMatchObject({
+        previousStatus: "PAYMENT_PENDING",
+        nextStatus,
+        previousPaymentStatus: "PENDING",
+        nextPaymentStatus: paymentStatus,
+        paymentFailureReason,
+      });
+      const order = await pool.query<{
+        paymentFailureReason: string | null;
+        paymentStatus: string;
+        status: string;
+      }>(`SELECT status, "paymentStatus", "paymentFailureReason" FROM "orders" WHERE "orderId" = $1`, [
+        ADMIN_FIXTURE.orderId,
+      ]);
+      expect(order.rows[0]).toEqual({ status: nextStatus, paymentStatus, paymentFailureReason });
+    },
+  );
+
   it("validates category hierarchy, uniqueness, and deactivation constraints", async () => {
     const token = await adminToken(request.agent(app.getHttpServer()));
     const createMutation = `mutation Create($input: CreateCategoryInput!) {
@@ -245,6 +441,73 @@ describe("Admin GraphQL integration", () => {
     expect(updated.body.data.updateCategory.sortOrder).toBe(7);
   });
 
+  it("serializes opposite category reparenting without persisting a cycle", async () => {
+    const firstCategoryId = "33000000-0000-4000-8000-000000000001";
+    const secondCategoryId = "33000000-0000-4000-8000-000000000002";
+    await pool.query(
+      `INSERT INTO categories ("categoryId", name, slug, "sortOrder") VALUES
+        ($1, 'Concurrent A', 'concurrent-a', 10),
+        ($2, 'Concurrent B', 'concurrent-b', 11)`,
+      [firstCategoryId, secondCategoryId],
+    );
+    const token = await adminToken(request.agent(app.getHttpServer()));
+    const mutation = `mutation Update($input: UpdateCategoryInput!) {
+      updateCategory(input: $input) { categoryId parentId }
+    }`;
+    const blocker = await pool.connect();
+    const requests: Promise<request.Response>[] = [];
+    let released = false;
+    try {
+      await pool.query(`
+        CREATE FUNCTION delay_test_category_reparent() RETURNS trigger AS $$
+        BEGIN
+          IF NEW."parentId" IS DISTINCT FROM OLD."parentId" THEN
+            PERFORM pg_advisory_xact_lock(91002, 1);
+          END IF;
+          RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql;
+        CREATE TRIGGER delay_test_category_reparent
+        BEFORE UPDATE ON categories
+        FOR EACH ROW EXECUTE FUNCTION delay_test_category_reparent();
+      `);
+      await blocker.query(`SELECT pg_advisory_lock(91002, 1)`);
+      const firstRequest = graphql(app, token, mutation, {
+        input: { categoryId: firstCategoryId, parentId: secondCategoryId },
+      }).then((response) => response);
+      requests.push(firstRequest);
+      await waitForAdvisoryWaiters(pool, 1);
+      const secondRequest = graphql(app, token, mutation, {
+        input: { categoryId: secondCategoryId, parentId: firstCategoryId },
+      }).then((response) => response);
+      requests.push(secondRequest);
+      await waitForAdvisoryWaiters(pool, 2);
+      await blocker.query(`SELECT pg_advisory_unlock(91002, 1)`);
+      released = true;
+      const responses = await Promise.all(requests);
+      expect(responses.filter(({ body }) => body.data?.updateCategory)).toHaveLength(1);
+      expect(
+        responses.filter(({ body }) => body.errors?.[0]?.message === "Category hierarchy cannot contain a cycle"),
+      ).toHaveLength(1);
+      const state = await pool.query<{ categoryId: string; parentId: string | null }>(
+        `SELECT "categoryId", "parentId" FROM categories WHERE "categoryId" IN ($1, $2) ORDER BY "categoryId"`,
+        [firstCategoryId, secondCategoryId],
+      );
+      const parentById = new Map(state.rows.map((row) => [row.categoryId, row.parentId]));
+      expect(
+        parentById.get(firstCategoryId) === secondCategoryId && parentById.get(secondCategoryId) === firstCategoryId,
+      ).toBe(false);
+    } finally {
+      if (!released) await blocker.query(`SELECT pg_advisory_unlock(91002, 1)`).catch(() => undefined);
+      await Promise.allSettled(requests);
+      blocker.release();
+      await pool.query(`
+        DROP TRIGGER IF EXISTS delay_test_category_reparent ON categories;
+        DROP FUNCTION IF EXISTS delay_test_category_reparent();
+      `);
+    }
+  });
+
   it("creates, revokes, expires, and consumes hash-only admin invites once", async () => {
     const token = await adminToken(request.agent(app.getHttpServer()));
     const createMutation = `mutation Invite($input: CreateAdminInviteInput!) {
@@ -257,13 +520,14 @@ describe("Admin GraphQL integration", () => {
     const failedDelivery = await graphql(app, token, createMutation, {
       input: { email: "failed-delivery@example.test" },
     });
-    expect(failedDelivery.body.errors[0].extensions.code).toBe("SERVICE_UNAVAILABLE");
-    const rolledBack = await pool.query(
-      `SELECT 1 FROM "adminInvites" WHERE "email" = 'failed-delivery@example.test'
-       UNION ALL
-       SELECT 1 FROM "auditLogs" WHERE "action" = 'ADMIN_INVITED' AND "metadata"->>'email' = 'failed-delivery@example.test'`,
+    expect(failedDelivery.body.errors).toBeUndefined();
+    const queued = await pool.query<{ status: string }>(
+      `SELECT o."status"
+       FROM "adminInvites" i
+       JOIN "emailDeliveryOutbox" o ON o."proofId" = i."inviteId"::text
+       WHERE i."email" = 'failed-delivery@example.test'`,
     );
-    expect(rolledBack.rowCount).toBe(0);
+    expect(queued.rows).toEqual([{ status: "PENDING" }]);
     const created = await graphql(app, token, createMutation, { input: { email: "second-admin@example.test" } });
     expect(created.body.errors).toBeUndefined();
     expect(created.body.data.createAdminInvite).not.toHaveProperty("token");
@@ -340,6 +604,96 @@ describe("Admin GraphQL integration", () => {
       query: `{ __type(name: "AdminInviteType") { fields { name } } }`,
     });
     expect(schema.body.data.__type.fields.map(({ name }: { name: string }) => name)).not.toContain("token");
+  });
+
+  it("never sends an admin invite from a transaction that fails to commit", async () => {
+    const token = await adminToken(request.agent(app.getHttpServer()));
+    const sender = app.get<EmailSender>("EmailSender");
+    const sendLink = jest.spyOn(sender, "sendLink").mockResolvedValue(undefined);
+    await pool.query(`
+      CREATE FUNCTION reject_admin_invite_commit() RETURNS trigger AS $$
+      BEGIN
+        IF NEW."email" = 'commit-failure@example.test' THEN
+          RAISE EXCEPTION 'blocked admin invite commit';
+        END IF;
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql
+    `);
+    await pool.query(`
+      CREATE CONSTRAINT TRIGGER reject_admin_invite_commit
+      AFTER INSERT ON "emailDeliveryOutbox"
+      DEFERRABLE INITIALLY DEFERRED
+      FOR EACH ROW EXECUTE FUNCTION reject_admin_invite_commit()
+    `);
+
+    let response;
+    try {
+      response = await graphql(
+        app,
+        token,
+        `
+          mutation Invite($input: CreateAdminInviteInput!) {
+            createAdminInvite(input: $input) {
+              inviteId
+            }
+          }
+        `,
+        { input: { email: "commit-failure@example.test" } },
+      );
+    } finally {
+      await pool.query(`DROP TRIGGER reject_admin_invite_commit ON "emailDeliveryOutbox"`);
+      await pool.query(`DROP FUNCTION reject_admin_invite_commit()`);
+    }
+
+    expect(response.body.errors).toBeDefined();
+    expect(sendLink).not.toHaveBeenCalled();
+    const rows = await pool.query(
+      `SELECT 1 FROM "adminInvites" WHERE "email" = 'commit-failure@example.test'
+       UNION ALL
+       SELECT 1 FROM "emailDeliveryOutbox" WHERE "email" = 'commit-failure@example.test'`,
+    );
+    expect(rows.rowCount).toBe(0);
+  });
+
+  it("delivers an admin invite through the shared worker only after its transaction commits", async () => {
+    const token = await adminToken(request.agent(app.getHttpServer()));
+    const sender = app.get<EmailSender>("EmailSender");
+    const sendLink = jest.spyOn(sender, "sendLink").mockResolvedValue(undefined);
+    const created = await graphql(
+      app,
+      token,
+      `
+        mutation Invite($input: CreateAdminInviteInput!) {
+          createAdminInvite(input: $input) {
+            inviteId
+            email
+          }
+        }
+      `,
+      { input: { email: "worker-admin@example.test" } },
+    );
+
+    expect(created.body.errors).toBeUndefined();
+    expect(sendLink).not.toHaveBeenCalled();
+    const before = await pool.query<{ id: string; status: string }>(`
+      SELECT "id", "status" FROM "emailDeliveryOutbox" WHERE "email" = 'worker-admin@example.test'
+    `);
+    expect(before.rows).toEqual([{ id: expect.any(String), status: "PENDING" }]);
+    const deliveryId = before.rows[0]?.id;
+
+    await app.get(EmailDeliveryWorker).runOnce(new Date(Date.now() + 1_000));
+
+    expect(sendLink).toHaveBeenCalledWith(
+      "worker-admin@example.test",
+      "다담장 관리자 초대",
+      expect.stringMatching(/^http:\/\/localhost:3001\/invite\/accept#token=[A-Za-z0-9_-]+$/),
+      expect.stringMatching(/^email-delivery\/[0-9a-f-]+$/),
+    );
+    const after = await pool.query<{ status: string }>(`SELECT "status" FROM "emailDeliveryOutbox" WHERE "id" = $1`, [
+      deliveryId,
+    ]);
+    expect(after.rows).toEqual([{ status: "SENT" }]);
   });
 
   it("filters immutable audit logs by actor, action, entity, and date", async () => {

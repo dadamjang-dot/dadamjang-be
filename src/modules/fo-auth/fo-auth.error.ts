@@ -1,7 +1,7 @@
 export class InvalidFoAuthProofError extends Error {
-  readonly name = "InvalidFoAuthProofError";
+  override readonly name = "InvalidFoAuthProofError";
 }
 
 export class ExistingFoIdentityError extends Error {
-  readonly name = "ExistingFoIdentityError";
+  override readonly name = "ExistingFoIdentityError";
 }

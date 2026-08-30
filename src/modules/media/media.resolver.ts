@@ -1,10 +1,12 @@
 import { Args, Context, Mutation, Query, Resolver } from "@nestjs/graphql";
 import { UseGuards } from "@nestjs/common";
-import { JwtAccessTokenGuard } from "src/guards/accessToken.guard";
+import { JwtAccessTokenGuard } from "src/guards/access-token.guard";
 import { RolesGuard } from "src/guards/roles.guard";
 import { UserRole } from "src/auth/role";
 import { Roles } from "src/auth/roles.decorator";
 import { CustomUnauthorizedException } from "src/common/errors/custom-exceptions";
+import { requestOriginFromRequest } from "src/modules/admission/admission-limiter";
+import type { Request } from "express";
 import { MediaErrorMessage } from "./media.error";
 import {
   CreateProductImageUploadInput,
@@ -14,10 +16,14 @@ import {
 } from "./media.types";
 import { MediaService } from "./media.service";
 
-const currentUserId = (context: { req?: { user?: { userId?: string } } }) => {
-  const userId = context.req?.user?.userId;
+type MediaRequest = Pick<Request, "headers" | "ip"> & { user?: { userId?: string } };
+type MediaContext = { req?: MediaRequest };
+
+const currentRequest = (context: MediaContext) => {
+  const req = context.req;
+  const userId = req?.user?.userId;
   if (!userId) throw new CustomUnauthorizedException(MediaErrorMessage.InvalidKey);
-  return userId;
+  return { req, userId };
 };
 
 @Resolver()
@@ -29,18 +35,20 @@ export class MediaResolver {
   @Roles(UserRole.Partner)
   async createProductImageUpload(
     @Args("input") input: CreateProductImageUploadInput,
-    @Context() context: { req?: { user?: { userId?: string } } },
+    @Context() context: MediaContext,
   ) {
-    return this.mediaService.createProductUpload(currentUserId(context), input);
+    const { req, userId } = currentRequest(context);
+    return this.mediaService.createProductUpload(userId, input, requestOriginFromRequest(req));
   }
 
   @Mutation(() => ProductImageUploadTarget)
   @Roles(UserRole.User, UserRole.Partner)
   async createStylePostImageUpload(
     @Args("input") input: CreateStylePostImageUploadInput,
-    @Context() context: { req?: { user?: { userId?: string } } },
+    @Context() context: MediaContext,
   ) {
-    return this.mediaService.createStylePostUpload(currentUserId(context), input);
+    const { req, userId } = currentRequest(context);
+    return this.mediaService.createStylePostUpload(userId, input, requestOriginFromRequest(req));
   }
 
   @Query(() => String)

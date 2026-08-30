@@ -1,9 +1,54 @@
+import { CopyObjectCommand, GetObjectCommand, HeadObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import type { INestApplication } from "@nestjs/common";
 import type { Pool } from "pg";
 import request from "supertest";
+import sharp from "sharp";
 import { createApp } from "src/app";
 import { FIXTURE } from "src/database/fixtures";
 import { migrateTestDatabase, resetTestFixtures, testPool } from "./support/database";
+
+let jpegBytes: Buffer;
+
+const styleImageObject = (bytes = jpegBytes) => {
+  let destination: { key: string; metadata: Record<string, string> } | undefined;
+  return async (command: unknown) => {
+    if (command instanceof HeadObjectCommand) {
+      const promoted = destination;
+      if (promoted && promoted.key === command.input.Key)
+        return {
+          ContentType: "image/jpeg",
+          ContentLength: bytes.byteLength,
+          Metadata: promoted.metadata,
+          ETag: '"copied-style-etag"',
+        };
+      if (/\/[0-9a-f]{64}\./.test(command.input.Key ?? ""))
+        throw Object.assign(new Error("missing"), { $metadata: { httpStatusCode: 404 } });
+      return {
+        ContentType: "image/jpeg",
+        ContentLength: bytes.byteLength,
+        Metadata: {
+          "owner-id": FIXTURE.userId,
+          "declared-content-type": "image/jpeg",
+          "declared-size": String(bytes.byteLength),
+        },
+        ETag: '"style-etag"',
+      };
+    }
+    if (command instanceof GetObjectCommand)
+      return {
+        ContentType: "image/jpeg",
+        ContentLength: bytes.byteLength,
+        ETag: destination?.key === command.input.Key ? '"copied-style-etag"' : '"style-etag"',
+        Body: { transformToByteArray: async () => bytes },
+      };
+    if (command instanceof CopyObjectCommand) {
+      if (!command.input.Key) throw new Error("Copy destination is required");
+      destination = { key: command.input.Key, metadata: command.input.Metadata ?? {} };
+      return { CopyObjectResult: { ETag: '"copied-style-etag"' } };
+    }
+    throw new Error("Unexpected storage command");
+  };
+};
 
 const signin = async (agent: ReturnType<typeof request.agent>) => {
   const response = await agent
@@ -22,11 +67,31 @@ const signin = async (agent: ReturnType<typeof request.agent>) => {
   return response.body.data.signin.accessToken;
 };
 
+const waitForAdvisoryWaiters = async (pool: Pool, expected: number) => {
+  for (let attempt = 0; attempt < 500; attempt += 1) {
+    const result = await pool.query<{ count: number }>(
+      `SELECT count(*)::int AS count
+       FROM pg_stat_activity
+       WHERE datname = current_database()
+         AND pid <> pg_backend_pid()
+         AND wait_event = 'advisory'`,
+    );
+    if ((result.rows[0]?.count ?? 0) >= expected) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`Timed out waiting for ${expected} advisory lock waiters`);
+};
+
 describe("PostgreSQL GraphQL integration", () => {
   let app: INestApplication;
   let pool: Pool;
 
   beforeAll(async () => {
+    jpegBytes = await sharp({
+      create: { width: 4, height: 3, channels: 4, background: "#ff00ffff" },
+    })
+      .jpeg()
+      .toBuffer();
     pool = testPool();
     app = await createApp();
     await app.init();
@@ -34,11 +99,42 @@ describe("PostgreSQL GraphQL integration", () => {
 
   beforeEach(async () => {
     await resetTestFixtures(pool);
+    jest.spyOn(S3Client.prototype, "send").mockImplementation(styleImageObject() as never);
   });
+
+  afterEach(() => jest.restoreAllMocks());
 
   afterAll(async () => {
     await app.close();
     await pool.end();
+  });
+
+  it("bounds style list thumbnails while preserving detail images", async () => {
+    const stylePostId = "82000000-0000-4000-8000-000000000010";
+    const imageKey = `style-posts/${FIXTURE.userId}/00000000-0000-4000-8000-000000000010.webp`;
+    const fullSizeUrl = `http://localhost/images/format=auto,fit=scale-down/http://localhost/r2/${imageKey}`;
+    await pool.query(
+      `INSERT INTO "stylePosts"
+        ("stylePostId", "authorId", "title", "content", "category", "imageKeys", "imageUrls")
+       VALUES ($1, $2, 'Bounded thumbnail', 'Bounded thumbnail', 'CLOTHING', $3::jsonb, $4::jsonb)`,
+      [stylePostId, FIXTURE.userId, JSON.stringify([imageKey]), JSON.stringify([fullSizeUrl])],
+    );
+
+    const summary = await request(app.getHttpServer())
+      .post("/graphql")
+      .send({ query: `{ stylePosts(filter: { sort: LATEST }) { nodes { stylePostId thumbnailUrl } } }` })
+      .expect(200);
+    const detail = await request(app.getHttpServer())
+      .post("/graphql")
+      .send({ query: `{ stylePost(stylePostId: "${stylePostId}") { imageUrls } }` })
+      .expect(200);
+
+    expect(summary.body.errors).toBeUndefined();
+    expect(summary.body.data.stylePosts.nodes[0]).toEqual({
+      stylePostId,
+      thumbnailUrl: `https://images.example.test/cdn-cgi/image/format=auto,width=640/http://localhost/r2/${imageKey}`,
+    });
+    expect(detail.body.data.stylePost.imageUrls).toEqual([fullSizeUrl]);
   });
 
   it("runs all migrations initially and idempotently", async () => {
@@ -71,6 +167,40 @@ describe("PostgreSQL GraphQL integration", () => {
     expect(logout.body.data.logout).toBe(true);
     const rejected = await agent.post("/graphql").send({ query: `mutation { refresh { accessToken } }` }).expect(200);
     expect(rejected.body.errors).toHaveLength(1);
+  });
+
+  it("rejects GraphQL documents that exceed the request budget", async () => {
+    const aliases = Array.from({ length: 21 }, (_, index) => `field${index}: __typename`).join("\n");
+    const response = await request(app.getHttpServer())
+      .post("/graphql")
+      .send({ query: `query Oversized { ${aliases} }` })
+      .expect(400);
+
+    expect(response.body.errors[0]).toMatchObject({
+      message: "GraphQL operation exceeds the request budget",
+      extensions: { code: "GRAPHQL_VALIDATION_FAILED" },
+    });
+  });
+
+  it("does not expose client-authored activity events", async () => {
+    const response = await request(app.getHttpServer()).post("/graphql").send({
+      query: `query MutationFields { __schema { mutationType { fields { name } } } }`,
+    });
+    const fieldNames = response.body.data.__schema.mutationType.fields.map((field: { name: string }) => field.name);
+
+    expect(fieldNames).not.toContain("recordActivity");
+  });
+
+  it("classifies malformed database identifiers as client input errors", async () => {
+    const response = await request(app.getHttpServer())
+      .post("/graphql")
+      .send({ query: `query InvalidProduct { product(productId: "not-a-uuid") { productId } }` })
+      .expect(200);
+
+    expect(response.body.errors[0]).toMatchObject({
+      message: "Invalid identifier",
+      extensions: { code: "BAD_USER_INPUT" },
+    });
   });
 
   it("filters and paginates catalog products with stable cursors", async () => {
@@ -201,10 +331,35 @@ describe("PostgreSQL GraphQL integration", () => {
       .expect(200);
     expect(feedAfterInvalidImage.body.data.stylePosts.nodes).toEqual([]);
 
+    jest
+      .mocked(S3Client.prototype.send)
+      .mockImplementation(
+        styleImageObject(
+          Buffer.from([...Buffer.from("%PDF", "ascii"), ...Array.from({ length: 60 }, () => 0)]),
+        ) as never,
+      );
+    const invalidMagic = await agent
+      .post("/graphql")
+      .set(auth)
+      .send({
+        query: createMutation,
+        variables: {
+          input: {
+            category: "CLOTHING",
+            productIds: [FIXTURE.productId],
+            imageKeys: [`style-posts/${FIXTURE.userId}/00000000-0000-4000-8000-000000000003.jpg`],
+            content: "이미지가 아닌 바이트",
+            idempotencyKey: "invalid-style-magic",
+          },
+        },
+      });
+    expect(invalidMagic.body.errors[0].extensions.code).toBe("BAD_USER_INPUT");
+    jest.mocked(S3Client.prototype.send).mockImplementation(styleImageObject() as never);
+
     const input = {
       category: "CLOTHING",
       productIds: [FIXTURE.productId],
-      imageKeys: [`style-posts/${FIXTURE.userId}/00000000-0000-4000-8000-000000000001.jpg`],
+      imageKeys: [`pending/style-posts/${FIXTURE.userId}/00000000-0000-4000-8000-000000000001.jpg`],
       content: "오늘의 스타일",
       hashtags: ["daily_look"],
       brandTagIds: [FIXTURE.brandId],
@@ -221,6 +376,21 @@ describe("PostgreSQL GraphQL integration", () => {
       likeCount: 0,
       isLiked: false,
     });
+    const storedImages = await pool.query<{ imageKeys: string[] }>(
+      `SELECT "imageKeys" FROM "stylePosts" WHERE "stylePostId" = $1`,
+      [first.body.data.createStylePost.stylePostId],
+    );
+    expect(storedImages.rows[0]?.imageKeys).toEqual([
+      expect.stringMatching(/^style-posts\/10000000-0000-4000-8000-000000000001\/[0-9a-f]{64}\.jpg$/),
+    ]);
+    const references = await pool.query<{ finalKey: string; status: string }>(
+      `SELECT r."finalKey", p."status"
+       FROM "mediaObjectReferences" r
+       JOIN "mediaObjectPromotions" p ON p."finalKey" = r."finalKey"
+       WHERE r."entityType" = 'STYLE_POST' AND r."entityId" = $1`,
+      [first.body.data.createStylePost.stylePostId],
+    );
+    expect(references.rows).toEqual([{ finalKey: storedImages.rows[0]?.imageKeys[0], status: "READY" }]);
 
     const invalidCursor = Buffer.from(
       JSON.stringify({
@@ -268,6 +438,67 @@ describe("PostgreSQL GraphQL integration", () => {
     expect(repeatedUnlike.body.data.unlikeStylePost).toEqual({ likeCount: 0, isLiked: false });
     const reliked = await agent.post("/graphql").set(auth).send({ query: likeMutation });
     expect(reliked.body.data.likeStylePost).toEqual({ likeCount: 1, isLiked: true });
+  });
+
+  it("preserves a later unlike when an earlier like is delayed", async () => {
+    const stylePostId = "82000000-0000-4000-8000-000000000099";
+    await pool.query(
+      `INSERT INTO "stylePosts" ("stylePostId", "authorId", title, content, category)
+       VALUES ($1, $2, 'Concurrent like', 'Concurrent like', 'CLOTHING')`,
+      [stylePostId, FIXTURE.userId],
+    );
+    const accessToken = await signin(request.agent(app.getHttpServer()));
+    const blocker = await pool.connect();
+    const requests: Promise<request.Response>[] = [];
+    let released = false;
+    try {
+      await pool.query(`
+        CREATE FUNCTION delay_test_style_like_insert() RETURNS trigger AS $$
+        BEGIN
+          PERFORM pg_advisory_xact_lock(91001, 1);
+          RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql;
+        CREATE TRIGGER delay_test_style_like_insert
+        BEFORE INSERT ON "stylePostLikes"
+        FOR EACH ROW EXECUTE FUNCTION delay_test_style_like_insert();
+      `);
+      await blocker.query(`SELECT pg_advisory_lock(91001, 1)`);
+      const likeRequest = request(app.getHttpServer())
+        .post("/graphql")
+        .set("Authorization", `Bearer ${accessToken}`)
+        .send({ query: `mutation { likeStylePost(stylePostId: "${stylePostId}") { isLiked } }` })
+        .then((response) => response);
+      requests.push(likeRequest);
+      await waitForAdvisoryWaiters(pool, 1);
+      const unlikeRequest = request(app.getHttpServer())
+        .post("/graphql")
+        .set("Authorization", `Bearer ${accessToken}`)
+        .send({ query: `mutation { unlikeStylePost(stylePostId: "${stylePostId}") { isLiked } }` })
+        .then((response) => response);
+      requests.push(unlikeRequest);
+      await Promise.race([unlikeRequest, waitForAdvisoryWaiters(pool, 2)]);
+      await blocker.query(`SELECT pg_advisory_unlock(91001, 1)`);
+      released = true;
+      const [liked, unliked] = await Promise.all(requests);
+      expect(liked?.body.errors).toBeUndefined();
+      expect(unliked?.body.errors).toBeUndefined();
+      const state = await pool.query<{ active_likes: number }>(
+        `SELECT count(*)::int AS active_likes
+         FROM "stylePostLikes"
+         WHERE "stylePostId" = $1 AND "userId" = $2 AND "deletedAt" IS NULL`,
+        [stylePostId, FIXTURE.userId],
+      );
+      expect(state.rows[0]?.active_likes).toBe(0);
+    } finally {
+      if (!released) await blocker.query(`SELECT pg_advisory_unlock(91001, 1)`).catch(() => undefined);
+      await Promise.allSettled(requests);
+      blocker.release();
+      await pool.query(`
+        DROP TRIGGER IF EXISTS delay_test_style_like_insert ON "stylePostLikes";
+        DROP FUNCTION IF EXISTS delay_test_style_like_insert();
+      `);
+    }
   });
 
   it("paginates style posts with category and sort-aware cursors", async () => {
@@ -467,7 +698,7 @@ describe("PostgreSQL GraphQL integration", () => {
     expect(removed.body.data.removeWish).toBe(true);
   });
 
-  it("updates cart and completes checkout idempotently", async () => {
+  it("creates a payment-pending order idempotently without claiming approval", async () => {
     const agent = request.agent(app.getHttpServer());
     const accessToken = await signin(agent);
     const auth = { Authorization: `Bearer ${accessToken}` };
@@ -482,14 +713,23 @@ describe("PostgreSQL GraphQL integration", () => {
     const checkout = await agent.post("/graphql").set(auth).send({ query: checkoutMutation });
     const repeated = await agent.post("/graphql").set(auth).send({ query: checkoutMutation });
     expect(checkout.body.data.checkoutCart).toMatchObject({
-      status: "PAID",
-      paymentStatus: "APPROVED",
+      status: "PAYMENT_PENDING",
+      paymentStatus: "PENDING",
       totalAmount: 30000,
     });
     expect(repeated.body.data.checkoutCart.orderId).toBe(checkout.body.data.checkoutCart.orderId);
+    const stock = await pool.query<{ stock: number }>(`SELECT stock FROM "productSkus" WHERE "skuId" = $1`, [
+      FIXTURE.skuId,
+    ]);
+    expect(stock.rows[0]?.stock).toBe(5);
+    const events = await pool.query<{ eventType: string }>(
+      `SELECT "eventType" FROM "activityEvents" WHERE "subjectId" = $1 ORDER BY "createdAt"`,
+      [checkout.body.data.checkoutCart.orderId],
+    );
+    expect(events.rows).toEqual([{ eventType: "ORDER_PAYMENT_PENDING" }, { eventType: "CHECKOUT_IDEMPOTENCY_REUSED" }]);
   });
 
-  it("records checkout payment failure without consuming stock", async () => {
+  it("uses stock as a non-reserving checkout availability snapshot", async () => {
     const agent = request.agent(app.getHttpServer());
     const accessToken = await signin(agent);
     const auth = { Authorization: `Bearer ${accessToken}` };
@@ -499,17 +739,51 @@ describe("PostgreSQL GraphQL integration", () => {
       .send({
         query: `mutation { upsertCartItem(input: { skuId: "${FIXTURE.secondSkuId}", quantity: 1 }) { cartId } }`,
       });
-    const failed = await agent.post("/graphql").set(auth).send({
+    await pool.query(`UPDATE "productSkus" SET stock = 0 WHERE "skuId" = $1`, [FIXTURE.secondSkuId]);
+    const checkout = await agent.post("/graphql").set(auth).send({
+      query: `mutation { checkoutCart(input: { idempotencyKey: "unavailable-snapshot" }) { orderId } }`,
+    });
+    expect(checkout.body.errors[0]).toMatchObject({
+      message: "Insufficient stock for INTEGRATION-SHOES-M",
+      extensions: { code: "BAD_USER_INPUT" },
+    });
+    const state = await pool.query<{ cart_items: number; idempotency_keys: number; orders: number; stock: number }>(
+      `SELECT
+        (SELECT count(*)::int FROM "cartItems") AS cart_items,
+        (SELECT count(*)::int FROM "checkoutIdempotencyKeys") AS idempotency_keys,
+        (SELECT count(*)::int FROM "orders") AS orders,
+        (SELECT stock FROM "productSkus" WHERE "skuId" = $1) AS stock`,
+      [FIXTURE.secondSkuId],
+    );
+    expect(state.rows[0]).toEqual({ cart_items: 1, idempotency_keys: 0, orders: 0, stock: 0 });
+  });
+
+  it("rejects checkout test controls in the public GraphQL input", async () => {
+    const agent = request.agent(app.getHttpServer());
+    const accessToken = await signin(agent);
+    const auth = { Authorization: `Bearer ${accessToken}` };
+    await agent
+      .post("/graphql")
+      .set(auth)
+      .send({
+        query: `mutation { upsertCartItem(input: { skuId: "${FIXTURE.secondSkuId}", quantity: 1 }) { cartId } }`,
+      });
+    const rejected = await agent.post("/graphql").set(auth).send({
       query: `mutation { checkoutCart(input: { idempotencyKey: "integration-failure", forcePaymentFailure: true }) { status paymentStatus paymentFailureReason } }`,
     });
-    expect(failed.body.data.checkoutCart).toMatchObject({
-      status: "FAILED",
-      paymentStatus: "FAILED",
-      paymentFailureReason: "Mock payment rejected",
-    });
-    const stock = await pool.query<{ stock: number }>(`SELECT stock FROM "productSkus" WHERE "skuId" = $1`, [
-      FIXTURE.secondSkuId,
-    ]);
-    expect(stock.rows[0]?.stock).toBe(1);
+    const schema = await agent
+      .post("/graphql")
+      .send({ query: `{ __type(name: "CheckoutCartInput") { inputFields { name } } }` });
+    expect(rejected.status).toBe(400);
+    expect(rejected.body.data).toBeUndefined();
+    expect(schema.body.data.__type.inputFields).toEqual([{ name: "idempotencyKey" }]);
+    const state = await pool.query<{ cart_items: number; orders: number; stock: number }>(
+      `SELECT
+        (SELECT count(*)::int FROM "cartItems") AS cart_items,
+        (SELECT count(*)::int FROM "orders") AS orders,
+        (SELECT stock FROM "productSkus" WHERE "skuId" = $1) AS stock`,
+      [FIXTURE.secondSkuId],
+    );
+    expect(state.rows[0]).toEqual({ cart_items: 1, orders: 0, stock: 1 });
   });
 });

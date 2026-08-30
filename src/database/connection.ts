@@ -1,4 +1,8 @@
-import { Pool } from "pg";
+import type { OnApplicationShutdown } from "@nestjs/common";
+import { X509Certificate } from "crypto";
+import { readFileSync } from "fs";
+import { Pool, type PoolConfig } from "pg";
+import { createSecureContext } from "tls";
 
 type DatabaseMode = "test" | "e2e";
 
@@ -6,6 +10,74 @@ const databaseNames = {
   test: "dadamjang_test",
   e2e: "dadamjang_e2e",
 } as const;
+
+const localEnvironments = new Set(["local", "development", "test"]);
+const databaseOptions = "-c timezone=UTC";
+const certificatePattern = /-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g;
+const invalidCaMessage = "POSTGRES_SSL_CA_PATH must point to a readable nonempty valid CA bundle";
+
+const requiredEnv = (env: NodeJS.ProcessEnv, name: string) => {
+  const value = env[name];
+  if (!value?.trim()) throw new Error(`${name} is required`);
+  return value;
+};
+
+const databasePort = (value: string | undefined) => {
+  const port = value ?? "5432";
+  if (!/^\d+$/.test(port) || !Number.isInteger(Number(port)) || Number(port) < 1 || Number(port) > 65535)
+    throw new Error("POSTGRES_PORT must be an integer between 1 and 65535");
+  return Number(port);
+};
+
+const validateCaBundle = (ca: Buffer) => {
+  const source = ca.toString("utf8");
+  const certificates = source.match(certificatePattern) ?? [];
+  if (!certificates.length || source.replace(certificatePattern, "").trim()) throw new Error(invalidCaMessage);
+  for (const certificate of certificates) {
+    if (!new X509Certificate(certificate).ca) throw new Error(invalidCaMessage);
+  }
+  createSecureContext({ ca });
+};
+
+const databaseSsl = (env: NodeJS.ProcessEnv) => {
+  const environment = env.NODE_ENV ?? "development";
+  if (localEnvironments.has(environment)) return undefined;
+  if (env.POSTGRES_SSL !== "true") throw new Error("POSTGRES_SSL=true is required outside local environments");
+  const caPath = requiredEnv(env, "POSTGRES_SSL_CA_PATH");
+  let ca: Buffer;
+  try {
+    ca = readFileSync(caPath);
+  } catch {
+    throw new Error(invalidCaMessage);
+  }
+  if (!ca.length) throw new Error(invalidCaMessage);
+  try {
+    validateCaBundle(ca);
+  } catch {
+    throw new Error(invalidCaMessage);
+  }
+  return { rejectUnauthorized: true, ca };
+};
+
+export const databasePoolConfig = (env: NodeJS.ProcessEnv = process.env): PoolConfig => {
+  const ssl = databaseSsl(env);
+  return {
+    host: requiredEnv(env, "POSTGRES_HOST"),
+    port: databasePort(env.POSTGRES_PORT),
+    user: requiredEnv(env, "POSTGRES_USERNAME"),
+    password: requiredEnv(env, "POSTGRES_PASSWORD"),
+    database: requiredEnv(env, "POSTGRES_DATABASE"),
+    connectionTimeoutMillis: 3000,
+    options: databaseOptions,
+    ...(ssl === undefined ? {} : { ssl }),
+  };
+};
+
+export class DatabasePool extends Pool implements OnApplicationShutdown {
+  onApplicationShutdown = async () => {
+    await this.end();
+  };
+}
 
 export const assertDatabaseMode = (mode: DatabaseMode) => {
   const expectedEnvironment = mode;
@@ -17,11 +89,8 @@ export const assertDatabaseMode = (mode: DatabaseMode) => {
   }
 };
 
-export const createDatabasePool = () =>
-  new Pool({
-    host: process.env.POSTGRES_HOST,
-    port: Number(process.env.POSTGRES_PORT ?? 5432),
-    user: process.env.POSTGRES_USERNAME,
-    password: process.env.POSTGRES_PASSWORD,
-    database: process.env.POSTGRES_DATABASE,
+export const createDatabasePool = (env: NodeJS.ProcessEnv = process.env, options?: string) =>
+  new DatabasePool({
+    ...databasePoolConfig(env),
+    options: options === undefined ? databaseOptions : `${databaseOptions} ${options}`,
   });

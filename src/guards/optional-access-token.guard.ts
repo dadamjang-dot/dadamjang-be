@@ -1,10 +1,10 @@
 import { Injectable } from "@nestjs/common";
 import type { JwtPayload } from "src/modules/auth/auth.types";
-import { JwtAccessTokenGuard } from "./accessToken.guard";
+import { JwtAccessTokenGuard } from "./access-token.guard";
 
 @Injectable()
 export class OptionalJwtAccessTokenGuard extends JwtAccessTokenGuard {
-  handleRequest<TUser = JwtPayload>(err: unknown, user: TUser | undefined): TUser {
-    return err || !user ? user! : user;
+  override handleRequest<TUser = JwtPayload>(_error: unknown, user: TUser | undefined) {
+    return user;
   }
 }
