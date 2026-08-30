@@ -7,7 +7,15 @@ import {
 } from "src/common/errors/custom-exceptions";
 import { requireResult } from "src/common/invariants/require-result";
 import { Database, DRIZZLE } from "src/modules/database/database.module";
-import { brands, categories, colors, productSkus, products, sizes } from "src/modules/database/schema";
+import {
+  brands,
+  categories,
+  colors,
+  productPriceEvidenceSnapshots,
+  productSkus,
+  products,
+  sizes,
+} from "src/modules/database/schema";
 import { IMAGE_SUMMARY_WIDTH } from "src/modules/media/media.constant";
 import { MediaService } from "src/modules/media/media.service";
 import { CatalogErrorMessage } from "./catalog.error";
@@ -42,6 +50,7 @@ type MetricProductCursor = {
 type ProductCursor = DateProductCursor | MetricProductCursor;
 type CatalogDatabase = Database | Parameters<Parameters<Database["transaction"]>[0]>[0];
 type HydratedProduct = ProductType & Pick<typeof products.$inferSelect, "imageKeys">;
+type ProductPriceEvidenceSnapshot = typeof productPriceEvidenceSnapshots.$inferSelect;
 
 const DATE_PRODUCT_SORTS = new Set<ProductSort>([ProductSort.RECOMMENDED, ProductSort.LATEST]);
 const METRIC_PRODUCT_SORTS = new Set<ProductSort>([ProductSort.LOW_PRICE, ProductSort.HIGH_PRICE, ProductSort.POPULAR]);
@@ -169,66 +178,75 @@ export class CatalogService {
   };
 
   listProductPriceSummaries = async (filter: ProductFilterInput) => {
-    const { nodes: productsWithSkus, hasNextPage, nextCursor, totalCount } = await this.listCatalogProducts(filter);
+    const {
+      nodes: productsWithSkus,
+      snapshots,
+      hasNextPage,
+      nextCursor,
+      totalCount,
+    } = await this.listCatalogProducts(filter, true);
     return {
-      nodes: productsWithSkus.map((product) => this.toPriceSummary(product)),
+      nodes: productsWithSkus.map((product) => this.toPriceSummary(product, snapshots.get(product.productId))),
       hasNextPage,
       nextCursor,
       totalCount,
     };
   };
 
-  getProductPriceSummary = async (productId: string) => this.toPriceSummary(await this.getProduct(productId));
+  getProductPriceSummary = async (productId: string) => {
+    const product = await this.getProduct(productId);
+    const snapshots = await this.getPriceSnapshotsByProductIds([productId]);
+    return this.toPriceSummary(product, snapshots.get(productId));
+  };
 
   getProductPriceSummariesByIds = async (productIds: string[]) => {
     const productById = new Map(
       (await this.getProductsByIds(productIds)).map((product) => [product.productId, product]),
     );
+    const snapshots = await this.getPriceSnapshotsByProductIds(productIds);
     return productIds.map((productId) => {
       const product = productById.get(productId);
       if (!product) throw new CustomNotFoundException(CatalogErrorMessage.ProductNotFound);
-      return this.toPriceSummary(product);
+      return this.toPriceSummary(product, snapshots.get(productId));
     });
   };
 
   getProductPriceEvidence = async (productId: string, priceRevision?: string): Promise<ProductPriceEvidenceType> => {
     const product = await this.getProduct(productId);
-    const summary = this.toPriceSummary(product);
-    if (priceRevision && priceRevision !== summary.priceRevision)
+    this.requireActiveSku(product);
+    const snapshot = (await this.getPriceSnapshotsByProductIds([productId])).get(productId);
+    if (!snapshot) throw new CustomNotFoundException(CatalogErrorMessage.PriceEvidenceUnavailable);
+    if (priceRevision && priceRevision !== snapshot.revision)
       throw new CustomConflictException(CatalogErrorMessage.PriceRevisionChanged);
     return {
-      productId: product.productId,
-      priceRevision: summary.priceRevision,
-      priceHistory: [
-        {
-          label: "기준가",
-          price: summary.basePrice,
-          recordedAt: product.createdAt,
-        },
-        {
-          label: "현재 최저가",
-          price: summary.finalPrice,
-          recordedAt: product.createdAt,
-        },
-      ],
-      couponConditions: [
-        {
-          title: "다담장 위시템 기본 혜택",
-          discountAmount: Math.max(summary.basePrice - summary.finalPrice, 0),
-          condition: "상품 비교 화면에서 최저 옵션 기준으로 적용",
-        },
-      ],
-      shippingPolicy: {
-        title: "기본 배송",
-        shippingFee: summary.finalPrice >= 30_000 ? 0 : 3_000,
-        condition: "30,000원 이상 무료 배송",
-      },
-      offerSource: "product_sku_lowest_price",
-      calculatedAt: new Date(),
+      productId: snapshot.productId,
+      priceRevision: snapshot.revision,
+      priceHistory: this.priceEvidenceItems(snapshot.basePrice, snapshot.finalPrice, snapshot.recordedAt),
+      couponConditions: [],
+      shippingPolicy: null,
+      offerSource: snapshot.source,
+      calculatedAt: snapshot.verifiedAt,
     };
   };
 
-  private listCatalogProducts = async (filter: ProductFilterInput) => {
+  private getPriceSnapshotsByProductIds = async (productIds: string[], db: CatalogDatabase = this.db) => {
+    if (productIds.length === 0) return new Map<string, ProductPriceEvidenceSnapshot>();
+    const rows = await db
+      .select()
+      .from(productPriceEvidenceSnapshots)
+      .where(inArray(productPriceEvidenceSnapshots.productId, productIds));
+    return new Map(rows.map((snapshot) => [snapshot.productId, snapshot]));
+  };
+
+  private priceEvidenceItems = (basePrice: number, finalPrice: number, recordedAt: Date) =>
+    basePrice === finalPrice
+      ? [{ label: "현재 판매가", price: finalPrice, recordedAt }]
+      : [
+          { label: "옵션 최고가", price: basePrice, recordedAt },
+          { label: "옵션 최저가", price: finalPrice, recordedAt },
+        ];
+
+  private listCatalogProducts = async (filter: ProductFilterInput, includePriceSnapshots = false) => {
     const first = Math.min(Math.max(filter.first ?? 20, 1), MAX_PAGE_SIZE);
     const selectedSort = filter.sort ?? ProductSort.RECOMMENDED;
     const cursor = filter.after ? decodeProductCursor(filter.after, selectedSort) : undefined;
@@ -285,10 +303,17 @@ export class CatalogService {
           pageRows.map(({ cursorCreatedAt: _, cursorSortValue: __, ...product }) => product),
           tx,
         );
+        const snapshots = includePriceSnapshots
+          ? await this.getPriceSnapshotsByProductIds(
+              nodes.map(({ productId }) => productId),
+              tx,
+            )
+          : new Map<string, ProductPriceEvidenceSnapshot>();
         const hasNextPage = rows.length > first;
         const tailRow = pageRows[pageRows.length - 1];
         return {
           nodes,
+          snapshots,
           hasNextPage,
           nextCursor:
             hasNextPage && tailRow
@@ -333,7 +358,7 @@ export class CatalogService {
       .as(alias);
 
   private productConditions = (filter: ProductFilterInput, activeLowestPrice?: SQL<number>) => {
-    const conditions = [eq(products.status, "PUBLISHED")];
+    const conditions = [eq(products.status, "PUBLISHED"), this.activeSkuExistsCondition()];
     if (filter.categoryIds?.length) conditions.push(inArray(products.categoryId, filter.categoryIds));
     else if (filter.categoryId) conditions.push(eq(products.categoryId, filter.categoryId));
     if (filter.query?.trim()) conditions.push(ilike(products.title, `%${filter.query.trim()}%`));
@@ -364,7 +389,7 @@ export class CatalogService {
       .where(and(eq(products.productId, productId), eq(products.status, "PUBLISHED")))
       .limit(1);
     if (!product) throw new CustomNotFoundException(CatalogErrorMessage.ProductNotFound);
-    return requireResult((await this.withSkus([product]))[0]);
+    return this.requireActiveSku(requireResult((await this.withSkus([product]))[0]));
   };
 
   getProductsByIds = async (productIds: string[]): Promise<HydratedProduct[]> => {
@@ -437,6 +462,7 @@ export class CatalogService {
           eq(products.productId, productId),
           eq(products.partnerId, partnerId),
           eq(products.approvalStatus, "APPROVED"),
+          this.activeSkuExistsCondition(),
         ),
       )
       .returning();
@@ -495,16 +521,21 @@ export class CatalogService {
     };
   };
 
-  private lowestSkuPrice = (product: ProductType) =>
-    product.skus.length > 0 ? Math.min(...product.skus.map((sku) => sku.price)) : 0;
+  private activeSkuExistsCondition = () =>
+    sql`exists (select 1 from ${productSkus} where ${productSkus.productId} = ${products.productId} and ${productSkus.isActive} = true)`;
 
-  private highestSkuPrice = (product: ProductType) =>
-    product.skus.length > 0 ? Math.max(...product.skus.map((sku) => sku.price)) : 0;
+  private requireActiveSku = (product: HydratedProduct) => {
+    if (product.skus.length === 0) throw new CustomNotFoundException(CatalogErrorMessage.PriceEvidenceUnavailable);
+    return product;
+  };
 
-  private toPriceSummary = (product: HydratedProduct): ProductPriceSummaryType => {
-    const finalPrice = this.lowestSkuPrice(product);
-    const basePrice = this.highestSkuPrice(product);
-    const discountAmount = Math.max(basePrice - finalPrice, 0);
+  private toPriceSummary = (
+    product: HydratedProduct,
+    snapshot?: ProductPriceEvidenceSnapshot,
+  ): ProductPriceSummaryType => {
+    this.requireActiveSku(product);
+    if (!snapshot) throw new CustomNotFoundException(CatalogErrorMessage.PriceEvidenceUnavailable);
+    const finalPrice = snapshot.finalPrice;
     return {
       productId: product.productId,
       name: product.title,
@@ -513,11 +544,10 @@ export class CatalogService {
         : (product.imageUrls[0] ?? null),
       isOnSale: product.isOnSale,
       isExpressDelivery: product.isExpressDelivery,
-      basePrice,
+      basePrice: finalPrice,
       finalPrice,
-      priceRevision: `${product.productId}:${product.createdAt.getTime()}:${basePrice}:${finalPrice}`,
-      lowestPriceEvidenceSummary:
-        discountAmount > 0 ? `최저 옵션 기준 ${discountAmount.toLocaleString()}원 차이` : "현재 옵션 최저가 기준",
+      priceRevision: snapshot.revision,
+      lowestPriceEvidenceSummary: "현재 옵션 최저가 기준",
     };
   };
 }

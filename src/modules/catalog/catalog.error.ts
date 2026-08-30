@@ -3,5 +3,6 @@ export enum CatalogErrorMessage {
   ProductNotFound = "Product not found",
   InvalidPriceOrStock = "Price and stock must be non-negative",
   PriceRevisionChanged = "Product price has changed",
+  PriceEvidenceUnavailable = "Product price evidence unavailable",
   PublishUnapprovedProduct = "Product must be approved before publishing",
 }
