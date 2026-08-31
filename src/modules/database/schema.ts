@@ -16,14 +16,56 @@ import {
   varchar,
 } from "drizzle-orm/pg-core";
 
-export const users = pgTable("users", {
-  userId: uuid("userId").primaryKey(),
-  userid: varchar("userid", { length: 40 }).notNull().unique(),
-  email: varchar("email", { length: 255 }).notNull().unique(),
-  password: text("password").notNull(),
-  role: varchar("role", { length: 20 }).notNull().default("USER"),
-  createdAt: timestamp("createdAt").defaultNow().notNull(),
-  updatedAt: timestamp("updatedAt").defaultNow().notNull(),
+export const users = pgTable(
+  "users",
+  {
+    userId: uuid("userId").primaryKey(),
+    userid: varchar("userid", { length: 40 }).notNull().unique(),
+    email: varchar("email", { length: 255 }).notNull().unique(),
+    password: text("password"),
+    role: varchar("role", { length: 20 }).notNull().default("USER"),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().notNull(),
+    deactivatedAt: timestamp("deactivatedAt", { withTimezone: true }),
+    scheduledAnonymizationAt: timestamp("scheduledAnonymizationAt", { withTimezone: true }),
+    anonymizedAt: timestamp("anonymizedAt", { withTimezone: true }),
+  },
+  (table) => [
+    check("users_non_user_password_check", sql`${table.role} = 'USER' OR ${table.password} IS NOT NULL`),
+    check(
+      "users_lifecycle_order_check",
+      sql`(
+          ${table.deactivatedAt} IS NULL
+          AND ${table.scheduledAnonymizationAt} IS NULL
+          AND ${table.anonymizedAt} IS NULL
+        ) OR (
+          ${table.deactivatedAt} IS NOT NULL
+          AND ${table.scheduledAnonymizationAt} IS NOT NULL
+          AND ${table.scheduledAnonymizationAt} >= ${table.deactivatedAt}
+          AND ${table.anonymizedAt} IS NULL
+        ) OR (
+          ${table.deactivatedAt} IS NOT NULL
+          AND ${table.scheduledAnonymizationAt} IS NOT NULL
+          AND ${table.anonymizedAt} IS NOT NULL
+          AND ${table.scheduledAnonymizationAt} >= ${table.deactivatedAt}
+          AND ${table.anonymizedAt} >= ${table.scheduledAnonymizationAt}
+        )`,
+    ),
+    index("users_due_anonymization_idx")
+      .on(table.scheduledAnonymizationAt, table.userId)
+      .where(sql`${table.deactivatedAt} IS NOT NULL AND ${table.anonymizedAt} IS NULL`),
+  ],
+);
+
+export const accountReactivationTokens = pgTable("accountReactivationTokens", {
+  tokenHash: text("tokenHash").primaryKey(),
+  userId: uuid("userId")
+    .notNull()
+    .references(() => users.userId, { onDelete: "cascade" }),
+  deviceIdHash: text("deviceIdHash").notNull(),
+  expiresAt: timestamp("expiresAt", { withTimezone: true }).notNull(),
+  usedAt: timestamp("usedAt", { withTimezone: true }),
+  createdAt: timestamp("createdAt", { withTimezone: true }).defaultNow().notNull(),
 });
 
 export const refreshTokens = pgTable(

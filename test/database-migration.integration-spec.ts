@@ -227,6 +227,188 @@ describe("database migration PostgreSQL integration", () => {
     expect(refreshRotationForeignKey.rows).toEqual([{ delete_rule: "CASCADE" }]);
   });
 
+  it("migrates FO accounts to nullable passwords and enforces lifecycle invariants once", async () => {
+    const migrationsBeforeAccountLifecycle = (await readMigrationArtifacts())
+      .filter(({ name, retired }) => !retired && name < "0025_fo_account_lifecycle.sql")
+      .map(({ name }) => name);
+    await runHistoricalMigrations(migrationPool, undefined, migrationsBeforeAccountLifecycle);
+    const kakaoOnlyPasswordHash = "kakao-only-synthetic-password";
+    const emailPasswordHash = "email-password-hash";
+    const kakaoOnlyClient = await migrationPool.connect();
+    try {
+      await kakaoOnlyClient.query("BEGIN");
+      await kakaoOnlyClient.query(
+        `INSERT INTO "users" ("userId", "userid", "email", "password")
+         VALUES ('10000000-0000-4000-8000-000000000025', 'kakao-only-migration', 'kakao-only@example.test', $1)`,
+        [kakaoOnlyPasswordHash],
+      );
+      await kakaoOnlyClient.query(
+        `INSERT INTO "authIdentity" ("userId", "provider", "providerUserId")
+         VALUES ('10000000-0000-4000-8000-000000000025', 'kakao', 'kakao-only-migration')`,
+      );
+      await kakaoOnlyClient.query("COMMIT");
+    } catch (error) {
+      await kakaoOnlyClient.query("ROLLBACK");
+      throw error;
+    } finally {
+      kakaoOnlyClient.release();
+    }
+    await migrationPool.query(
+      `INSERT INTO "users" ("userId", "userid", "email", "password", "createdAt", "updatedAt")
+       VALUES (
+         '10000000-0000-4000-8000-000000000026',
+         'linked-email-migration',
+         'linked-email@example.test',
+         $1,
+         '2026-01-01T00:00:00Z',
+         '2026-01-01T00:00:00Z'
+       )`,
+      [emailPasswordHash],
+    );
+    await migrationPool.query(
+      `INSERT INTO "authIdentity" ("userId", "provider", "providerUserId", "createdAt")
+       VALUES (
+         '10000000-0000-4000-8000-000000000026',
+         'kakao',
+         'linked-email-migration',
+         '2026-01-02T00:00:00Z'
+       )`,
+    );
+    await migrationPool.query(
+      `INSERT INTO "users" ("userId", "userid", "email", "password", "role")
+       VALUES (
+         '10000000-0000-4000-8000-000000000027',
+         'partner-migration',
+         'partner@example.test',
+         'partner-password-hash',
+         'PARTNER'
+       )`,
+    );
+
+    await migrate({ pool: migrationPool });
+    await migrate({ pool: migrationPool });
+
+    const migratedUsers = await migrationPool.query<{ password: string | null; userId: string }>(
+      `SELECT "userId", "password"
+       FROM "users"
+       WHERE "userId" IN (
+         '10000000-0000-4000-8000-000000000025',
+         '10000000-0000-4000-8000-000000000026',
+         '10000000-0000-4000-8000-000000000027'
+       )
+       ORDER BY "userId"`,
+    );
+    const [kakaoOnly, linkedEmail, nonUser] = migratedUsers.rows;
+    expect(kakaoOnly?.password).toBeNull();
+    expect(linkedEmail?.password).toBe(emailPasswordHash);
+    expect(nonUser?.password).toBe("partner-password-hash");
+
+    await expect(
+      migrationPool.query(
+        `INSERT INTO "users" ("userId", "userid", "email", "password")
+         VALUES ('10000000-0000-4000-8000-000000000028', 'passwordless-user', 'passwordless@example.test', NULL)`,
+      ),
+    ).resolves.toEqual(expect.objectContaining({ rowCount: 1 }));
+    const insertNonUserWithoutPassword = () =>
+      migrationPool.query(
+        `INSERT INTO "users" ("userId", "userid", "email", "password", "role")
+         VALUES ('10000000-0000-4000-8000-000000000029', 'passwordless-admin', 'passwordless-admin@example.test', NULL, 'ADMIN')`,
+      );
+    await expect(insertNonUserWithoutPassword()).rejects.toThrow();
+
+    await expect(
+      migrationPool.query(
+        `UPDATE "users"
+         SET "scheduledAnonymizationAt" = now() + interval '30 days'
+         WHERE "userId" = '10000000-0000-4000-8000-000000000028'`,
+      ),
+    ).rejects.toThrow();
+    await expect(
+      migrationPool.query(
+        `UPDATE "users"
+         SET "deactivatedAt" = now()
+         WHERE "userId" = '10000000-0000-4000-8000-000000000028'`,
+      ),
+    ).rejects.toThrow();
+    await expect(
+      migrationPool.query(
+        `UPDATE "users"
+         SET "deactivatedAt" = now(), "scheduledAnonymizationAt" = now() - interval '1 second'
+         WHERE "userId" = '10000000-0000-4000-8000-000000000028'`,
+      ),
+    ).rejects.toThrow();
+    await expect(
+      migrationPool.query(
+        `UPDATE "users"
+         SET
+           "deactivatedAt" = now(),
+           "scheduledAnonymizationAt" = now() + interval '30 days',
+           "anonymizedAt" = now() + interval '29 days'
+         WHERE "userId" = '10000000-0000-4000-8000-000000000028'`,
+      ),
+    ).rejects.toThrow();
+    await expect(
+      migrationPool.query(
+        `UPDATE "users"
+         SET "deactivatedAt" = now(), "scheduledAnonymizationAt" = now() + interval '30 days'
+         WHERE "userId" = '10000000-0000-4000-8000-000000000028'`,
+      ),
+    ).resolves.toEqual(expect.objectContaining({ rowCount: 1 }));
+    await expect(
+      migrationPool.query(
+        `UPDATE "users"
+         SET "anonymizedAt" = "scheduledAnonymizationAt" + interval '1 second'
+         WHERE "userId" = '10000000-0000-4000-8000-000000000028'`,
+      ),
+    ).resolves.toEqual(expect.objectContaining({ rowCount: 1 }));
+
+    await migrationPool.query(
+      `INSERT INTO "accountReactivationTokens"
+        ("tokenHash", "userId", "deviceIdHash", "expiresAt")
+       VALUES (
+         'reactivation-token-hash',
+         '10000000-0000-4000-8000-000000000028',
+         'device-id-hash',
+         now() + interval '10 minutes'
+       )`,
+    );
+    await expect(
+      migrationPool.query(
+        `INSERT INTO "accountReactivationTokens"
+          ("tokenHash", "userId", "deviceIdHash", "expiresAt")
+         VALUES (
+           'reactivation-token-hash',
+           '10000000-0000-4000-8000-000000000027',
+           'other-device-id-hash',
+           now() + interval '10 minutes'
+         )`,
+      ),
+    ).rejects.toThrow();
+    await migrationPool.query(`DELETE FROM "users" WHERE "userId" = '10000000-0000-4000-8000-000000000028'`);
+    const reactivationTokens = await migrationPool.query<{ count: string }>(
+      `SELECT count(*) FROM "accountReactivationTokens" WHERE "tokenHash" = 'reactivation-token-hash'`,
+    );
+    const dueIndex = await migrationPool.query<{ indexdef: string }>(
+      `SELECT indexdef
+       FROM pg_indexes
+       WHERE schemaname = 'public'
+         AND tablename = 'users'
+         AND indexname = 'users_due_anonymization_idx'`,
+    );
+    const lifecycleMigrationJournal = await migrationPool.query<{ count: string }>(
+      `SELECT count(*) FROM "_migrations" WHERE "name" = '0025_fo_account_lifecycle.sql'`,
+    );
+
+    expect(reactivationTokens.rows).toEqual([{ count: "0" }]);
+    expect(dueIndex.rows).toEqual([
+      {
+        indexdef:
+          'CREATE INDEX users_due_anonymization_idx ON public.users USING btree ("scheduledAnonymizationAt", "userId") WHERE (("deactivatedAt" IS NOT NULL) AND ("anonymizedAt" IS NULL))',
+      },
+    ]);
+    expect(lifecycleMigrationJournal.rows).toEqual([{ count: "1" }]);
+  });
+
   it("backfills the latest price snapshot for an existing published product", async () => {
     const migrationsBeforePriceSnapshots = (await readMigrationArtifacts())
       .filter(({ name, retired }) => !retired && name < "0024_product_price_evidence_snapshots.sql")
