@@ -3,7 +3,13 @@ import { and, asc, desc, eq, gt, inArray, isNull, lt, lte, or, sql } from "drizz
 import { randomUUID } from "crypto";
 import { requireResult } from "src/common/invariants/require-result";
 import { hashToken } from "src/common/security/token-hash";
-import { Database, type DatabaseExecutor, DRIZZLE } from "src/modules/database/database.module";
+import {
+  Database,
+  type DatabaseExecutor,
+  type DatabaseTransaction,
+  DRIZZLE,
+} from "src/modules/database/database.module";
+import { lockEmailDelivery } from "./email-delivery-lock";
 import {
   adminInvites,
   emailDeliveryOutbox,
@@ -179,23 +185,28 @@ export class EmailRepository {
       proofId?: string;
       requestIpHash?: string;
     }>,
-    executor: DatabaseExecutor = this.db,
-  ) =>
-    requireResult(
-      (
-        await executor
-          .insert(emailDeliveryOutbox)
-          .values({
-            email: input.email,
-            expiresAt: input.expiresAt,
-            kind: input.kind,
-            ...(input.payloadCiphertext ? { payloadCiphertext: input.payloadCiphertext } : {}),
-            ...(input.proofId ? { proofId: input.proofId } : {}),
-            ...(input.requestIpHash ? { requestIpHash: input.requestIpHash } : {}),
-          })
-          .returning()
-      )[0],
-    );
+    transaction?: DatabaseTransaction,
+  ) => {
+    const enqueue = async (tx: DatabaseTransaction) => {
+      await lockEmailDelivery(tx, input.email);
+      return requireResult(
+        (
+          await tx
+            .insert(emailDeliveryOutbox)
+            .values({
+              email: input.email,
+              expiresAt: input.expiresAt,
+              kind: input.kind,
+              ...(input.payloadCiphertext ? { payloadCiphertext: input.payloadCiphertext } : {}),
+              ...(input.proofId ? { proofId: input.proofId } : {}),
+              ...(input.requestIpHash ? { requestIpHash: input.requestIpHash } : {}),
+            })
+            .returning()
+        )[0],
+      );
+    };
+    return transaction ? enqueue(transaction) : this.db.transaction(enqueue);
+  };
 
   claimDelivery = async (now = new Date()) =>
     this.db.transaction(async (tx) => {

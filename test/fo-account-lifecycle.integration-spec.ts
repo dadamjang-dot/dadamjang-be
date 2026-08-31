@@ -2,8 +2,11 @@ import type { INestApplication } from "@nestjs/common";
 import type { Pool, PoolClient } from "pg";
 import request from "supertest";
 import { createApp } from "src/app";
+import { hasDatabaseErrorCode } from "src/common/errors/database-error";
 import { hashToken } from "src/common/security/token-hash";
 import { FIXTURE } from "src/database/fixtures";
+import { EmailRepository } from "src/modules/email/email.repository";
+import { FoAccountRepository } from "src/modules/fo-account/fo-account.repository";
 import { KakaoFlowRepository } from "src/modules/fo-auth/kakao-flow.repository";
 import { resetTestFixtures, testPool } from "./support/database";
 
@@ -252,17 +255,221 @@ const consentDocumentIds = [
   "a0000000-0000-4000-8000-000000000014",
 ] as const;
 
+const ANONYMIZATION_FIXTURE = {
+  userId: "12000000-0000-4000-8000-000000000001",
+  userid: "anonymization-user",
+  email: "anonymization@example.test",
+  providerUserId: "anonymization-kakao",
+  ciHash: "anonymization-ci",
+  verificationId: "13000000-0000-4000-8000-000000000001",
+  stylePostId: "14000000-0000-4000-8000-000000000001",
+  cartId: "15000000-0000-4000-8000-000000000001",
+  orderId: "16000000-0000-4000-8000-000000000001",
+  orderItemId: "17000000-0000-4000-8000-000000000001",
+  consentDocumentId: "18000000-0000-4000-8000-000000000001",
+  outboxId: "19000000-0000-4000-8000-000000000001",
+  identitySessionId: "1a000000-0000-4000-8000-000000000001",
+  mediaKey: "style-posts/anonymization-user/preserved.jpg",
+} as const;
+
+const batchUserId = (index: number) => `20000000-0000-4000-8000-${String(index).padStart(12, "0")}`;
+
+const seedDueUsers = async (pool: Pool, userIds: readonly string[]) => {
+  const userids = userIds.map((_, index) => `due-batch-${index + 1}`);
+  const emails = userIds.map((_, index) => `due-batch-${index + 1}@example.test`);
+  await pool.query(
+    `INSERT INTO "users"
+      ("userId", "userid", "email", "password", "role", "deactivatedAt", "scheduledAnonymizationAt")
+     SELECT input."userId", input.userid, input.email, NULL, 'USER',
+       transaction_timestamp() - interval '31 days',
+       transaction_timestamp() - interval '2 days' + (input.position - 1) * interval '1 second'
+     FROM unnest($1::uuid[], $2::text[], $3::text[]) WITH ORDINALITY
+       AS input("userId", userid, email, position)`,
+    [userIds, userids, emails],
+  );
+};
+
+const seedAnonymizationFixture = async (pool: Pool) => {
+  const fixture = ANONYMIZATION_FIXTURE;
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(
+      `INSERT INTO users
+        ("userId", userid, email, password, role, "deactivatedAt", "scheduledAnonymizationAt")
+       VALUES ($1, $2, $3, 'original-password-hash', 'USER', now() - interval '31 days', now() - interval '1 day')`,
+      [fixture.userId, fixture.userid, fixture.email],
+    );
+    await client.query(
+      `INSERT INTO "accountReactivationTokens" ("tokenHash", "userId", "deviceIdHash", "expiresAt")
+       VALUES ('anonymization-reactivation', $1, 'anonymization-device', now() + interval '10 minutes')`,
+      [fixture.userId],
+    );
+    await client.query(
+      `INSERT INTO "refreshToken" ("userId", "deviceId", "refreshToken", "refreshTokenExp")
+       VALUES ($1, 'anonymization-device', 'anonymization-refresh', now() + interval '1 day')`,
+      [fixture.userId],
+    );
+    await client.query(
+      `INSERT INTO "refreshTokenRotationMarker" ("userId", "deviceId", "rotationKey", "expiresAt")
+       VALUES ($1, 'anonymization-device', 'anonymization-rotation', now() + interval '1 minute')`,
+      [fixture.userId],
+    );
+    await client.query(
+      `INSERT INTO "passwordResetToken" ("tokenHash", "userId", "expiresAt")
+       VALUES ('anonymization-reset', $1, now() + interval '10 minutes')`,
+      [fixture.userId],
+    );
+    await client.query(
+      `INSERT INTO "emailVerification" (id, email, purpose, "codeHash", "expiresAt", "verifiedAt")
+       VALUES ($1, $2, 'PASSWORD_RESET', 'anonymization-code', now() + interval '10 minutes', now())`,
+      [fixture.verificationId, fixture.email],
+    );
+    await client.query(
+      `INSERT INTO "emailVerificationToken" ("tokenHash", email, purpose, "verificationId", "expiresAt")
+       VALUES ('anonymization-email-token', $1, 'PASSWORD_RESET', $2, now() + interval '10 minutes')`,
+      [fixture.email, fixture.verificationId],
+    );
+    await client.query(
+      `INSERT INTO "emailDeliveryOutbox" (id, kind, email, "payloadCiphertext", "proofId", status, "expiresAt")
+       VALUES ($1, 'PASSWORD_RESET_LINK', $2, 'anonymization-ciphertext', 'anonymization-reset', 'PENDING', now() + interval '10 minutes')`,
+      [fixture.outboxId, fixture.email],
+    );
+    await client.query(`INSERT INTO "authIdentity" ("userId", provider, "providerUserId") VALUES ($1, 'kakao', $2)`, [
+      fixture.userId,
+      fixture.providerUserId,
+    ]);
+    await client.query(
+      `INSERT INTO "verifiedIdentities" ("userId", "ciHash", "certificateProvider", "verifiedAt")
+       VALUES ($1, $2, 'KAKAO', now())`,
+      [fixture.userId, fixture.ciHash],
+    );
+    await client.query(
+      `INSERT INTO "identityVerificationSessions"
+        ("sessionId", purpose, provider, "deviceIdHash", "merchantTransactionId", status, "ciHash", "certificateProvider", "isFourteenOrOlder", "expiresAt", "verifiedAt")
+       VALUES ($1, 'RECOVERY', 'KAKAO', 'anonymization-device', 'anon-transaction-001', 'VERIFIED', $2, 'KAKAO', true, now() + interval '10 minutes', now())`,
+      [fixture.identitySessionId, fixture.ciHash],
+    );
+    await client.query(
+      `INSERT INTO "kakaoSignupToken" ("tokenHash", "providerUserId", email, "emailVerified", "deviceIdHash", "expiresAt")
+       VALUES ('anonymization-signup', $1, $2, true, 'anonymization-device', now() + interval '10 minutes')`,
+      [fixture.providerUserId, fixture.email],
+    );
+    await client.query(
+      `INSERT INTO "kakaoLoginFlows" ("userId", "deviceIdHash", "providerUserId", email, "emailVerified", status, "expiresAt")
+       VALUES ($1, 'anonymization-device', $2, $3, true, 'EXISTING_USER', now() + interval '10 minutes')`,
+      [fixture.userId, fixture.providerUserId, fixture.email],
+    );
+    await client.query(`INSERT INTO "brandFollows" ("userId", "brandId") VALUES ($1, $2)`, [
+      fixture.userId,
+      FIXTURE.brandId,
+    ]);
+    await client.query(
+      `INSERT INTO "stylePosts" ("stylePostId", "authorId", title, content, "imageUrls", "imageKeys")
+       VALUES ($1, $2, 'Preserved style', 'Preserved style', '[]', '[]')`,
+      [fixture.stylePostId, fixture.userId],
+    );
+    await client.query(`INSERT INTO "stylePostProducts" ("stylePostId", "productId") VALUES ($1, $2)`, [
+      fixture.stylePostId,
+      FIXTURE.productId,
+    ]);
+    await client.query(`INSERT INTO "stylePostLikes" ("stylePostId", "userId") VALUES ($1, $2)`, [
+      fixture.stylePostId,
+      fixture.userId,
+    ]);
+    await client.query(`INSERT INTO wishes ("userId", "productId") VALUES ($1, $2)`, [
+      fixture.userId,
+      FIXTURE.productId,
+    ]);
+    await client.query(`INSERT INTO "recentProductViews" ("userId", "productId") VALUES ($1, $2)`, [
+      fixture.userId,
+      FIXTURE.productId,
+    ]);
+    await client.query(`INSERT INTO "comparisonItems" ("userId", "productId") VALUES ($1, $2)`, [
+      fixture.userId,
+      FIXTURE.productId,
+    ]);
+    await client.query(`INSERT INTO carts ("cartId", "userId") VALUES ($1, $2)`, [fixture.cartId, fixture.userId]);
+    await client.query(`INSERT INTO "cartItems" ("cartId", "skuId", quantity) VALUES ($1, $2, 1)`, [
+      fixture.cartId,
+      FIXTURE.skuId,
+    ]);
+    await client.query(
+      `INSERT INTO orders ("orderId", "orderNumber", "userId", status, "paymentStatus", "totalAmount")
+       VALUES ($1, 'DJ-ANONYMIZATION-001', $2, 'COMPLETED', 'APPROVED', 15000)`,
+      [fixture.orderId, fixture.userId],
+    );
+    await client.query(
+      `INSERT INTO "orderItems"
+        ("orderItemId", "orderId", "productId", "skuId", "productTitle", "skuOptionName", "unitPrice", quantity)
+       VALUES ($1, $2, $3, $4, 'Integration Sale Tee', 'Black / M', 15000, 1)`,
+      [fixture.orderItemId, fixture.orderId, FIXTURE.productId, FIXTURE.skuId],
+    );
+    await client.query(
+      `INSERT INTO "checkoutIdempotencyKeys" ("userId", "idempotencyKey", "orderId", status)
+       VALUES ($1, 'anonymization-checkout', $2, 'COMPLETED')`,
+      [fixture.userId, fixture.orderId],
+    );
+    await client.query(
+      `INSERT INTO "activityEvents" ("actorUserId", "eventType", "subjectType", "subjectId", payload)
+       VALUES ($1, 'VIEW', 'PRODUCT', $2, '{"source":"fixture"}')`,
+      [fixture.userId, FIXTURE.productId],
+    );
+    await client.query(
+      `INSERT INTO "consentDocuments" ("documentId", type, title, body, version, required, "activeFrom")
+       VALUES ($1, 'SERVICE_TERMS', 'Terms', 'Terms', 'anonymization', true, now())`,
+      [fixture.consentDocumentId],
+    );
+    await client.query(
+      `INSERT INTO "userConsentAcceptances" ("userId", "documentId", agreed, "agreedAt")
+       VALUES ($1, $2, true, now())`,
+      [fixture.userId, fixture.consentDocumentId],
+    );
+    await client.query(
+      `INSERT INTO "auditLogs" ("actorUserId", action, "entityType", "entityId", metadata)
+       VALUES ($1, 'ACCOUNT_EVENT', 'USER', $2, '{"source":"fixture"}')`,
+      [fixture.userId, fixture.userId],
+    );
+    await client.query(
+      `INSERT INTO "mediaObjectPromotions"
+        ("finalKey", "ownerUserId", kind, "contentType", "objectSize", status, "readyAt")
+       VALUES ($1, $2, 'STYLE_POST', 'image/jpeg', 100, 'READY', now())`,
+      [fixture.mediaKey, fixture.userId],
+    );
+    await client.query(
+      `INSERT INTO "mediaObjectReferences" ("entityType", "entityId", "finalKey")
+       VALUES ('STYLE_POST', $1, $2)`,
+      [fixture.stylePostId, fixture.mediaKey],
+    );
+    await client.query(
+      `INSERT INTO "requestAdmission" (action, "scopeType", "scopeHash", "requestCount", "windowStartedAt", "expiresAt")
+       VALUES ('anonymization-preserved', 'USER', $1, 1, now(), now() + interval '1 hour')`,
+      [fixture.userId],
+    );
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
+};
+
 jest.setTimeout(30_000);
 
 describe("FO account lifecycle", () => {
   let app: INestApplication;
+  let emailRepository: EmailRepository;
   let pool: Pool;
+  let foAccountRepository: FoAccountRepository;
   let kakaoFlowRepository: KakaoFlowRepository;
 
   beforeAll(async () => {
     pool = testPool();
     app = await createApp();
     await app.listen(0, "127.0.0.1");
+    emailRepository = app.get(EmailRepository);
+    foAccountRepository = app.get(FoAccountRepository);
     kakaoFlowRepository = app.get(KakaoFlowRepository);
   });
 
@@ -976,5 +1183,364 @@ describe("FO account lifecycle", () => {
     );
     expect(state.rows[0]).toEqual({ signupUsed: false, identityConsumed: false, links: 0, consents: 0 });
     await expectDeactivatedWithoutSessions(pool);
+  });
+
+  it("removes personal rows while preserving legal and authored records", async () => {
+    const fixture = ANONYMIZATION_FIXTURE;
+    await seedAnonymizationFixture(pool);
+
+    await expect(foAccountRepository.anonymizeDueBatch(100)).resolves.toEqual([fixture.userId]);
+
+    const removed = await pool.query<Record<string, number>>(
+      `SELECT
+        (SELECT count(*)::int FROM "accountReactivationTokens" WHERE "userId" = $1) AS "reactivationTokens",
+        (SELECT count(*)::int FROM "refreshToken" WHERE "userId" = $1) AS "refreshTokens",
+        (SELECT count(*)::int FROM "refreshTokenRotationMarker" WHERE "userId" = $1) AS "rotationMarkers",
+        (SELECT count(*)::int FROM "passwordResetToken" WHERE "userId" = $1) AS "passwordResetTokens",
+        (SELECT count(*)::int FROM "emailVerificationToken" WHERE email = $2) AS "emailVerificationTokens",
+        (SELECT count(*)::int FROM "emailVerification" WHERE email = $2) AS "emailVerifications",
+        (SELECT count(*)::int FROM "emailDeliveryOutbox" WHERE email = $2) AS "emailOutbox",
+        (SELECT count(*)::int FROM "kakaoSignupToken" WHERE "providerUserId" = $3 OR email = $2) AS "kakaoSignupTokens",
+        (SELECT count(*)::int FROM "kakaoLoginFlows" WHERE "userId" = $1 OR "providerUserId" = $3 OR email = $2) AS "kakaoLoginFlows",
+        (SELECT count(*)::int FROM "identityVerificationSessions" WHERE "ciHash" = $4) AS "identitySessions",
+        (SELECT count(*)::int FROM "authIdentity" WHERE "userId" = $1) AS "authIdentities",
+        (SELECT count(*)::int FROM "verifiedIdentities" WHERE "userId" = $1) AS "verifiedIdentities",
+        (SELECT count(*)::int FROM "brandFollows" WHERE "userId" = $1) AS "brandFollows",
+        (SELECT count(*)::int FROM "stylePostLikes" WHERE "userId" = $1) AS "stylePostLikes",
+        (SELECT count(*)::int FROM wishes WHERE "userId" = $1) AS wishes,
+        (SELECT count(*)::int FROM "recentProductViews" WHERE "userId" = $1) AS "recentProductViews",
+        (SELECT count(*)::int FROM "comparisonItems" WHERE "userId" = $1) AS "comparisonItems",
+        (SELECT count(*)::int FROM "cartItems" ci INNER JOIN carts c ON c."cartId" = ci."cartId" WHERE c."userId" = $1) AS "cartItems",
+        (SELECT count(*)::int FROM carts WHERE "userId" = $1) AS carts,
+        (SELECT count(*)::int FROM "checkoutIdempotencyKeys" WHERE "userId" = $1) AS "checkoutIdempotencyKeys",
+        (SELECT count(*)::int FROM "activityEvents" WHERE "actorUserId" = $1) AS "activityEvents"`,
+      [fixture.userId, fixture.email, fixture.providerUserId, fixture.ciHash],
+    );
+    expect(removed.rows[0]).toEqual({
+      reactivationTokens: 0,
+      refreshTokens: 0,
+      rotationMarkers: 0,
+      passwordResetTokens: 0,
+      emailVerificationTokens: 0,
+      emailVerifications: 0,
+      emailOutbox: 0,
+      kakaoSignupTokens: 0,
+      kakaoLoginFlows: 0,
+      identitySessions: 0,
+      authIdentities: 0,
+      verifiedIdentities: 0,
+      brandFollows: 0,
+      stylePostLikes: 0,
+      wishes: 0,
+      recentProductViews: 0,
+      comparisonItems: 0,
+      cartItems: 0,
+      carts: 0,
+      checkoutIdempotencyKeys: 0,
+      activityEvents: 0,
+    });
+    const preserved = await pool.query<{
+      auditLogs: number;
+      consentAcceptances: number;
+      mediaPromotions: number;
+      mediaReferences: number;
+      orderItems: number;
+      orders: number;
+      requestAdmissions: number;
+      stylePosts: number;
+      users: number;
+    }>(
+      `SELECT
+        (SELECT count(*)::int FROM users WHERE "userId" = $1) AS users,
+        (SELECT count(*)::int FROM orders WHERE "userId" = $1) AS orders,
+        (SELECT count(*)::int FROM "orderItems" oi INNER JOIN orders o ON o."orderId" = oi."orderId" WHERE o."userId" = $1) AS "orderItems",
+        (SELECT count(*)::int FROM "stylePosts" WHERE "authorId" = $1) AS "stylePosts",
+        (SELECT count(*)::int FROM "userConsentAcceptances" WHERE "userId" = $1) AS "consentAcceptances",
+        (SELECT count(*)::int FROM "auditLogs" WHERE "actorUserId" = $1) AS "auditLogs",
+        (SELECT count(*)::int FROM "mediaObjectPromotions" WHERE "ownerUserId" = $1) AS "mediaPromotions",
+        (SELECT count(*)::int FROM "mediaObjectReferences" WHERE "entityId" = $2) AS "mediaReferences",
+        (SELECT count(*)::int FROM "requestAdmission" WHERE action = 'anonymization-preserved' AND "scopeHash" = $3) AS "requestAdmissions"`,
+      [fixture.userId, fixture.stylePostId, fixture.userId],
+    );
+    expect(preserved.rows[0]).toEqual({
+      users: 1,
+      orders: 1,
+      orderItems: 1,
+      stylePosts: 1,
+      consentAcceptances: 1,
+      auditLogs: 1,
+      mediaPromotions: 1,
+      mediaReferences: 1,
+      requestAdmissions: 1,
+    });
+    const user = await pool.query<{
+      anonymizedAt: Date | null;
+      email: string;
+      password: string | null;
+      userid: string;
+    }>(`SELECT "userid", "email", "password", "anonymizedAt" FROM users WHERE "userId" = $1`, [fixture.userId]);
+    expect(user.rows[0]).toEqual({
+      userid: `deleted-${fixture.userId.replaceAll("-", "")}`,
+      email: `deleted+${fixture.userId.replaceAll("-", "")}@invalid.local`,
+      password: null,
+      anonymizedAt: expect.any(Date),
+    });
+  });
+
+  it("masks a preserved style post author after anonymization", async () => {
+    const fixture = ANONYMIZATION_FIXTURE;
+    await seedAnonymizationFixture(pool);
+    await foAccountRepository.anonymizeDueBatch(100);
+
+    const response = await request(app.getHttpServer())
+      .post("/graphql")
+      .send({
+        query: `query StylePost($stylePostId: String!) {
+          stylePost(stylePostId: $stylePostId) { author { userId userid } }
+        }`,
+        variables: { stylePostId: fixture.stylePostId },
+      });
+
+    expect(response.body.errors).toBeUndefined();
+    expect(response.body.data.stylePost.author).toEqual({ userId: fixture.userId, userid: "탈퇴한 사용자" });
+  });
+
+  it("claims only the 100 earliest due users in deterministic order", async () => {
+    const userIds = Array.from({ length: 101 }, (_, index) => batchUserId(index + 1));
+    await seedDueUsers(pool, userIds);
+
+    const anonymized = await foAccountRepository.anonymizeDueBatch(100);
+
+    expect(anonymized).toEqual(userIds.slice(0, 100));
+    const remaining = await pool.query<{ userId: string }>(
+      `SELECT "userId" FROM users
+       WHERE "deactivatedAt" IS NOT NULL AND "anonymizedAt" IS NULL
+       ORDER BY "scheduledAnonymizationAt", "userId"`,
+    );
+    expect(remaining.rows).toEqual([{ userId: userIds[100] }]);
+  });
+
+  it("lets two workers skip locked users without processing the same account", async () => {
+    const firstUserId = batchUserId(201);
+    const secondUserId = batchUserId(202);
+    await seedDueUsers(pool, [firstUserId, secondUserId]);
+    await pool.query(
+      `CREATE OR REPLACE FUNCTION block_first_anonymization() RETURNS trigger AS $$
+       BEGIN
+         IF NEW."userId" = '${firstUserId}'::uuid AND OLD."anonymizedAt" IS NULL AND NEW."anonymizedAt" IS NOT NULL THEN
+           PERFORM pg_advisory_xact_lock(hashtextextended(NEW."userId"::text, 91));
+         END IF;
+         RETURN NEW;
+       END;
+       $$ LANGUAGE plpgsql;
+       CREATE TRIGGER block_first_anonymization_trigger
+       BEFORE UPDATE ON users
+       FOR EACH ROW EXECUTE FUNCTION block_first_anonymization()`,
+    );
+    const blocker = await startAdvisoryBlocker(pool, firstUserId, 91);
+    const firstRun = foAccountRepository.anonymizeDueBatch(2);
+    let released = false;
+
+    try {
+      await waitFor(async () => (await blockedBy(pool, blocker.pid)) === 1);
+      const secondRun = await foAccountRepository.anonymizeDueBatch(2);
+      expect(secondRun).toEqual([secondUserId]);
+      await releaseBlocker(blocker.client);
+      released = true;
+      await expect(firstRun).resolves.toEqual([firstUserId]);
+    } finally {
+      if (!released) {
+        await rollbackBlocker(blocker.client);
+        await Promise.allSettled([firstRun]);
+      }
+      await pool.query(`DROP TRIGGER IF EXISTS block_first_anonymization_trigger ON users`);
+      await pool.query(`DROP FUNCTION IF EXISTS block_first_anonymization()`);
+    }
+    const state = await pool.query<{ count: number }>(
+      `SELECT count(*)::int AS count FROM users WHERE "userId" = ANY($1::uuid[]) AND "anonymizedAt" IS NOT NULL`,
+      [[firstUserId, secondUserId]],
+    );
+    expect(state.rows[0]?.count).toBe(2);
+  });
+
+  it("rolls back every cleanup row when the retained-user update fails", async () => {
+    const fixture = ANONYMIZATION_FIXTURE;
+    await seedAnonymizationFixture(pool);
+    await pool.query(
+      `CREATE OR REPLACE FUNCTION reject_anonymization_update() RETURNS trigger AS $$
+       BEGIN
+         IF NEW."userId" = '${fixture.userId}'::uuid AND NEW."anonymizedAt" IS NOT NULL THEN
+           RAISE EXCEPTION 'reject anonymization fixture';
+         END IF;
+         RETURN NEW;
+       END;
+       $$ LANGUAGE plpgsql;
+       CREATE TRIGGER reject_anonymization_update_trigger
+       BEFORE UPDATE ON users
+       FOR EACH ROW EXECUTE FUNCTION reject_anonymization_update()`,
+    );
+
+    let failure: unknown;
+    try {
+      await foAccountRepository.anonymizeDueBatch(100).catch((error: unknown) => {
+        failure = error;
+      });
+    } finally {
+      await pool.query(`DROP TRIGGER IF EXISTS reject_anonymization_update_trigger ON users`);
+      await pool.query(`DROP FUNCTION IF EXISTS reject_anonymization_update()`);
+    }
+    expect(hasDatabaseErrorCode(failure, "P0001")).toBe(true);
+    const state = await pool.query<{
+      anonymizedAt: Date | null;
+      reactivationTokens: number;
+      wishes: number;
+      carts: number;
+    }>(
+      `SELECT "anonymizedAt",
+        (SELECT count(*)::int FROM "accountReactivationTokens" WHERE "userId" = $1) AS "reactivationTokens",
+        (SELECT count(*)::int FROM wishes WHERE "userId" = $1) AS wishes,
+        (SELECT count(*)::int FROM carts WHERE "userId" = $1) AS carts
+       FROM users WHERE "userId" = $1`,
+      [fixture.userId],
+    );
+    expect(state.rows[0]).toEqual({ anonymizedAt: null, reactivationTokens: 1, wishes: 1, carts: 1 });
+  });
+
+  it("leaves unrelated user and behavioral rows unchanged", async () => {
+    const fixture = ANONYMIZATION_FIXTURE;
+    const otherUserId = batchUserId(301);
+    await seedAnonymizationFixture(pool);
+    await pool.query(
+      `INSERT INTO users ("userId", "userid", "email", "password", role)
+       VALUES ($1, 'unrelated-user', 'unrelated@example.test', 'unrelated-password', 'USER')`,
+      [otherUserId],
+    );
+    await pool.query(
+      `INSERT INTO "authIdentity" ("userId", provider, "providerUserId") VALUES ($1, 'kakao', 'unrelated-kakao')`,
+      [otherUserId],
+    );
+    await pool.query(`INSERT INTO wishes ("userId", "productId") VALUES ($1, $2)`, [
+      otherUserId,
+      FIXTURE.secondProductId,
+    ]);
+    await pool.query(`INSERT INTO carts ("userId") VALUES ($1)`, [otherUserId]);
+    await pool.query(
+      `INSERT INTO "emailDeliveryOutbox" (kind, email, status, "expiresAt")
+       VALUES ('PASSWORD_RESET_LINK', 'unrelated@example.test', 'PENDING', now() + interval '10 minutes')`,
+    );
+
+    await foAccountRepository.anonymizeDueBatch(100);
+
+    const state = await pool.query<{
+      authIdentities: number;
+      carts: number;
+      email: string;
+      emailOutbox: number;
+      password: string;
+      userid: string;
+      wishes: number;
+    }>(
+      `SELECT userid, email, password,
+        (SELECT count(*)::int FROM "authIdentity" WHERE "userId" = $1) AS "authIdentities",
+        (SELECT count(*)::int FROM wishes WHERE "userId" = $1) AS wishes,
+        (SELECT count(*)::int FROM carts WHERE "userId" = $1) AS carts,
+        (SELECT count(*)::int FROM "emailDeliveryOutbox" WHERE email = 'unrelated@example.test') AS "emailOutbox"
+       FROM users WHERE "userId" = $1`,
+      [otherUserId],
+    );
+    expect(state.rows[0]).toEqual({
+      userid: "unrelated-user",
+      email: "unrelated@example.test",
+      password: "unrelated-password",
+      authIdentities: 1,
+      wishes: 1,
+      carts: 1,
+      emailOutbox: 1,
+    });
+    expect(
+      (await pool.query(`SELECT "anonymizedAt" FROM users WHERE "userId" = $1`, [fixture.userId])).rows[0],
+    ).toEqual({ anonymizedAt: expect.any(Date) });
+  });
+
+  it("rolls back and retries later when email preparation owns the matching outbox lock", async () => {
+    const fixture = ANONYMIZATION_FIXTURE;
+    await seedAnonymizationFixture(pool);
+    const emailTransaction = await pool.connect();
+    await emailTransaction.query("BEGIN");
+    await emailTransaction.query(`SELECT id FROM "emailDeliveryOutbox" WHERE email = $1 FOR UPDATE`, [fixture.email]);
+    const firstRun = foAccountRepository.anonymizeDueBatch(1);
+    let transactionOpen = true;
+
+    try {
+      const firstResult = await Promise.race([
+        firstRun,
+        new Promise<"timed-out">((resolve) => setTimeout(() => resolve("timed-out"), 500)),
+      ]);
+      expect(firstResult).toEqual([]);
+      await emailTransaction.query(`SELECT "userId" FROM users WHERE "userId" = $1 FOR KEY SHARE`, [fixture.userId]);
+      const pending = await pool.query<{ anonymizedAt: Date | null; wishes: number }>(
+        `SELECT "anonymizedAt", (SELECT count(*)::int FROM wishes WHERE "userId" = $1) AS wishes
+         FROM users WHERE "userId" = $1`,
+        [fixture.userId],
+      );
+      expect(pending.rows[0]).toEqual({ anonymizedAt: null, wishes: 1 });
+      await emailTransaction.query("COMMIT");
+      transactionOpen = false;
+      await expect(foAccountRepository.anonymizeDueBatch(1)).resolves.toEqual([fixture.userId]);
+    } finally {
+      if (transactionOpen) await emailTransaction.query("ROLLBACK").catch(() => undefined);
+      emailTransaction.release();
+      await Promise.allSettled([firstRun]);
+    }
+  });
+
+  it("orders a concurrent matching outbox insert before anonymization cleanup", async () => {
+    const fixture = ANONYMIZATION_FIXTURE;
+    await seedAnonymizationFixture(pool);
+    await pool.query(
+      `CREATE OR REPLACE FUNCTION block_anonymization_outbox_insert() RETURNS trigger AS $$
+       BEGIN
+         IF NEW.email = '${fixture.email}' THEN
+           PERFORM pg_advisory_xact_lock(hashtextextended(NEW.email, 92));
+         END IF;
+         RETURN NEW;
+       END;
+       $$ LANGUAGE plpgsql;
+       CREATE TRIGGER block_anonymization_outbox_insert_trigger
+       BEFORE INSERT ON "emailDeliveryOutbox"
+       FOR EACH ROW EXECUTE FUNCTION block_anonymization_outbox_insert()`,
+    );
+    const blocker = await startAdvisoryBlocker(pool, fixture.email, 92);
+    const enqueue = emailRepository.enqueueDelivery({
+      email: fixture.email,
+      expiresAt: new Date(Date.now() + 10 * 60_000),
+      kind: "PASSWORD_RESET_LINK",
+    });
+    let blockerReleased = false;
+    let firstRun: Promise<string[]> | undefined;
+
+    try {
+      await waitFor(async () => (await blockedBy(pool, blocker.pid)) === 1);
+      firstRun = foAccountRepository.anonymizeDueBatch(1);
+      const firstResult = await Promise.race([
+        firstRun,
+        new Promise<"timed-out">((resolve) => setTimeout(() => resolve("timed-out"), 500)),
+      ]);
+      expect(firstResult).toEqual([]);
+      await releaseBlocker(blocker.client);
+      blockerReleased = true;
+      await enqueue;
+      await expect(foAccountRepository.anonymizeDueBatch(1)).resolves.toEqual([fixture.userId]);
+      const matchingOutbox = await pool.query<{ count: number }>(
+        `SELECT count(*)::int AS count FROM "emailDeliveryOutbox" WHERE email = $1`,
+        [fixture.email],
+      );
+      expect(matchingOutbox.rows[0]?.count).toBe(0);
+    } finally {
+      if (!blockerReleased) await rollbackBlocker(blocker.client);
+      await Promise.allSettled([enqueue, ...(firstRun ? [firstRun] : [])]);
+      await pool.query(`DROP TRIGGER IF EXISTS block_anonymization_outbox_insert_trigger ON "emailDeliveryOutbox"`);
+      await pool.query(`DROP FUNCTION IF EXISTS block_anonymization_outbox_insert()`);
+    }
   });
 });

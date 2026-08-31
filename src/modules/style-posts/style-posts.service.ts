@@ -511,7 +511,7 @@ export class StylePostsService {
     const brandIds = unique(rows.flatMap((row) => row.brandTagIds ?? []));
     const [authors, productLinks, likeCounts, likedRows, brandRows] = await Promise.all([
       this.db
-        .select({ userId: users.userId, userid: users.userid })
+        .select({ userId: users.userId, userid: users.userid, anonymizedAt: users.anonymizedAt })
         .from(users)
         .where(inArray(users.userId, authorIds)),
       this.db
@@ -553,7 +553,12 @@ export class StylePostsService {
             .where(inArray(brands.brandId, brandIds))
         : Promise.resolve([] as { brandId: string; name: string }[]),
     ]);
-    const authorById = new Map(authors.map((author) => [author.userId, author]));
+    const authorById = new Map(
+      authors.map(({ userId, userid, anonymizedAt }) => [
+        userId,
+        { userId, userid: anonymizedAt ? "탈퇴한 사용자" : userid },
+      ]),
+    );
     const productsByPost = new Map<string, StylePostProductType[]>();
     for (const product of productLinks) {
       const list = productsByPost.get(product.stylePostId) ?? [];
