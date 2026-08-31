@@ -1,6 +1,10 @@
 import { Inject, Injectable } from "@nestjs/common";
 import { and, desc, eq, inArray } from "drizzle-orm";
-import { CustomBadRequestException, CustomNotFoundException } from "src/common/errors/custom-exceptions";
+import {
+  CustomBadRequestException,
+  CustomNotFoundException,
+  CustomUnauthorizedException,
+} from "src/common/errors/custom-exceptions";
 import { requireResult } from "src/common/invariants/require-result";
 import { assertCartItemCount, calculateCartTotal, MAX_CART_ITEMS } from "src/modules/cart/cart-invariants";
 import { OrderErrorMessage, getInsufficientStockMessage } from "./order.error";
@@ -14,6 +18,7 @@ import {
   orders,
   productSkus,
   products,
+  users,
 } from "src/modules/database/schema";
 
 type CheckoutInput = { idempotencyKey?: string };
@@ -28,6 +33,9 @@ export class OrderService {
   checkoutCart = async (userId: string, input: CheckoutInput) =>
     this.db.transaction(async (tx) => {
       if (!input.idempotencyKey?.trim()) throw new CustomBadRequestException(OrderErrorMessage.IdempotencyKeyRequired);
+      const [user] = await tx.select().from(users).where(eq(users.userId, userId)).limit(1).for("no key update");
+      if (!user || user.deactivatedAt || user.anonymizedAt)
+        throw new CustomUnauthorizedException(OrderErrorMessage.AuthenticationRequired);
       const checkoutKey = input.idempotencyKey.trim();
       const [idempotencyRecord] = await tx
         .insert(checkoutIdempotencyKeys)

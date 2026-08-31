@@ -17,6 +17,19 @@ const listQuery = (rows: readonly unknown[]) => {
   return chain;
 };
 
+const lockedQuery = (rows: readonly unknown[]) => {
+  const chain = {
+    from: jest.fn(),
+    where: jest.fn(),
+    limit: jest.fn(),
+    for: jest.fn().mockResolvedValue(rows),
+  };
+  chain.from.mockReturnValue(chain);
+  chain.where.mockReturnValue(chain);
+  chain.limit.mockReturnValue(chain);
+  return chain;
+};
+
 describe("OrderService", () => {
   it("loads an order list and all items in two queries", async () => {
     const createdAt = new Date("2026-08-29T00:00:00Z");
@@ -86,10 +99,12 @@ describe("OrderService", () => {
   });
 
   it("rejects an empty cart after claiming an idempotency key", async () => {
+    const userQuery = lockedQuery([{ userId: "user-1", deactivatedAt: null, anonymizedAt: null }]);
+    const cartQuery = lockedQuery([]);
     const db = {
       transaction: async (callback: (tx: unknown) => Promise<unknown>) =>
         callback({
-          select: () => ({ from: () => ({ where: () => ({ limit: () => ({ for: async () => [] }) }) }) }),
+          select: jest.fn().mockReturnValueOnce(userQuery).mockReturnValueOnce(cartQuery),
           insert: () => ({
             values: () => ({
               onConflictDoNothing: () => ({ returning: async () => [{ checkoutIdempotencyKeyId: "key-1" }] }),
@@ -105,7 +120,6 @@ describe("OrderService", () => {
 
   it("returns the existing order for a reused idempotency key", async () => {
     let insertCount = 0;
-    let selectCount = 0;
     const order = {
       orderId: "order-1",
       orderNumber: "DJ-1",
@@ -117,24 +131,19 @@ describe("OrderService", () => {
       createdAt: new Date(),
       updatedAt: new Date(),
     };
+    const userQuery = lockedQuery([{ userId: "user-1", deactivatedAt: null, anonymizedAt: null }]);
+    const idempotencyQuery = listQuery([{ orderId: "order-1" }]);
+    const orderQuery = listQuery([order]);
+    const itemQuery = listQuery([]);
     const db = {
       transaction: async (callback: (tx: unknown) => Promise<unknown>) =>
         callback({
-          select: () => ({
-            from: () => ({
-              where: () => {
-                selectCount += 1;
-                if (selectCount === 3) return Promise.resolve([]);
-                return {
-                  limit: async () => {
-                    if (selectCount === 1) return [{ orderId: "order-1" }];
-                    if (selectCount === 2) return [order];
-                    return [];
-                  },
-                };
-              },
-            }),
-          }),
+          select: jest
+            .fn()
+            .mockReturnValueOnce(userQuery)
+            .mockReturnValueOnce(idempotencyQuery)
+            .mockReturnValueOnce(orderQuery)
+            .mockReturnValueOnce(itemQuery),
           insert: () => ({
             values: () => {
               insertCount += 1;

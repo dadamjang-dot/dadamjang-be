@@ -137,9 +137,11 @@ describe("PostgreSQL checkout concurrency", () => {
       await waitFor(async () => {
         const waiting = await pool.query<{ count: number }>(
           `SELECT count(*)::int AS count
-           FROM pg_locks lock
-           JOIN pg_class relation ON relation.oid = lock.relation
-           WHERE relation.relname = 'checkoutIdempotencyKeys' AND NOT lock.granted`,
+           FROM pg_stat_activity
+           WHERE datname = current_database()
+             AND pid <> pg_backend_pid()
+             AND wait_event_type = 'Lock'
+             AND (query LIKE '%"users"%' OR query LIKE '%"checkoutIdempotencyKeys"%')`,
         );
         return (waiting.rows[0]?.count ?? 0) >= 2;
       });
@@ -187,7 +189,7 @@ describe("PostgreSQL checkout concurrency", () => {
            WHERE datname = current_database()
              AND pid <> pg_backend_pid()
              AND wait_event_type = 'Lock'
-             AND (query LIKE '%"orders"%' OR query LIKE '%"carts"%')`,
+             AND (query LIKE '%"users"%' OR query LIKE '%"orders"%' OR query LIKE '%"carts"%')`,
         );
         return (waiting.rows[0]?.count ?? 0) >= 2;
       });

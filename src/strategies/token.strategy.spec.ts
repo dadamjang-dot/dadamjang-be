@@ -10,6 +10,14 @@ const jwt = new JwtService();
 const config = {
   getOrThrow: jest.fn((key: string) => (key === "JWT_ACCESS_TOKEN_SECRET" ? accessSecret : refreshSecret)),
 } as unknown as ConfigService;
+const activeUserRepository = {
+  findUser: jest.fn().mockResolvedValue({
+    userId: "user-1",
+    deactivatedAt: null,
+    scheduledAnonymizationAt: null,
+    anonymizedAt: null,
+  }),
+};
 
 type AuthenticatableStrategy = {
   authenticate(request: Request, options?: object): void;
@@ -54,13 +62,28 @@ describe("JWT strategies", () => {
     ["invalid role", signAccess({ userId: "user-1", role: "ROOT", tokenUse: "access" })],
     ["missing identifier", signAccess({ role: "USER", tokenUse: "access" })],
   ])("rejects access-token confusion from %s", async (_case, token) => {
-    await expect(authenticate(new JwtAccessTokenStrategy(config), token)).rejects.toThrow();
+    await expect(
+      authenticate(new JwtAccessTokenStrategy(config, activeUserRepository as never), token),
+    ).rejects.toThrow();
   });
 
   it("accepts a narrowed access payload", async () => {
     const payload = { userId: "user-1", role: "USER", tokenUse: "access" };
 
-    await expect(authenticate(new JwtAccessTokenStrategy(config), signAccess(payload))).resolves.toMatchObject(payload);
+    await expect(
+      authenticate(new JwtAccessTokenStrategy(config, activeUserRepository as never), signAccess(payload)),
+    ).resolves.toMatchObject(payload);
+  });
+
+  it.each([
+    ["missing", undefined],
+    ["deactivated", { userId: "user-1", deactivatedAt: new Date(), anonymizedAt: null }],
+    ["anonymized", { userId: "user-1", deactivatedAt: new Date(), anonymizedAt: new Date() }],
+  ])("rejects a valid access token for a %s user", async (_case, currentUser) => {
+    const repository = { findUser: jest.fn().mockResolvedValue(currentUser) };
+    const token = signAccess({ userId: "user-1", role: "USER", tokenUse: "access" });
+
+    await expect(authenticate(new JwtAccessTokenStrategy(config, repository as never), token)).rejects.toThrow();
   });
 
   it.each([

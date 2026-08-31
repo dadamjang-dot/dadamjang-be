@@ -1,6 +1,7 @@
 import { Inject, Injectable } from "@nestjs/common";
 import { and, eq, gt, lt, sql } from "drizzle-orm";
-import { Database, DRIZZLE } from "src/modules/database/database.module";
+import { CustomUnauthorizedException } from "src/common/errors/custom-exceptions";
+import { Database, DatabaseExecutor, DatabaseTransaction, DRIZZLE } from "src/modules/database/database.module";
 import {
   refreshTokenRotationMarkers,
   refreshTokens,
@@ -8,8 +9,9 @@ import {
   type RefreshToken,
   type User,
 } from "src/modules/database/schema";
+import { AuthErrorMessage } from "./auth.error";
 
-export type RefreshTokenStore = Pick<Database, "delete" | "insert" | "query" | "select" | "update">;
+export type RefreshTokenStore = DatabaseTransaction;
 
 const MIN_SIGNIN_REISSUE_INTERVAL_MS = 1000;
 const REFRESH_ROTATION_HISTORY_SECONDS = 60;
@@ -36,7 +38,7 @@ export class AuthRepository {
     if (Number.isNaN(startedAt.getTime())) throw new Error("Failed to start sign-in");
     return startedAt;
   };
-  withSigninLock = <T>(userId: string, deviceId: string, action: (store: RefreshTokenStore) => Promise<T>) =>
+  withSigninLock = <T>(userId: string, deviceId: string, action: (store: DatabaseTransaction) => Promise<T>) =>
     this.db.transaction(async (tx) => {
       const lock = await tx.execute<{ acquired: boolean }>(
         sql`SELECT pg_try_advisory_xact_lock(hashtextextended(${`${userId}:${deviceId}`}, 2)) AS "acquired"`,
@@ -48,6 +50,19 @@ export class AuthRepository {
     this.db.query.users.findFirst({ where: eq(users.userid, userid) });
   findUser = (userId: string): Promise<User | undefined> =>
     this.db.query.users.findFirst({ where: eq(users.userId, userId) });
+  withActiveUserSession = <T>(
+    userId: string,
+    action: (user: User, store: DatabaseTransaction) => Promise<T>,
+    store?: DatabaseTransaction,
+  ) => {
+    const execute = async (tx: DatabaseTransaction) => {
+      const [user] = await tx.select().from(users).where(eq(users.userId, userId)).limit(1).for("update");
+      if (!user || user.deactivatedAt || user.anonymizedAt)
+        throw new CustomUnauthorizedException(AuthErrorMessage.AuthRequired);
+      return action(user, tx);
+    };
+    return store ? execute(store) : this.db.transaction(execute);
+  };
   findViewer = async (userId: string) =>
     (
       await this.db
@@ -65,12 +80,12 @@ export class AuthRepository {
   findRefreshToken = (
     userId: string,
     deviceId: string,
-    store: RefreshTokenStore = this.db,
+    store: DatabaseExecutor = this.db,
   ): Promise<RefreshToken | undefined> =>
     store.query.refreshTokens.findFirst({
       where: and(eq(refreshTokens.userId, userId), eq(refreshTokens.deviceId, deviceId)),
     });
-  saveRefreshToken = async (input: SaveRefreshTokenInput, store: RefreshTokenStore = this.db) => {
+  saveRefreshToken = async (input: SaveRefreshTokenInput, store: DatabaseExecutor = this.db) => {
     const { previousRefreshToken, signinStartedAt, ...session } = input;
     if (previousRefreshToken === undefined) {
       const [created] = await store
@@ -109,15 +124,18 @@ export class AuthRepository {
         );
     return Boolean(updated);
   };
-  rotateRefreshToken = async (input: {
-    userId: string;
-    deviceId: string;
-    previousRefreshToken: string;
-    rotationKey: string;
-    refreshToken: string;
-    refreshTokenExp: Date;
-  }): Promise<RefreshRotationResult> =>
-    this.db.transaction(async (tx) => {
+  rotateRefreshToken = async (
+    input: {
+      userId: string;
+      deviceId: string;
+      previousRefreshToken: string;
+      rotationKey: string;
+      refreshToken: string;
+      refreshTokenExp: Date;
+    },
+    store?: DatabaseTransaction,
+  ): Promise<RefreshRotationResult> => {
+    const rotate = async (tx: DatabaseTransaction) => {
       const [rotated] = await tx
         .update(refreshTokens)
         .set({
@@ -158,12 +176,14 @@ export class AuthRepository {
         WHERE ${refreshTokenRotationMarkers.id} = candidates.id
       `);
       return "rotated";
-    });
+    };
+    return store ? rotate(store) : this.db.transaction(rotate);
+  };
   hasRecentRotation = async (
     userId: string,
     deviceId: string,
     rotationKey: string,
-    store: RefreshTokenStore = this.db,
+    store: DatabaseExecutor = this.db,
   ) =>
     Boolean(
       await store.query.refreshTokenRotationMarkers.findFirst({
