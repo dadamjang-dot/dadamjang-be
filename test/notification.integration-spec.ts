@@ -1430,6 +1430,198 @@ describe("FO notification GraphQL integration", () => {
     expect(rows.rows.every(({ status, expoTicketId }) => status === "TICKETED" && expoTicketId !== null)).toBe(true);
   });
 
+  it("persists the still-owned ticket when logout invalidates one in-flight batch peer", async () => {
+    const invalidKey = "worker-partial-logout";
+    const validKey = "worker-partial-valid";
+    const invalidDeviceId = await seedPushDevice(pool, FIXTURE.userId, invalidKey);
+    const validDeviceId = await seedPushDevice(pool, FIXTURE.userId, validKey);
+    const invalid = await seedPushDelivery(pool, invalidDeviceId, "push-worker-partial-logout");
+    const valid = await seedPushDelivery(pool, validDeviceId, "push-worker-partial-valid");
+    const now = new Date("2026-08-31T12:00:00.000Z");
+    let release: (() => void) | undefined;
+    let started: (() => void) | undefined;
+    const providerRelease = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const providerStarted = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const provider = recordingPushSender({
+      send: async (messages) => {
+        started?.();
+        await providerRelease;
+        return messages.map(({ data }) => ({ status: "ok", id: `ticket-${data.notificationId}` }));
+      },
+    });
+    const worker = pushWorker(notificationRepository, provider.sender);
+    const firstRun = worker.runOnce(now);
+
+    try {
+      await providerStarted;
+      await db.transaction((tx) =>
+        notificationRepository.disableInstallation(
+          tx,
+          FIXTURE.userId,
+          `notification-${invalidKey}-installation`,
+          "LOGGED_OUT",
+        ),
+      );
+    } finally {
+      release?.();
+      await firstRun;
+    }
+    await worker.runOnce(new Date(now.getTime() + 30_001));
+
+    expect(provider.sent).toHaveLength(1);
+    expect(new Set(provider.sent[0]?.map(({ data }) => data.notificationId))).toEqual(
+      new Set([invalid.notificationId, valid.notificationId]),
+    );
+    const states = await pool.query<{ pushOutboxId: string; status: string; expoTicketId: string | null }>(
+      `SELECT "pushOutboxId", status, "expoTicketId"
+       FROM "pushOutbox"
+       WHERE "pushOutboxId" = ANY($1::uuid[])`,
+      [[invalid.pushOutboxId, valid.pushOutboxId]],
+    );
+    expect(new Map(states.rows.map(({ pushOutboxId, ...state }) => [pushOutboxId, state]))).toEqual(
+      new Map([
+        [invalid.pushOutboxId, { status: "FAILED", expoTicketId: null }],
+        [valid.pushOutboxId, { status: "TICKETED", expoTicketId: `ticket-${valid.notificationId}` }],
+      ]),
+    );
+  });
+
+  it("renews only the still-owned claims when a batch peer is logged out", async () => {
+    const invalidKey = "worker-renew-logout";
+    const invalidDeviceId = await seedPushDevice(pool, FIXTURE.userId, invalidKey);
+    const validDeviceId = await seedPushDevice(pool, FIXTURE.userId, "worker-renew-valid");
+    const invalid = await seedPushDelivery(pool, invalidDeviceId, "push-worker-renew-logout");
+    const valid = await seedPushDelivery(pool, validDeviceId, "push-worker-renew-valid");
+    const now = new Date("2026-08-31T12:00:00.000Z");
+    const claims = await notificationRepository.claimPushSendBatch(now, 100);
+    const renewedAt = new Date(now.getTime() + 10_000);
+    await db.transaction((tx) =>
+      notificationRepository.disableInstallation(
+        tx,
+        FIXTURE.userId,
+        `notification-${invalidKey}-installation`,
+        "LOGGED_OUT",
+      ),
+    );
+
+    await expect(notificationRepository.renewPushClaims(claims, renewedAt)).resolves.toBeUndefined();
+
+    const states = await pool.query<{
+      pushOutboxId: string;
+      status: string;
+      claimedAt: Date | null;
+      lastError: string | null;
+    }>(
+      `SELECT "pushOutboxId", status, "claimedAt", "lastError"
+       FROM "pushOutbox"
+       WHERE "pushOutboxId" = ANY($1::uuid[])`,
+      [[invalid.pushOutboxId, valid.pushOutboxId]],
+    );
+    expect(new Map(states.rows.map(({ pushOutboxId, ...state }) => [pushOutboxId, state]))).toEqual(
+      new Map([
+        [invalid.pushOutboxId, { status: "FAILED", claimedAt: null, lastError: "LOGGED_OUT" }],
+        [valid.pushOutboxId, { status: "PROCESSING", claimedAt: renewedAt, lastError: null }],
+      ]),
+    );
+  });
+
+  it("persists only the still-owned receipts when a batch peer is logged out", async () => {
+    const invalidKey = "worker-receipt-logout";
+    const invalidDeviceId = await seedPushDevice(pool, FIXTURE.userId, invalidKey);
+    const validDeviceId = await seedPushDevice(pool, FIXTURE.userId, "worker-receipt-valid");
+    const now = new Date("2026-08-31T12:00:00.000Z");
+    const invalidTicketId = "partial-owned-invalid-ticket";
+    const validTicketId = "partial-owned-valid-ticket";
+    const invalid = await seedPushDelivery(pool, invalidDeviceId, "push-worker-receipt-logout", {
+      status: "TICKETED",
+      expoTicketId: invalidTicketId,
+      receiptAvailableAt: now,
+    });
+    const valid = await seedPushDelivery(pool, validDeviceId, "push-worker-receipt-valid", {
+      status: "TICKETED",
+      expoTicketId: validTicketId,
+      receiptAvailableAt: now,
+    });
+    const claims = await notificationRepository.claimPushReceiptBatch(now, 1_000);
+    await db.transaction((tx) =>
+      notificationRepository.disableInstallation(
+        tx,
+        FIXTURE.userId,
+        `notification-${invalidKey}-installation`,
+        "LOGGED_OUT",
+      ),
+    );
+
+    await expect(
+      notificationRepository.persistPushReceipts(
+        claims,
+        { [invalidTicketId]: { status: "ok" }, [validTicketId]: { status: "ok" } },
+        now,
+      ),
+    ).resolves.toBeUndefined();
+
+    const states = await pool.query<{ pushOutboxId: string; status: string; lastError: string | null }>(
+      `SELECT "pushOutboxId", status, "lastError"
+       FROM "pushOutbox"
+       WHERE "pushOutboxId" = ANY($1::uuid[])`,
+      [[invalid.pushOutboxId, valid.pushOutboxId]],
+    );
+    expect(new Map(states.rows.map(({ pushOutboxId, ...state }) => [pushOutboxId, state]))).toEqual(
+      new Map([
+        [invalid.pushOutboxId, { status: "FAILED", lastError: "LOGGED_OUT" }],
+        [valid.pushOutboxId, { status: "RECEIPT_OK", lastError: null }],
+      ]),
+    );
+  });
+
+  it.each([
+    { method: "retryPushClaims" as const, expectedStatus: "PENDING" },
+    { method: "failPushClaims" as const, expectedStatus: "FAILED" },
+  ])(
+    "$method settles only the still-owned claims when a batch peer is logged out",
+    async ({ method, expectedStatus }) => {
+      const invalidKey = `worker-${method}-logout`;
+      const invalidDeviceId = await seedPushDevice(pool, FIXTURE.userId, invalidKey);
+      const validDeviceId = await seedPushDevice(pool, FIXTURE.userId, `worker-${method}-valid`);
+      const invalid = await seedPushDelivery(pool, invalidDeviceId, `push-${method}-logout`);
+      const valid = await seedPushDelivery(pool, validDeviceId, `push-${method}-valid`);
+      const now = new Date("2026-08-31T12:00:00.000Z");
+      const claims = await notificationRepository.claimPushSendBatch(now, 100);
+      const providerError = new Error("provider unavailable");
+      await db.transaction((tx) =>
+        notificationRepository.disableInstallation(
+          tx,
+          FIXTURE.userId,
+          `notification-${invalidKey}-installation`,
+          "LOGGED_OUT",
+        ),
+      );
+
+      const settlement =
+        method === "retryPushClaims"
+          ? notificationRepository.retryPushClaims(claims, providerError, now)
+          : notificationRepository.failPushClaims(claims, providerError, now);
+      await expect(settlement).resolves.toBeUndefined();
+
+      const states = await pool.query<{ pushOutboxId: string; status: string; lastError: string | null }>(
+        `SELECT "pushOutboxId", status, "lastError"
+       FROM "pushOutbox"
+       WHERE "pushOutboxId" = ANY($1::uuid[])`,
+        [[invalid.pushOutboxId, valid.pushOutboxId]],
+      );
+      expect(new Map(states.rows.map(({ pushOutboxId, ...state }) => [pushOutboxId, state]))).toEqual(
+        new Map([
+          [invalid.pushOutboxId, { status: "FAILED", lastError: "LOGGED_OUT" }],
+          [valid.pushOutboxId, { status: expectedStatus, lastError: "Error: provider unavailable" }],
+        ]),
+      );
+    },
+  );
+
   it("persists a cross-user worker batch with device transfer in canonical lock order", async () => {
     await seedSecondUser(pool);
     const highDeviceId = "ee000000-0000-4000-8000-000000000003";
@@ -1489,7 +1681,7 @@ describe("FO notification GraphQL integration", () => {
     }
   }, 15_000);
 
-  it("recovers a thirty-second stale claim and resets the receipt retry budget without letting its old token complete", async () => {
+  it("recovers a thirty-second stale claim and ignores settlement from its old token", async () => {
     const pushDeviceId = await seedPushDevice(pool, FIXTURE.userId, "worker-stale");
     const now = new Date("2026-08-31T12:00:00.000Z");
     const oldClaimToken = randomUUID();
@@ -1520,7 +1712,7 @@ describe("FO notification GraphQL integration", () => {
         [{ status: "ok", id: "old-ticket" }],
         now,
       ),
-    ).rejects.toThrow("Push delivery claim was lost");
+    ).resolves.toBeUndefined();
     const state = await pool.query<{ status: string; expoTicketId: string | null; attemptCount: number }>(
       `SELECT status, "expoTicketId", "attemptCount" FROM "pushOutbox" WHERE "pushOutboxId" = $1`,
       [delivery.pushOutboxId],

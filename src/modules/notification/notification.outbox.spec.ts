@@ -178,13 +178,13 @@ describe("NotificationOutboxWorker", () => {
     expect(repository.renewPushClaims).toHaveBeenCalledTimes(1);
   });
 
-  it("does not persist a provider result after heartbeat ownership is lost", async () => {
+  it("persists a send result through claim fencing after a transient heartbeat failure", async () => {
     const now = new Date("2026-08-31T02:00:00.000Z");
     jest.useFakeTimers({ now });
-    const claimLost = new Error("Push delivery claim was lost");
+    const heartbeatError = new Error("heartbeat database unavailable");
     const { repository, sender, worker } = setup();
     repository.claimPushReceiptBatch.mockResolvedValue([]);
-    repository.renewPushClaims.mockRejectedValue(claimLost);
+    repository.renewPushClaims.mockRejectedValue(heartbeatError);
     let release: ((tickets: readonly [{ status: "ok"; id: string }]) => void) | undefined;
     sender.send.mockImplementation(
       () =>
@@ -198,6 +198,60 @@ describe("NotificationOutboxWorker", () => {
     release?.([{ status: "ok", id: "ticket-1" }]);
     await expect(run).resolves.toBe(true);
 
+    expect(repository.persistPushTickets).toHaveBeenCalledWith([claimedSend], [{ status: "ok", id: "ticket-1" }], now);
+    expect(repository.retryPushClaims).not.toHaveBeenCalled();
+  });
+
+  it("persists a receipt result through claim fencing after a transient heartbeat failure", async () => {
+    const now = new Date("2026-08-31T02:00:00.000Z");
+    jest.useFakeTimers({ now });
+    const heartbeatError = new Error("heartbeat database unavailable");
+    const { repository, sender, worker } = setup();
+    repository.claimPushSendBatch.mockResolvedValue([]);
+    repository.renewPushClaims.mockRejectedValue(heartbeatError);
+    let release: ((receipts: Readonly<Record<string, { status: "ok" }>>) => void) | undefined;
+    sender.getReceipts.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          release = resolve;
+        }),
+    );
+
+    const run = worker.runOnce(now);
+    await jest.advanceTimersByTimeAsync(10_000);
+    release?.({ "ticket-1": { status: "ok" } });
+    await expect(run).resolves.toBe(true);
+
+    expect(repository.persistPushReceipts).toHaveBeenCalledWith(
+      [claimedReceipt],
+      { "ticket-1": { status: "ok" } },
+      now,
+    );
+    expect(repository.retryPushClaims).not.toHaveBeenCalled();
+  });
+
+  it("uses a heartbeat failure for retry settlement when the provider returns no result", async () => {
+    const now = new Date("2026-08-31T02:00:00.000Z");
+    jest.useFakeTimers({ now });
+    const heartbeatError = new Error("heartbeat database unavailable");
+    const providerError = new RetryablePushError(503);
+    const { repository, sender, worker } = setup();
+    repository.claimPushReceiptBatch.mockResolvedValue([]);
+    repository.renewPushClaims.mockRejectedValue(heartbeatError);
+    let reject: ((error: Error) => void) | undefined;
+    sender.send.mockImplementation(
+      () =>
+        new Promise((_, rejectOperation) => {
+          reject = rejectOperation;
+        }),
+    );
+
+    const run = worker.runOnce(now);
+    await jest.advanceTimersByTimeAsync(10_000);
+    reject?.(providerError);
+    await expect(run).resolves.toBe(true);
+
+    expect(repository.retryPushClaims).toHaveBeenCalledWith([claimedSend], heartbeatError, now);
     expect(repository.persistPushTickets).not.toHaveBeenCalled();
   });
 

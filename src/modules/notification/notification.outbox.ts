@@ -92,8 +92,7 @@ export class NotificationOutboxWorker implements OnModuleInit, OnApplicationShut
       clearInterval(timer);
     }
     await renewal;
-    if (heartbeatError) throw heartbeatError;
-    if (operationError) throw operationError;
+    if (operationError) throw heartbeatError ?? operationError;
     return result as T;
   };
 
