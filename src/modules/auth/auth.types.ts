@@ -57,9 +57,9 @@ export type KakaoRequest = Request & {
 };
 
 export enum AuthPortal {
-  Fo = "FO",
-  Partner = "PARTNER",
-  Bo = "BO",
+  FO = "FO",
+  PARTNER = "PARTNER",
+  BO = "BO",
 }
 
 registerEnumType(AuthPortal, { name: "AuthPortal" });
@@ -70,7 +70,7 @@ export class SigninAuthInput {
   userid!: string;
   @Field()
   password!: string;
-  @Field(() => AuthPortal, { defaultValue: AuthPortal.Fo })
+  @Field(() => AuthPortal, { defaultValue: AuthPortal.FO })
   portal!: AuthPortal;
 }
 

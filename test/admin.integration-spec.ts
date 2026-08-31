@@ -10,7 +10,7 @@ import { resetTestFixtures, testPool } from "./support/database";
 
 type Agent = ReturnType<typeof request.agent>;
 
-const signin = async (agent: Agent, portal: "Fo" | "Bo", userid: string, password: string) => {
+const signin = async (agent: Agent, portal: "FO" | "BO", userid: string, password: string) => {
   const response = await agent
     .post("/graphql")
     .set("x-device-id", `admin-integration-${portal.toLowerCase()}-${userid}`)
@@ -22,7 +22,7 @@ const signin = async (agent: Agent, portal: "Fo" | "Bo", userid: string, passwor
   return response.body.data.signin.accessToken as string;
 };
 
-const adminToken = (agent: Agent) => signin(agent, "Bo", ADMIN_FIXTURE.userid, ADMIN_FIXTURE.password);
+const adminToken = (agent: Agent) => signin(agent, "BO", ADMIN_FIXTURE.userid, ADMIN_FIXTURE.password);
 
 const graphql = (app: INestApplication, token: string, query: string, variables?: Record<string, unknown>) =>
   request(app.getHttpServer()).post("/graphql").set("Authorization", `Bearer ${token}`).send({ query, variables });
@@ -69,7 +69,7 @@ describe("Admin GraphQL integration", () => {
     expect(unauthenticated.body.errors[0].extensions.code).toBe("UNAUTHENTICATED");
 
     const userAgent = request.agent(app.getHttpServer());
-    const userToken = await signin(userAgent, "Fo", FIXTURE.userid, FIXTURE.password);
+    const userToken = await signin(userAgent, "FO", FIXTURE.userid, FIXTURE.password);
     const forbidden = await graphql(app, userToken, query);
     expect(forbidden.body.errors[0].extensions.code).toBe("FORBIDDEN");
 
@@ -186,7 +186,7 @@ describe("Admin GraphQL integration", () => {
           input: {
             userid: ADMIN_FIXTURE.partnerOwnerUserid,
             password: ADMIN_FIXTURE.password,
-            portal: "Fo",
+            portal: "FO",
           },
         },
       });
@@ -268,7 +268,7 @@ describe("Admin GraphQL integration", () => {
           input: {
             userid: ADMIN_FIXTURE.partnerOwnerUserid,
             password: ADMIN_FIXTURE.password,
-            portal: "Fo",
+            portal: "FO",
           },
         },
       });
@@ -561,7 +561,7 @@ describe("Admin GraphQL integration", () => {
     expect(reused.body.errors[0].extensions.code).toBe("BAD_USER_INPUT");
 
     const acceptedAgent = request.agent(app.getHttpServer());
-    const acceptedToken = await signin(acceptedAgent, "Bo", "accepted-admin", "AcceptedAdmin123!");
+    const acceptedToken = await signin(acceptedAgent, "BO", "accepted-admin", "AcceptedAdmin123!");
     expect(acceptedToken).toEqual(expect.any(String));
 
     const revokedToken = "revoked-admin-token";

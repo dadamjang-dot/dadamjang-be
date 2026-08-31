@@ -34,7 +34,7 @@ export class AuthService {
   ) {}
   signin = async (input: SigninAuthInput, deviceId: string, origin: RequestOrigin) => {
     const userid = this.emailService.normalizeUserid(input.userid);
-    const limit = input.portal === AuthPortal.Fo ? 20 : 5;
+    const limit = input.portal === AuthPortal.FO ? 20 : 5;
     await this.admissionLimiter.assertAllowed(
       `AUTH_SIGNIN_${input.portal}`,
       [
@@ -151,9 +151,9 @@ export class AuthService {
   };
   private assertPortalRole = (role: UserRoleValue, portal: AuthPortal) => {
     const allowed =
-      (portal === AuthPortal.Fo && hasBuyerCapability(role)) ||
-      (portal === AuthPortal.Partner && role === UserRole.Partner) ||
-      (portal === AuthPortal.Bo && role === UserRole.Admin);
+      (portal === AuthPortal.FO && hasBuyerCapability(role)) ||
+      (portal === AuthPortal.PARTNER && role === UserRole.Partner) ||
+      (portal === AuthPortal.BO && role === UserRole.Admin);
     if (!allowed) throw new CustomUnauthorizedException(AuthErrorMessage.AuthRequired);
   };
 }
