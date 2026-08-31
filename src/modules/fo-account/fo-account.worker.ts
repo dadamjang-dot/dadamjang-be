@@ -5,6 +5,7 @@ import { FoAccountRepository } from "./fo-account.repository";
 @Injectable()
 export class FoAccountWorker implements OnModuleInit, OnApplicationShutdown {
   private readonly logger = new Logger(FoAccountWorker.name);
+  private running: Promise<void> | undefined;
   private timer?: NodeJS.Timeout;
 
   constructor(
@@ -19,15 +20,23 @@ export class FoAccountWorker implements OnModuleInit, OnApplicationShutdown {
     this.runScheduled();
   };
 
-  onApplicationShutdown = () => {
+  onApplicationShutdown = async () => {
     if (this.timer) clearInterval(this.timer);
+    await this.running;
   };
 
   runOnce = async () => this.repository.anonymizeDueBatch(100);
 
   private runScheduled = () => {
-    void this.runOnce().catch((error: unknown) =>
-      this.logger.error(error instanceof Error ? error.message : "FO account anonymization failed"),
-    );
+    if (this.running) return;
+    const running = this.runOnce()
+      .then(() => undefined)
+      .catch((error: unknown) =>
+        this.logger.error(error instanceof Error ? error.message : "FO account anonymization failed"),
+      )
+      .finally(() => {
+        if (this.running === running) this.running = undefined;
+      });
+    this.running = running;
   };
 }
