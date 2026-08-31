@@ -365,12 +365,16 @@ describe("FO account lifecycle", () => {
 
     expect(recovered.body.errors).toBeUndefined();
     expect(recovered.body.data.reactivateFoAccount).toMatchObject({ role: "USER" });
-    const accessToken = recovered.body.data.reactivateFoAccount.accessToken as string;
-    const refreshToken = recovered.body.data.reactivateFoAccount.refreshToken as string;
-    expect(accessToken).toMatch(/^[^.\s]+\.[^.\s]+\.[^.\s]+$/);
-    expect(refreshToken).toMatch(/^[^.\s]+\.[^.\s]+\.[^.\s]+$/);
-    expect(cookieValue(recovered, "access_token")).toBe(accessToken);
-    expect(cookieValue(recovered, "refresh_token")).toBe(refreshToken);
+    const bodyAccessToken = recovered.body.data.reactivateFoAccount.accessToken as string;
+    const bodyRefreshToken = recovered.body.data.reactivateFoAccount.refreshToken as string;
+    const cookieAccessToken = cookieValue(recovered, "access_token");
+    const cookieRefreshToken = cookieValue(recovered, "refresh_token");
+    expect(bodyAccessToken).toMatch(/^[^.\s]+\.[^.\s]+\.[^.\s]+$/);
+    expect(bodyRefreshToken).toMatch(/^[^.\s]+\.[^.\s]+\.[^.\s]+$/);
+    expect(cookieAccessToken).toMatch(/^[^.\s]+\.[^.\s]+\.[^.\s]+$/);
+    expect(cookieRefreshToken).toMatch(/^[^.\s]+\.[^.\s]+\.[^.\s]+$/);
+    expect(cookieAccessToken).toBe(bodyAccessToken);
+    expect(cookieRefreshToken).toBe(bodyRefreshToken);
     const state = await pool.query<{
       deactivatedAt: Date | null;
       scheduledAnonymizationAt: Date | null;
@@ -463,26 +467,60 @@ describe("FO account lifecycle", () => {
       )
     ).rows[0]?.usedAt;
     if (!usedAt) throw new Error("Failed to mark recovery token used");
+    const userBefore = (
+      await pool.query<{ deactivatedAt: Date; scheduledAnonymizationAt: Date }>(
+        `SELECT "deactivatedAt", "scheduledAnonymizationAt" FROM "users" WHERE "userId" = $1`,
+        [FIXTURE.userId],
+      )
+    ).rows[0];
+    const tokenBefore = (
+      await pool.query<{
+        tokenHash: string;
+        userId: string;
+        deviceIdHash: string;
+        expiresAt: Date;
+        usedAt: Date;
+        createdAt: Date;
+      }>(
+        `SELECT "tokenHash", "userId", "deviceIdHash", "expiresAt", "usedAt", "createdAt"
+         FROM "accountReactivationTokens" WHERE "tokenHash" = $1`,
+        [hashToken(token)],
+      )
+    ).rows[0];
+    if (!userBefore || !tokenBefore) throw new Error("Failed to snapshot used-token state");
 
     const response = await reactivate(app, token, deviceId);
 
     expect(response.body.data).toBeNull();
     expect(response.body.errors[0].extensions.code).toBe("UNAUTHENTICATED");
     expect(cookies(response)).toBeUndefined();
-    const state = await pool.query<{
-      deactivated: boolean;
-      deadlinePresent: boolean;
-      sessions: number;
-      usedAt: Date;
-    }>(
-      `SELECT "deactivatedAt" IS NOT NULL AS deactivated,
-        "scheduledAnonymizationAt" IS NOT NULL AS "deadlinePresent",
-        (SELECT count(*)::int FROM "refreshToken" WHERE "userId" = $1) AS sessions,
-        (SELECT "usedAt" FROM "accountReactivationTokens" WHERE "tokenHash" = $2) AS "usedAt"
-       FROM "users" WHERE "userId" = $1`,
-      [FIXTURE.userId, hashToken(token)],
+    const userAfter = (
+      await pool.query<{ deactivatedAt: Date; scheduledAnonymizationAt: Date }>(
+        `SELECT "deactivatedAt", "scheduledAnonymizationAt" FROM "users" WHERE "userId" = $1`,
+        [FIXTURE.userId],
+      )
+    ).rows[0];
+    const tokenAfter = (
+      await pool.query<{
+        tokenHash: string;
+        userId: string;
+        deviceIdHash: string;
+        expiresAt: Date;
+        usedAt: Date;
+        createdAt: Date;
+      }>(
+        `SELECT "tokenHash", "userId", "deviceIdHash", "expiresAt", "usedAt", "createdAt"
+         FROM "accountReactivationTokens" WHERE "tokenHash" = $1`,
+        [hashToken(token)],
+      )
+    ).rows[0];
+    expect(userAfter).toEqual(userBefore);
+    expect(tokenAfter).toEqual(tokenBefore);
+    const sessions = await pool.query<{ count: number }>(
+      `SELECT count(*)::int AS count FROM "refreshToken" WHERE "userId" = $1`,
+      [FIXTURE.userId],
     );
-    expect(state.rows[0]).toEqual({ deactivated: true, deadlinePresent: true, sessions: 0, usedAt });
+    expect(sessions.rows[0]?.count).toBe(0);
   });
 
   it("allows only one concurrent reactivation with the same token", async () => {
@@ -512,12 +550,16 @@ describe("FO account lifecycle", () => {
       expect(rejected[0]?.body.errors[0].extensions.code).toBe("UNAUTHENTICATED");
       expect(cookies(rejected[0] as request.Response)).toBeUndefined();
       const winner = successful[0] as request.Response;
-      const accessToken = winner.body.data.reactivateFoAccount.accessToken as string;
-      const refreshToken = winner.body.data.reactivateFoAccount.refreshToken as string;
-      expect(accessToken).toMatch(/^[^.\s]+\.[^.\s]+\.[^.\s]+$/);
-      expect(refreshToken).toMatch(/^[^.\s]+\.[^.\s]+\.[^.\s]+$/);
-      expect(cookieValue(winner, "access_token")).toBe(accessToken);
-      expect(cookieValue(winner, "refresh_token")).toBe(refreshToken);
+      const bodyAccessToken = winner.body.data.reactivateFoAccount.accessToken as string;
+      const bodyRefreshToken = winner.body.data.reactivateFoAccount.refreshToken as string;
+      const cookieAccessToken = cookieValue(winner, "access_token");
+      const cookieRefreshToken = cookieValue(winner, "refresh_token");
+      expect(bodyAccessToken).toMatch(/^[^.\s]+\.[^.\s]+\.[^.\s]+$/);
+      expect(bodyRefreshToken).toMatch(/^[^.\s]+\.[^.\s]+\.[^.\s]+$/);
+      expect(cookieAccessToken).toMatch(/^[^.\s]+\.[^.\s]+\.[^.\s]+$/);
+      expect(cookieRefreshToken).toMatch(/^[^.\s]+\.[^.\s]+\.[^.\s]+$/);
+      expect(cookieAccessToken).toBe(bodyAccessToken);
+      expect(cookieRefreshToken).toBe(bodyRefreshToken);
       const state = await pool.query<{
         deactivatedAt: Date | null;
         refreshToken: string;
@@ -533,7 +575,7 @@ describe("FO account lifecycle", () => {
       );
       expect(state.rows[0]).toEqual({
         used: 1,
-        refreshToken: hashToken(refreshToken),
+        refreshToken: hashToken(bodyRefreshToken),
         deactivatedAt: null,
         scheduledAnonymizationAt: null,
       });
