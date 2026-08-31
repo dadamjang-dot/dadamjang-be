@@ -34,12 +34,16 @@ import {
   type User,
 } from "src/modules/database/schema";
 import { tryLockEmailDelivery } from "src/modules/email/email-delivery-lock";
+import { NotificationRepository } from "src/modules/notification/notification.repository";
 
 type IssueTokens<T> = (user: User, store: DatabaseTransaction) => Promise<T>;
 
 @Injectable()
 export class FoAccountRepository {
-  constructor(@Inject(DRIZZLE) private readonly db: Database) {}
+  constructor(
+    @Inject(DRIZZLE) private readonly db: Database,
+    private readonly notificationRepository: NotificationRepository,
+  ) {}
 
   deactivate = (userId: string) =>
     this.db.transaction(async (tx) => {
@@ -64,6 +68,7 @@ export class FoAccountRepository {
             .returning({ scheduledAnonymizationAt: users.scheduledAnonymizationAt })
         )[0],
       );
+      await this.notificationRepository.disableUserDevices(tx, userId, "ACCOUNT_DEACTIVATED");
       await tx.delete(refreshTokens).where(eq(refreshTokens.userId, userId));
       if (!updated.scheduledAnonymizationAt) throw new Error("Scheduled anonymization timestamp is missing");
       return { ok: true, scheduledAnonymizationAt: updated.scheduledAnonymizationAt };
@@ -143,6 +148,7 @@ export class FoAccountRepository {
           const verificationIds = verificationProofs.map(({ id }) => id);
           await tx.delete(accountReactivationTokens).where(eq(accountReactivationTokens.userId, user.userId));
           await tx.delete(refreshTokens).where(eq(refreshTokens.userId, user.userId));
+          await this.notificationRepository.deleteUserData(tx, user.userId);
           await tx.delete(emailDeliveryOutbox).where(outboxCondition);
           await tx.delete(passwordResetTokens).where(eq(passwordResetTokens.userId, user.userId));
           await tx

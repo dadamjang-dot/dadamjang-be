@@ -25,6 +25,7 @@ import { IdentityVerificationModule } from "./identity-verification/identity-ver
 import { FoAuthModule } from "./fo-auth/fo-auth.module";
 import { KakaoFlowModule } from "./fo-auth/kakao-flow.module";
 import { FoAccountModule } from "./fo-account/fo-account.module";
+import { NotificationModule } from "./notification/notification.module";
 
 const graphQlErrorCode = (status: number) => {
   if (status === HttpStatus.BAD_REQUEST) return "BAD_USER_INPUT";
@@ -106,6 +107,7 @@ export const validateConfig = (environment: Record<string, unknown>) => {
     FoAuthModule,
     KakaoFlowModule,
     FoAccountModule,
+    NotificationModule,
   ],
 })
 export class AppModule {}

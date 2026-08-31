@@ -9,6 +9,7 @@ import {
   type RefreshToken,
   type User,
 } from "src/modules/database/schema";
+import { NotificationRepository } from "src/modules/notification/notification.repository";
 import { AuthErrorMessage } from "./auth.error";
 
 export type RefreshTokenStore = DatabaseTransaction;
@@ -30,7 +31,10 @@ type SaveRefreshTokenInput = {
 
 @Injectable()
 export class AuthRepository {
-  constructor(@Inject(DRIZZLE) private readonly db: Database) {}
+  constructor(
+    @Inject(DRIZZLE) private readonly db: Database,
+    private readonly notificationRepository: NotificationRepository,
+  ) {}
   signinStartedAt = async () => {
     const result = await this.db.execute<{ startedAt: Date | string }>(sql`SELECT clock_timestamp() AS "startedAt"`);
     const value = result.rows[0]?.startedAt;
@@ -197,16 +201,20 @@ export class AuthRepository {
       }),
     );
   deleteRefreshToken = async (userId: string, deviceId: string, refreshToken: string) => {
-    const [deleted] = await this.db
-      .delete(refreshTokens)
-      .where(
-        and(
-          eq(refreshTokens.userId, userId),
-          eq(refreshTokens.deviceId, deviceId),
-          eq(refreshTokens.refreshToken, refreshToken),
-        ),
-      )
-      .returning({ id: refreshTokens.id });
-    return Boolean(deleted);
+    return this.db.transaction(async (tx) => {
+      const [deleted] = await tx
+        .delete(refreshTokens)
+        .where(
+          and(
+            eq(refreshTokens.userId, userId),
+            eq(refreshTokens.deviceId, deviceId),
+            eq(refreshTokens.refreshToken, refreshToken),
+          ),
+        )
+        .returning({ id: refreshTokens.id });
+      if (!deleted) return false;
+      await this.notificationRepository.disableInstallation(tx, userId, deviceId, "LOGGED_OUT");
+      return true;
+    });
   };
 }

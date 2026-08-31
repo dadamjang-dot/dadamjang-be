@@ -1,4 +1,5 @@
 import type { INestApplication } from "@nestjs/common";
+import { randomUUID } from "crypto";
 import type { Pool, PoolClient } from "pg";
 import request from "supertest";
 import { createApp } from "src/app";
@@ -269,6 +270,9 @@ const ANONYMIZATION_FIXTURE = {
   consentDocumentId: "18000000-0000-4000-8000-000000000001",
   outboxId: "19000000-0000-4000-8000-000000000001",
   identitySessionId: "1a000000-0000-4000-8000-000000000001",
+  notificationId: "1b000000-0000-4000-8000-000000000001",
+  pushDeviceId: "1c000000-0000-4000-8000-000000000001",
+  pushOutboxId: "1d000000-0000-4000-8000-000000000001",
   mediaKey: "style-posts/anonymization-user/preserved.jpg",
 } as const;
 
@@ -314,6 +318,23 @@ const seedAnonymizationFixture = async (pool: Pool) => {
       `INSERT INTO "refreshTokenRotationMarker" ("userId", "deviceId", "rotationKey", "expiresAt")
        VALUES ($1, 'anonymization-device', 'anonymization-rotation', now() + interval '1 minute')`,
       [fixture.userId],
+    );
+    await client.query(
+      `INSERT INTO notifications
+        ("notificationId", "userId", type, title, body, route, "entityId", "dedupeKey")
+       VALUES ($1, $2, 'ORDER_STATUS', 'Anonymization', 'Anonymization', $3, $4, 'anonymization-notification')`,
+      [fixture.notificationId, fixture.userId, `/order/${fixture.orderId}`, fixture.orderId],
+    );
+    await client.query(
+      `INSERT INTO "pushDevices"
+        ("pushDeviceId", "userId", "installationId", "expoPushToken", platform)
+       VALUES ($1, $2, 'anonymization-device', 'ExponentPushToken[anonymization]', 'IOS')`,
+      [fixture.pushDeviceId, fixture.userId],
+    );
+    await client.query(`INSERT INTO "notificationPreferences" ("userId") VALUES ($1)`, [fixture.userId]);
+    await client.query(
+      `INSERT INTO "pushOutbox" ("pushOutboxId", "notificationId", "pushDeviceId") VALUES ($1, $2, $3)`,
+      [fixture.pushOutboxId, fixture.notificationId, fixture.pushDeviceId],
     );
     await client.query(
       `INSERT INTO "passwordResetToken" ("tokenHash", "userId", "expiresAt")
@@ -490,6 +511,41 @@ describe("FO account lifecycle", () => {
     const accessToken = first.body.data.signin.accessToken as string;
     const refreshToken = first.body.data.signin.refreshToken as string;
     expect(second.body.errors).toBeUndefined();
+    const pushDeviceIds = ["1e000000-0000-4000-8000-000000000001", "1e000000-0000-4000-8000-000000000002"];
+    const notificationIds = [
+      "1f000000-0000-4000-8000-000000000001",
+      "1f000000-0000-4000-8000-000000000002",
+      "1f000000-0000-4000-8000-000000000003",
+    ];
+    await pool.query(
+      `INSERT INTO "pushDevices"
+        ("pushDeviceId", "userId", "installationId", "expoPushToken", platform)
+       VALUES
+        ($1, $3, $4, 'ExponentPushToken[deactivation-one]', 'IOS'),
+        ($2, $3, $5, 'ExponentPushToken[deactivation-two]', 'IOS')`,
+      [pushDeviceIds[0], pushDeviceIds[1], FIXTURE.userId, deviceId, secondDeviceId],
+    );
+    await pool.query(
+      `INSERT INTO notifications
+        ("notificationId", "userId", type, title, body, route, "entityId", "dedupeKey")
+       VALUES
+        ($1, $3, 'ORDER_STATUS', 'One', 'One', '/order/90000000-0000-4000-8000-000000000001',
+          '90000000-0000-4000-8000-000000000001', 'deactivation-one'),
+        ($2, $3, 'ORDER_STATUS', 'Two', 'Two', '/order/90000000-0000-4000-8000-000000000002',
+          '90000000-0000-4000-8000-000000000002', 'deactivation-two'),
+        ($4, $3, 'ORDER_STATUS', 'Three', 'Three', '/order/90000000-0000-4000-8000-000000000003',
+          '90000000-0000-4000-8000-000000000003', 'deactivation-three')`,
+      [notificationIds[0], notificationIds[1], FIXTURE.userId, notificationIds[2]],
+    );
+    await pool.query(
+      `INSERT INTO "pushOutbox"
+        ("notificationId", "pushDeviceId", status, "claimToken", "claimedAt", "expoTicketId", "receiptAvailableAt")
+       VALUES
+        ($1, $4, 'PENDING', NULL, NULL, NULL, NULL),
+        ($2, $4, 'PROCESSING', $6, transaction_timestamp(), NULL, NULL),
+        ($3, $5, 'TICKETED', NULL, NULL, 'deactivation-ticket', transaction_timestamp())`,
+      [notificationIds[0], notificationIds[1], notificationIds[2], pushDeviceIds[0], pushDeviceIds[1], randomUUID()],
+    );
 
     const response = await deactivate(app, accessToken, deviceId);
 
@@ -515,6 +571,21 @@ describe("FO account lifecycle", () => {
     expect(response.body.data.deactivateFoAccount.scheduledAnonymizationAt).toBe(
       state.rows[0]?.scheduledAnonymizationAt.toISOString(),
     );
+    const pushState = await pool.query<{
+      activeDevices: number;
+      failedDeliveries: number;
+      unsettledDeliveries: number;
+    }>(
+      `SELECT
+        (SELECT count(*)::int FROM "pushDevices" WHERE "userId" = $1 AND "disabledAt" IS NULL) AS "activeDevices",
+        (SELECT count(*)::int FROM "pushOutbox" WHERE "pushDeviceId" = ANY($2::uuid[]) AND status = 'FAILED')
+          AS "failedDeliveries",
+        (SELECT count(*)::int FROM "pushOutbox"
+          WHERE "pushDeviceId" = ANY($2::uuid[]) AND status IN ('PENDING', 'PROCESSING', 'TICKETED'))
+          AS "unsettledDeliveries"`,
+      [FIXTURE.userId, pushDeviceIds],
+    );
+    expect(pushState.rows[0]).toEqual({ activeDevices: 0, failedDeliveries: 3, unsettledDeliveries: 0 });
     expect((await me(app, accessToken)).body).toMatchObject({ data: null, errors: [expect.any(Object)] });
     expect((await refresh(app, refreshToken)).body).toMatchObject({ data: null, errors: [expect.any(Object)] });
     expect((await deactivate(app, accessToken, deviceId)).body.data).toBeNull();
@@ -1213,8 +1284,12 @@ describe("FO account lifecycle", () => {
         (SELECT count(*)::int FROM "cartItems" ci INNER JOIN carts c ON c."cartId" = ci."cartId" WHERE c."userId" = $1) AS "cartItems",
         (SELECT count(*)::int FROM carts WHERE "userId" = $1) AS carts,
         (SELECT count(*)::int FROM "checkoutIdempotencyKeys" WHERE "userId" = $1) AS "checkoutIdempotencyKeys",
-        (SELECT count(*)::int FROM "activityEvents" WHERE "actorUserId" = $1) AS "activityEvents"`,
-      [fixture.userId, fixture.email, fixture.providerUserId, fixture.ciHash],
+        (SELECT count(*)::int FROM "activityEvents" WHERE "actorUserId" = $1) AS "activityEvents",
+        (SELECT count(*)::int FROM "pushOutbox" WHERE "pushDeviceId" = $5) AS "pushOutbox",
+        (SELECT count(*)::int FROM notifications WHERE "userId" = $1) AS notifications,
+        (SELECT count(*)::int FROM "notificationPreferences" WHERE "userId" = $1) AS "notificationPreferences",
+        (SELECT count(*)::int FROM "pushDevices" WHERE "userId" = $1) AS "pushDevices"`,
+      [fixture.userId, fixture.email, fixture.providerUserId, fixture.ciHash, fixture.pushDeviceId],
     );
     expect(removed.rows[0]).toEqual({
       reactivationTokens: 0,
@@ -1238,6 +1313,10 @@ describe("FO account lifecycle", () => {
       carts: 0,
       checkoutIdempotencyKeys: 0,
       activityEvents: 0,
+      pushOutbox: 0,
+      notifications: 0,
+      notificationPreferences: 0,
+      pushDevices: 0,
     });
     const preserved = await pool.query<{
       auditLogs: number;
@@ -1395,15 +1474,29 @@ describe("FO account lifecycle", () => {
       reactivationTokens: number;
       wishes: number;
       carts: number;
+      notifications: number;
+      pushDevices: number;
+      pushOutbox: number;
     }>(
       `SELECT "anonymizedAt",
         (SELECT count(*)::int FROM "accountReactivationTokens" WHERE "userId" = $1) AS "reactivationTokens",
         (SELECT count(*)::int FROM wishes WHERE "userId" = $1) AS wishes,
-        (SELECT count(*)::int FROM carts WHERE "userId" = $1) AS carts
+        (SELECT count(*)::int FROM carts WHERE "userId" = $1) AS carts,
+        (SELECT count(*)::int FROM notifications WHERE "userId" = $1) AS notifications,
+        (SELECT count(*)::int FROM "pushDevices" WHERE "userId" = $1) AS "pushDevices",
+        (SELECT count(*)::int FROM "pushOutbox" WHERE "pushDeviceId" = $2) AS "pushOutbox"
        FROM users WHERE "userId" = $1`,
-      [fixture.userId],
+      [fixture.userId, fixture.pushDeviceId],
     );
-    expect(state.rows[0]).toEqual({ anonymizedAt: null, reactivationTokens: 1, wishes: 1, carts: 1 });
+    expect(state.rows[0]).toEqual({
+      anonymizedAt: null,
+      reactivationTokens: 1,
+      wishes: 1,
+      carts: 1,
+      notifications: 1,
+      pushDevices: 1,
+      pushOutbox: 1,
+    });
   });
 
   it("leaves unrelated user and behavioral rows unchanged", async () => {
