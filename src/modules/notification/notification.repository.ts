@@ -59,7 +59,7 @@ export type ClaimedPushSend = PushClaim &
     entityId: string;
   }>;
 
-export type ClaimedPushReceipt = PushClaim & Readonly<{ expoTicketId: string }>;
+export type ClaimedPushReceipt = PushClaim & Readonly<{ expoTicketId: string; rateLimitAttemptCount: number }>;
 
 const pushErrorMessage = (error: unknown) =>
   (error instanceof Error ? `${error.name}: ${error.message}` : "Unknown Push delivery error").slice(0, 500);
@@ -69,6 +69,12 @@ const expoErrorMessage = (result: Extract<ExpoPushTicket | ExpoPushReceipt, { st
 
 const deviceNotRegistered = (result: ExpoPushTicket | ExpoPushReceipt) =>
   result.status === "error" && result.details?.error === "DeviceNotRegistered";
+
+const messageRateExceeded = (result: ExpoPushReceipt) =>
+  result.status === "error" && result.details?.error === "MessageRateExceeded";
+
+const pushRetryAt = (now: Date, attemptCount: number) =>
+  new Date(now.getTime() + Math.min(2 ** attemptCount, 300) * 1_000);
 
 @Injectable()
 export class NotificationRepository {
@@ -350,6 +356,7 @@ export class NotificationRepository {
           pushOutboxId: pushOutbox.pushOutboxId,
           pushDeviceId: pushOutbox.pushDeviceId,
           expoTicketId: pushOutbox.expoTicketId,
+          rateLimitAttemptCount: pushOutbox.rateLimitAttemptCount,
         })
         .from(pushOutbox)
         .innerJoin(pushDevices, eq(pushDevices.pushDeviceId, pushOutbox.pushDeviceId))
@@ -391,11 +398,30 @@ export class NotificationRepository {
           pushOutboxId: candidate.pushOutboxId,
           pushDeviceId: candidate.pushDeviceId,
           expoTicketId: candidate.expoTicketId,
+          rateLimitAttemptCount: candidate.rateLimitAttemptCount,
           claimToken,
           attemptCount: requireResult(attempts.get(candidate.pushOutboxId)),
         };
       });
     });
+
+  renewPushClaims = async (claims: readonly PushClaim[], now = new Date()) => {
+    if (!claims.length) return;
+    await this.db.transaction(async (tx) => {
+      await this.lockPushClaims(tx, claims);
+      const renewed = await tx
+        .update(pushOutbox)
+        .set({ claimedAt: now, updatedAt: now })
+        .where(
+          inArray(
+            pushOutbox.pushOutboxId,
+            claims.map(({ pushOutboxId }) => pushOutboxId),
+          ),
+        )
+        .returning({ pushOutboxId: pushOutbox.pushOutboxId });
+      if (renewed.length !== claims.length) throw new Error("Push delivery claim was lost");
+    });
+  };
 
   persistPushTickets = async (
     claims: readonly ClaimedPushSend[],
@@ -468,35 +494,38 @@ export class NotificationRepository {
     receipts: Readonly<Record<string, ExpoPushReceipt>>,
     now = new Date(),
   ) => {
-    if (
-      Object.keys(receipts).length !== claims.length ||
-      claims.some(({ expoTicketId }) => !Object.prototype.hasOwnProperty.call(receipts, expoTicketId))
-    )
+    const requestedIds = new Set(claims.map(({ expoTicketId }) => expoTicketId));
+    if (Object.keys(receipts).some((ticketId) => !requestedIds.has(ticketId)))
       throw new Error("Expo Push receipt count mismatch");
     if (!claims.length) return;
     await this.db.transaction(async (tx) => {
       await this.lockPushClaims(tx, claims);
       const invalidDeviceIds = [
         ...new Set(
-          claims
-            .filter(({ expoTicketId }) => deviceNotRegistered(requireResult(receipts[expoTicketId])))
-            .map(({ pushDeviceId }) => pushDeviceId),
+          claims.flatMap((claim) => {
+            const receipt = receipts[claim.expoTicketId];
+            return receipt && deviceNotRegistered(receipt) ? [claim.pushDeviceId] : [];
+          }),
         ),
       ];
       await this.disableDeviceIds(tx, invalidDeviceIds, "DEVICE_NOT_REGISTERED");
       const validClaims = claims.filter(({ pushDeviceId }) => !invalidDeviceIds.includes(pushDeviceId));
-      const acceptedIds = validClaims
-        .filter(({ expoTicketId }) => requireResult(receipts[expoTicketId]).status === "ok")
-        .map(({ pushOutboxId }) => pushOutboxId);
+      const returned = validClaims.flatMap((claim) => {
+        const receipt = receipts[claim.expoTicketId];
+        return receipt ? [{ claim, receipt }] : [];
+      });
+      const acceptedIds = returned
+        .filter(({ receipt }) => receipt.status === "ok")
+        .map(({ claim }) => claim.pushOutboxId);
       if (acceptedIds.length)
         await tx
           .update(pushOutbox)
           .set({ status: "RECEIPT_OK", claimToken: null, claimedAt: null, lastError: null, updatedAt: now })
           .where(inArray(pushOutbox.pushOutboxId, acceptedIds));
-      const rejected = validClaims.flatMap((claim) => {
-        const receipt = requireResult(receipts[claim.expoTicketId]);
-        return receipt.status === "error" ? [{ claim, receipt }] : [];
-      });
+      const rejected = returned.filter(
+        (result): result is { claim: ClaimedPushReceipt; receipt: Extract<ExpoPushReceipt, { status: "error" }> } =>
+          result.receipt.status === "error" && !messageRateExceeded(result.receipt),
+      );
       if (rejected.length) {
         const values = sql.join(
           rejected.map(({ claim, receipt }) => sql`(${claim.pushOutboxId}::uuid, ${expoErrorMessage(receipt)}::text)`),
@@ -513,6 +542,19 @@ export class NotificationRepository {
           WHERE outbox."pushOutboxId" = result."pushOutboxId"
         `);
       }
+      await this.retryMissingPushReceipts(
+        tx,
+        validClaims.filter(({ expoTicketId }) => !Object.prototype.hasOwnProperty.call(receipts, expoTicketId)),
+        now,
+      );
+      await this.resendRateLimitedPushReceipts(
+        tx,
+        returned.filter(
+          (result): result is { claim: ClaimedPushReceipt; receipt: Extract<ExpoPushReceipt, { status: "error" }> } =>
+            messageRateExceeded(result.receipt),
+        ),
+        now,
+      );
     });
   };
 
@@ -521,11 +563,12 @@ export class NotificationRepository {
     await this.db.transaction(async (tx) => {
       await this.lockPushClaims(tx, claims);
       const retryable = claims.filter(({ attemptCount }) => attemptCount < PUSH_MAX_ATTEMPTS);
-      const retryAt = (attemptCount: number) => new Date(now.getTime() + Math.min(2 ** attemptCount, 300) * 1_000);
       const sendRetries = retryable.filter((claim) => !("expoTicketId" in claim));
       if (sendRetries.length) {
         const values = sql.join(
-          sendRetries.map((claim) => sql`(${claim.pushOutboxId}::uuid, ${retryAt(claim.attemptCount)}::timestamptz)`),
+          sendRetries.map(
+            (claim) => sql`(${claim.pushOutboxId}::uuid, ${pushRetryAt(now, claim.attemptCount)}::timestamptz)`,
+          ),
           sql`, `,
         );
         await tx.execute(sql`
@@ -546,7 +589,7 @@ export class NotificationRepository {
       if (receiptRetries.length) {
         const values = sql.join(
           receiptRetries.map(
-            (claim) => sql`(${claim.pushOutboxId}::uuid, ${retryAt(claim.attemptCount)}::timestamptz)`,
+            (claim) => sql`(${claim.pushOutboxId}::uuid, ${pushRetryAt(now, claim.attemptCount)}::timestamptz)`,
           ),
           sql`, `,
         );
@@ -621,6 +664,111 @@ export class NotificationRepository {
     return result.rows.length;
   };
 
+  private retryMissingPushReceipts = async (
+    store: DatabaseTransaction,
+    claims: readonly ClaimedPushReceipt[],
+    now: Date,
+  ) => {
+    const retryable = claims.filter(({ attemptCount }) => attemptCount < PUSH_MAX_ATTEMPTS);
+    if (retryable.length) {
+      const values = sql.join(
+        retryable.map(
+          (claim) => sql`(${claim.pushOutboxId}::uuid, ${pushRetryAt(now, claim.attemptCount)}::timestamptz)`,
+        ),
+        sql`, `,
+      );
+      await store.execute(sql`
+        UPDATE "pushOutbox" AS outbox
+        SET status = 'TICKETED',
+            "receiptAvailableAt" = result."retryAt",
+            "claimToken" = NULL,
+            "claimedAt" = NULL,
+            "lastError" = 'Expo Push receipt missing',
+            "updatedAt" = ${now}
+        FROM (VALUES ${values}) AS result("pushOutboxId", "retryAt")
+        WHERE outbox."pushOutboxId" = result."pushOutboxId"
+      `);
+    }
+    const terminalIds = claims
+      .filter(({ attemptCount }) => attemptCount >= PUSH_MAX_ATTEMPTS)
+      .map(({ pushOutboxId }) => pushOutboxId);
+    if (terminalIds.length)
+      await store
+        .update(pushOutbox)
+        .set({
+          status: "FAILED",
+          claimToken: null,
+          claimedAt: null,
+          lastError: "Expo Push receipt missing",
+          updatedAt: now,
+        })
+        .where(inArray(pushOutbox.pushOutboxId, terminalIds));
+  };
+
+  private resendRateLimitedPushReceipts = async (
+    store: DatabaseTransaction,
+    results: readonly {
+      claim: ClaimedPushReceipt;
+      receipt: Extract<ExpoPushReceipt, { status: "error" }>;
+    }[],
+    now: Date,
+  ) => {
+    const retries = results.flatMap(({ claim, receipt }) => {
+      const attemptCount = Math.min(claim.rateLimitAttemptCount + 1, PUSH_MAX_ATTEMPTS);
+      return attemptCount < PUSH_MAX_ATTEMPTS ? [{ claim, receipt, attemptCount }] : [];
+    });
+    if (retries.length) {
+      const values = sql.join(
+        retries.map(
+          ({ claim, receipt, attemptCount }) =>
+            sql`(${claim.pushOutboxId}::uuid, ${attemptCount}::integer, ${pushRetryAt(now, attemptCount)}::timestamptz, ${expoErrorMessage(receipt)}::text)`,
+        ),
+        sql`, `,
+      );
+      await store.execute(sql`
+        UPDATE "pushOutbox" AS outbox
+        SET status = 'PENDING',
+            "attemptCount" = 0,
+            "rateLimitAttemptCount" = result."attemptCount",
+            "availableAt" = result."retryAt",
+            "claimToken" = NULL,
+            "claimedAt" = NULL,
+            "expoTicketId" = NULL,
+            "receiptAvailableAt" = NULL,
+            "lastError" = result.error,
+            "updatedAt" = ${now}
+        FROM (VALUES ${values}) AS result("pushOutboxId", "attemptCount", "retryAt", error)
+        WHERE outbox."pushOutboxId" = result."pushOutboxId"
+      `);
+    }
+    const terminal = results.flatMap(({ claim, receipt }) => {
+      const attemptCount = Math.min(claim.rateLimitAttemptCount + 1, PUSH_MAX_ATTEMPTS);
+      return attemptCount >= PUSH_MAX_ATTEMPTS ? [{ claim, receipt, attemptCount }] : [];
+    });
+    if (terminal.length) {
+      const values = sql.join(
+        terminal.map(
+          ({ claim, receipt, attemptCount }) =>
+            sql`(${claim.pushOutboxId}::uuid, ${attemptCount}::integer, ${expoErrorMessage(receipt)}::text)`,
+        ),
+        sql`, `,
+      );
+      await store.execute(sql`
+        UPDATE "pushOutbox" AS outbox
+        SET status = 'FAILED',
+            "rateLimitAttemptCount" = result."attemptCount",
+            "claimToken" = NULL,
+            "claimedAt" = NULL,
+            "expoTicketId" = NULL,
+            "receiptAvailableAt" = NULL,
+            "lastError" = result.error,
+            "updatedAt" = ${now}
+        FROM (VALUES ${values}) AS result("pushOutboxId", "attemptCount", error)
+        WHERE outbox."pushOutboxId" = result."pushOutboxId"
+      `);
+    }
+  };
+
   private failUnavailablePushDeliveries = async (store: DatabaseTransaction, now: Date) => {
     const staleAt = new Date(now.getTime() - PUSH_CLAIM_STALE_MS);
     await store
@@ -679,6 +827,7 @@ export class NotificationRepository {
         claimToken: pushOutbox.claimToken,
         status: pushOutbox.status,
         expoTicketId: pushOutbox.expoTicketId,
+        rateLimitAttemptCount: pushOutbox.rateLimitAttemptCount,
       })
       .from(pushOutbox)
       .where(inArray(pushOutbox.pushOutboxId, pushOutboxIds))
@@ -688,12 +837,15 @@ export class NotificationRepository {
     const lost = claims.some((claim) => {
       const row = byId.get(claim.pushOutboxId);
       const expoTicketId = "expoTicketId" in claim ? claim.expoTicketId : null;
+      const rateLimitAttemptCount =
+        "rateLimitAttemptCount" in claim ? claim.rateLimitAttemptCount : row?.rateLimitAttemptCount;
       return (
         !row ||
         row.pushDeviceId !== claim.pushDeviceId ||
         row.claimToken !== claim.claimToken ||
         row.status !== "PROCESSING" ||
-        row.expoTicketId !== (expoTicketId ?? null)
+        row.expoTicketId !== (expoTicketId ?? null) ||
+        row.rateLimitAttemptCount !== rateLimitAttemptCount
       );
     });
     if (lost) throw new Error("Push delivery claim was lost");

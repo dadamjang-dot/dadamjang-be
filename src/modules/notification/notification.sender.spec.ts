@@ -148,11 +148,27 @@ describe("ExpoPushSender", () => {
     });
   });
 
-  it("retries receipt maps with missing or unexpected ticket IDs", async () => {
+  it("accepts a valid subset of requested receipt IDs", async () => {
+    const request = jest.spyOn(global, "fetch").mockResolvedValue(
+      jsonResponse({
+        data: {
+          "ticket-1": { status: "ok" },
+        },
+      }),
+    );
+
+    await expect(new ExpoPushSender().getReceipts(["ticket-1", "ticket-2"])).resolves.toEqual({
+      "ticket-1": { status: "ok" },
+    });
+    expect(request).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries receipt maps with unexpected ticket IDs or malformed requested receipts", async () => {
     jest.useFakeTimers();
     const request = jest
       .spyOn(global, "fetch")
-      .mockImplementation(async () => jsonResponse({ data: { "unexpected-ticket": { status: "ok" } } }));
+      .mockResolvedValueOnce(jsonResponse({ data: { "unexpected-ticket": { status: "ok" } } }))
+      .mockImplementation(async () => jsonResponse({ data: { "ticket-1": { status: "error" } } }));
 
     const delivery = new ExpoPushSender().getReceipts(["ticket-1"]);
     const rejected = expect(delivery).rejects.toBeInstanceOf(RetryablePushError);

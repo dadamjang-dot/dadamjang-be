@@ -586,6 +586,7 @@ describe("database migration PostgreSQL integration", () => {
            'push_outbox_status_check',
            'push_outbox_attempt_count_check',
            'push_outbox_claim_check',
+           'push_outbox_rate_limit_attempt_count_check',
            'push_outbox_ticket_pair_check',
            'push_outbox_ticket_state_check'
          )
@@ -612,6 +613,9 @@ describe("database migration PostgreSQL integration", () => {
     );
     const notificationMigrationJournal = await migrationPool.query<{ count: string }>(
       `SELECT count(*) FROM "_migrations" WHERE "name" = '0026_notifications_push_outbox.sql'`,
+    );
+    const pushRateLimitMigrationJournal = await migrationPool.query<{ count: string }>(
+      `SELECT count(*) FROM "_migrations" WHERE "name" = '0028_push_rate_limit_attempts.sql'`,
     );
 
     expect(commerceAfter.rows).toEqual(commerceBefore.rows);
@@ -656,6 +660,7 @@ describe("database migration PostgreSQL integration", () => {
       { column_default: "now()", column_name: "availableAt", table_name: "pushOutbox" },
       { column_default: "now()", column_name: "createdAt", table_name: "pushOutbox" },
       { column_default: "gen_random_uuid()", column_name: "pushOutboxId", table_name: "pushOutbox" },
+      { column_default: "0", column_name: "rateLimitAttemptCount", table_name: "pushOutbox" },
       { column_default: "'PENDING'::character varying", column_name: "status", table_name: "pushOutbox" },
       { column_default: "now()", column_name: "updatedAt", table_name: "pushOutbox" },
     ]);
@@ -672,6 +677,7 @@ describe("database migration PostgreSQL integration", () => {
       "push_devices_platform_check",
       "push_outbox_attempt_count_check",
       "push_outbox_claim_check",
+      "push_outbox_rate_limit_attempt_count_check",
       "push_outbox_status_check",
       "push_outbox_ticket_pair_check",
       "push_outbox_ticket_state_check",
@@ -689,6 +695,9 @@ describe("database migration PostgreSQL integration", () => {
     expect(checkDefinitions.push_outbox_status_check).toContain("RECEIPT_OK");
     expect(checkDefinitions.push_outbox_attempt_count_check).toContain('"attemptCount" >= 0');
     expect(checkDefinitions.push_outbox_claim_check).toContain("PROCESSING");
+    expect(checkDefinitions.push_outbox_rate_limit_attempt_count_check).toContain('"rateLimitAttemptCount"');
+    expect(checkDefinitions.push_outbox_rate_limit_attempt_count_check).toContain(">= 0");
+    expect(checkDefinitions.push_outbox_rate_limit_attempt_count_check).toContain("<= 8");
     expect(checkDefinitions.push_outbox_ticket_pair_check).toContain("receiptAvailableAt");
     expect(checkDefinitions.push_outbox_ticket_state_check).toContain("TICKETED");
     expect(indexes.rows.map(({ indexname }) => indexname)).toEqual([
@@ -726,6 +735,7 @@ describe("database migration PostgreSQL integration", () => {
     expect(indexByName.push_outbox_terminal_updated_idx?.predicate).toContain("RECEIPT_OK");
     expect(indexByName.push_outbox_terminal_updated_idx?.predicate).toContain("FAILED");
     expect(notificationMigrationJournal.rows).toEqual([{ count: "1" }]);
+    expect(pushRateLimitMigrationJournal.rows).toEqual([{ count: "1" }]);
   });
 
   it("enforces notification uniqueness, ownership, state matrices, and cascades", async () => {
@@ -1006,19 +1016,21 @@ describe("database migration PostgreSQL integration", () => {
       readonly claimToken?: string | null;
       readonly expoTicketId?: string | null;
       readonly pushOutboxId: string;
+      readonly rateLimitAttemptCount?: number;
       readonly receiptAvailableAt?: string | null;
       readonly status: string;
     }) =>
       migrationPool.query(
         `INSERT INTO "pushOutbox"
-          ("pushOutboxId", "notificationId", "pushDeviceId", "status", "attemptCount", "claimedAt", "claimToken", "expoTicketId", "receiptAvailableAt")
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+          ("pushOutboxId", "notificationId", "pushDeviceId", "status", "attemptCount", "rateLimitAttemptCount", "claimedAt", "claimToken", "expoTicketId", "receiptAvailableAt")
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
         [
           input.pushOutboxId,
           notificationB,
           deviceB,
           input.status,
           input.attemptCount ?? 0,
+          input.rateLimitAttemptCount ?? 0,
           input.claimedAt ?? null,
           input.claimToken ?? null,
           input.expoTicketId ?? null,
@@ -1072,6 +1084,11 @@ describe("database migration PostgreSQL integration", () => {
       () => insertMatrixOutbox({ attemptCount: -1, pushOutboxId: nextMatrixId(), status: "PENDING" }),
       "23514",
       "push_outbox_attempt_count_check",
+    );
+    await expectConstraintError(
+      () => insertMatrixOutbox({ pushOutboxId: nextMatrixId(), rateLimitAttemptCount: 9, status: "PENDING" }),
+      "23514",
+      "push_outbox_rate_limit_attempt_count_check",
     );
     await expectConstraintError(
       () =>

@@ -159,6 +159,7 @@ export const pushOutbox = pgTable(
     pushDeviceId: uuid("pushDeviceId").notNull(),
     status: varchar("status", { length: 20 }).notNull().default("PENDING"),
     attemptCount: integer("attemptCount").notNull().default(0),
+    rateLimitAttemptCount: integer("rateLimitAttemptCount").notNull().default(0),
     availableAt: timestamp("availableAt", { withTimezone: true }).defaultNow().notNull(),
     claimToken: uuid("claimToken"),
     claimedAt: timestamp("claimedAt", { withTimezone: true }),
@@ -185,6 +186,7 @@ export const pushOutbox = pgTable(
       sql`${table.status} IN ('PENDING', 'PROCESSING', 'TICKETED', 'RECEIPT_OK', 'FAILED')`,
     ),
     check("push_outbox_attempt_count_check", sql`${table.attemptCount} >= 0`),
+    check("push_outbox_rate_limit_attempt_count_check", sql`${table.rateLimitAttemptCount} BETWEEN 0 AND 8`),
     check(
       "push_outbox_claim_check",
       sql`(${table.status} = 'PROCESSING' AND ${table.claimToken} IS NOT NULL AND ${table.claimedAt} IS NOT NULL)

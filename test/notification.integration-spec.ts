@@ -411,6 +411,11 @@ describe("FO notification GraphQL integration", () => {
     await resetTestFixtures(pool);
   });
 
+  afterEach(() => {
+    jest.restoreAllMocks();
+    jest.useRealTimers();
+  });
+
   afterAll(async () => {
     await app.close();
     await pool.end();
@@ -1596,6 +1601,189 @@ describe("FO notification GraphQL integration", () => {
       [invalidPending.pushOutboxId]: "FAILED",
     });
     expect(invalidDevice.rows[0]).toEqual({ disabledReason: "DEVICE_NOT_REGISTERED" });
+  });
+
+  it("settles returned receipts while backing off missing receipts through their eighth attempt", async () => {
+    const normalDeviceId = await seedPushDevice(pool, FIXTURE.userId, "worker-partial-normal");
+    const invalidDeviceId = await seedPushDevice(pool, FIXTURE.userId, "worker-partial-invalid");
+    const missingDeviceId = await seedPushDevice(pool, FIXTURE.userId, "worker-partial-missing");
+    const exhaustedDeviceId = await seedPushDevice(pool, FIXTURE.userId, "worker-partial-exhausted");
+    const now = new Date("2026-08-31T12:00:00.000Z");
+    const normal = await seedPushDelivery(pool, normalDeviceId, "push-worker-partial-normal", {
+      status: "TICKETED",
+      expoTicketId: "partial-normal-ticket",
+      receiptAvailableAt: now,
+    });
+    const invalid = await seedPushDelivery(pool, invalidDeviceId, "push-worker-partial-invalid", {
+      status: "TICKETED",
+      expoTicketId: "partial-invalid-ticket",
+      receiptAvailableAt: now,
+    });
+    const missing = await seedPushDelivery(pool, missingDeviceId, "push-worker-partial-missing", {
+      status: "TICKETED",
+      expoTicketId: "partial-missing-ticket",
+      receiptAvailableAt: now,
+    });
+    const exhausted = await seedPushDelivery(pool, exhaustedDeviceId, "push-worker-partial-exhausted", {
+      status: "TICKETED",
+      expoTicketId: "partial-exhausted-ticket",
+      receiptAvailableAt: now,
+      attemptCount: 7,
+    });
+    const provider = recordingPushSender({
+      receipts: async () => ({
+        "partial-normal-ticket": { status: "ok" },
+        "partial-invalid-ticket": {
+          status: "error",
+          message: "unregistered",
+          details: { error: "DeviceNotRegistered" },
+        },
+      }),
+    });
+
+    await pushWorker(notificationRepository, provider.sender).runOnce(now);
+
+    const states = await pool.query<{
+      pushOutboxId: string;
+      status: string;
+      attemptCount: number;
+      receiptAvailableAt: Date | null;
+    }>(
+      `SELECT "pushOutboxId", status, "attemptCount", "receiptAvailableAt"
+       FROM "pushOutbox" WHERE "pushOutboxId" = ANY($1::uuid[])`,
+      [[normal.pushOutboxId, invalid.pushOutboxId, missing.pushOutboxId, exhausted.pushOutboxId]],
+    );
+    const byId = new Map(states.rows.map((row) => [row.pushOutboxId, row]));
+    expect(byId.get(normal.pushOutboxId)).toMatchObject({ status: "RECEIPT_OK", attemptCount: 1 });
+    expect(byId.get(invalid.pushOutboxId)).toMatchObject({ status: "FAILED", attemptCount: 1 });
+    expect(byId.get(missing.pushOutboxId)).toEqual({
+      pushOutboxId: missing.pushOutboxId,
+      status: "TICKETED",
+      attemptCount: 1,
+      receiptAvailableAt: new Date(now.getTime() + 2_000),
+    });
+    expect(byId.get(exhausted.pushOutboxId)).toMatchObject({ status: "FAILED", attemptCount: 8 });
+    const invalidDevice = await pool.query<{ disabledReason: string | null }>(
+      `SELECT "disabledReason" FROM "pushDevices" WHERE "pushDeviceId" = $1`,
+      [invalidDeviceId],
+    );
+    expect(invalidDevice.rows[0]).toEqual({ disabledReason: "DEVICE_NOT_REGISTERED" });
+  });
+
+  it("heartbeats a hanging Push claim so a second worker cannot resend after thirty seconds", async () => {
+    const pushDeviceId = await seedPushDevice(pool, FIXTURE.userId, "worker-heartbeat");
+    await seedPushDelivery(pool, pushDeviceId, "push-worker-heartbeat");
+    const now = new Date();
+    const nativeSetInterval = global.setInterval;
+    const interval = jest
+      .spyOn(global, "setInterval")
+      .mockImplementation((callback, delay, ...args) =>
+        nativeSetInterval(callback, delay === 10_000 ? 10 : delay, ...args),
+      );
+    let release: (() => void) | undefined;
+    let started: (() => void) | undefined;
+    const senderStarted = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const firstSend = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let sendCount = 0;
+    const provider = recordingPushSender({
+      send: async (messages) => {
+        sendCount += 1;
+        if (sendCount === 1) {
+          started?.();
+          await firstSend;
+        }
+        return messages.map(({ data }) => ({ status: "ok", id: `ticket-${data.notificationId}` }));
+      },
+    });
+    const firstRun = pushWorker(notificationRepository, provider.sender).runOnce(now);
+
+    try {
+      await senderStarted;
+      const renewalDeadline = Date.now() + 500;
+      while (Date.now() < renewalDeadline) {
+        const claim = await pool.query<{ claimedAt: Date }>(
+          `SELECT "claimedAt" FROM "pushOutbox" WHERE "pushDeviceId" = $1`,
+          [pushDeviceId],
+        );
+        if ((claim.rows[0]?.claimedAt.getTime() ?? 0) > now.getTime()) break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      await pushWorker(notificationRepository, provider.sender).runOnce(new Date(now.getTime() + 30_001));
+    } finally {
+      release?.();
+      await firstRun;
+      interval.mockRestore();
+    }
+
+    expect(provider.sent).toHaveLength(1);
+  });
+
+  it("backs off MessageRateExceeded receipts into bounded message resends", async () => {
+    const pushDeviceId = await seedPushDevice(pool, FIXTURE.userId, "worker-rate-limit");
+    const now = new Date("2026-08-31T12:00:00.000Z");
+    const delivery = await seedPushDelivery(pool, pushDeviceId, "push-worker-rate-limit", {
+      status: "TICKETED",
+      expoTicketId: "rate-limit-ticket",
+      receiptAvailableAt: now,
+    });
+    const provider = recordingPushSender({
+      receipts: async (ticketIds) =>
+        Object.fromEntries(
+          ticketIds.map((ticketId) => [
+            ticketId,
+            {
+              status: "error" as const,
+              message: "slow down",
+              details: { error: "MessageRateExceeded" },
+            },
+          ]),
+        ),
+    });
+    const worker = pushWorker(notificationRepository, provider.sender);
+    let receiptAt = now;
+
+    for (let rateLimitAttemptCount = 1; rateLimitAttemptCount <= 8; rateLimitAttemptCount += 1) {
+      await worker.runOnce(receiptAt);
+      const state = await pool.query<{
+        status: string;
+        attemptCount: number;
+        rateLimitAttemptCount: number;
+        availableAt: Date;
+        expoTicketId: string | null;
+        receiptAvailableAt: Date | null;
+      }>(
+        `SELECT status, "attemptCount", "rateLimitAttemptCount", "availableAt", "expoTicketId", "receiptAvailableAt"
+         FROM "pushOutbox" WHERE "pushOutboxId" = $1`,
+        [delivery.pushOutboxId],
+      );
+      expect(state.rows[0]).toMatchObject({
+        status: rateLimitAttemptCount === 8 ? "FAILED" : "PENDING",
+        rateLimitAttemptCount,
+        expoTicketId: null,
+        receiptAvailableAt: null,
+      });
+      if (rateLimitAttemptCount === 8) break;
+      expect(state.rows[0]?.attemptCount).toBe(0);
+      expect(state.rows[0]?.availableAt).toEqual(
+        new Date(receiptAt.getTime() + Math.min(2 ** rateLimitAttemptCount, 300) * 1_000),
+      );
+      await worker.runOnce(state.rows[0]?.availableAt);
+      const ticketed = await pool.query<{
+        status: string;
+        rateLimitAttemptCount: number;
+        receiptAvailableAt: Date;
+      }>(
+        `SELECT status, "rateLimitAttemptCount", "receiptAvailableAt"
+         FROM "pushOutbox" WHERE "pushOutboxId" = $1`,
+        [delivery.pushOutboxId],
+      );
+      expect(ticketed.rows[0]).toMatchObject({ status: "TICKETED", rateLimitAttemptCount });
+      receiptAt = ticketed.rows[0]?.receiptAvailableAt ?? receiptAt;
+    }
   });
 
   it("disables DeviceNotRegistered tickets and fails every unsettled device row", async () => {

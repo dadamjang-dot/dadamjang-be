@@ -20,6 +20,7 @@ const claimedReceipt = {
   ...claimedSend,
   claimToken: "84000000-0000-4000-8000-000000000002",
   expoTicketId: "ticket-1",
+  rateLimitAttemptCount: 0,
 };
 
 const setup = (input?: {
@@ -32,6 +33,7 @@ const setup = (input?: {
   const repository = {
     purgeTerminalPushDeliveries: jest.fn().mockResolvedValue(0),
     claimPushSendBatch: jest.fn().mockResolvedValue([claimedSend]),
+    renewPushClaims: jest.fn().mockResolvedValue(undefined),
     persistPushTickets: input?.persistTicketError
       ? jest.fn().mockRejectedValue(input.persistTicketError)
       : jest.fn().mockResolvedValue(undefined),
@@ -133,7 +135,7 @@ describe("NotificationOutboxWorker", () => {
     enabled.worker.onModuleInit();
     await jest.advanceTimersByTimeAsync(1_000);
     expect(enabledRun).toHaveBeenCalledTimes(1);
-    enabled.worker.onApplicationShutdown();
+    await enabled.worker.onApplicationShutdown();
   });
 
   it("does not overlap one-second ticks", async () => {
@@ -150,6 +152,76 @@ describe("NotificationOutboxWorker", () => {
     expect(run).toHaveBeenCalledTimes(1);
     release?.();
     await pending;
-    worker.onApplicationShutdown();
+    await worker.onApplicationShutdown();
+  });
+
+  it("renews an in-flight claim before the thirty-second lease expires", async () => {
+    const now = new Date("2026-08-31T02:00:00.000Z");
+    jest.useFakeTimers({ now });
+    const { repository, sender, worker } = setup();
+    repository.claimPushReceiptBatch.mockResolvedValue([]);
+    let release: ((tickets: readonly [{ status: "ok"; id: string }]) => void) | undefined;
+    sender.send.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          release = resolve;
+        }),
+    );
+
+    const run = worker.runOnce(now);
+    await jest.advanceTimersByTimeAsync(10_000);
+
+    expect(repository.renewPushClaims).toHaveBeenCalledWith([claimedSend], new Date(now.getTime() + 10_000));
+    release?.([{ status: "ok", id: "ticket-1" }]);
+    await expect(run).resolves.toBe(true);
+    await jest.advanceTimersByTimeAsync(30_000);
+    expect(repository.renewPushClaims).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not persist a provider result after heartbeat ownership is lost", async () => {
+    const now = new Date("2026-08-31T02:00:00.000Z");
+    jest.useFakeTimers({ now });
+    const claimLost = new Error("Push delivery claim was lost");
+    const { repository, sender, worker } = setup();
+    repository.claimPushReceiptBatch.mockResolvedValue([]);
+    repository.renewPushClaims.mockRejectedValue(claimLost);
+    let release: ((tickets: readonly [{ status: "ok"; id: string }]) => void) | undefined;
+    sender.send.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          release = resolve;
+        }),
+    );
+
+    const run = worker.runOnce(now);
+    await jest.advanceTimersByTimeAsync(10_000);
+    release?.([{ status: "ok", id: "ticket-1" }]);
+    await expect(run).resolves.toBe(true);
+
+    expect(repository.persistPushTickets).not.toHaveBeenCalled();
+  });
+
+  it("waits for the active timer tick during graceful shutdown and starts no new tick", async () => {
+    jest.useFakeTimers();
+    const { worker } = setup({ enabled: "true" });
+    let release: (() => void) | undefined;
+    const pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const run = jest.spyOn(worker, "runOnce").mockImplementation(async () => pending.then(() => false));
+    worker.onModuleInit();
+    await jest.advanceTimersByTimeAsync(1_000);
+
+    let shutdownSettled = false;
+    const shutdown = Promise.resolve(worker.onApplicationShutdown()).then(() => {
+      shutdownSettled = true;
+    });
+    await jest.advanceTimersByTimeAsync(3_000);
+
+    expect(shutdownSettled).toBe(false);
+    expect(run).toHaveBeenCalledTimes(1);
+    release?.();
+    await shutdown;
+    expect(shutdownSettled).toBe(true);
   });
 });

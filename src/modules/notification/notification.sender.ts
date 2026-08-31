@@ -89,9 +89,8 @@ const parseExpoPushReceipts = (
   if (!isRecord(value) || !isRecord(value.data)) throw new RetryablePushError();
   const data = value.data;
   const responseIds = Object.keys(data);
-  if (responseIds.length !== ticketIds.length || responseIds.some((ticketId) => !ticketIds.includes(ticketId)))
-    throw new RetryablePushError();
-  return Object.fromEntries(ticketIds.map((ticketId) => [ticketId, parseReceipt(data[ticketId])])) as Readonly<
+  if (responseIds.some((ticketId) => !ticketIds.includes(ticketId))) throw new RetryablePushError();
+  return Object.fromEntries(responseIds.map((ticketId) => [ticketId, parseReceipt(data[ticketId])])) as Readonly<
     Record<string, ExpoPushReceipt>
   >;
 };
