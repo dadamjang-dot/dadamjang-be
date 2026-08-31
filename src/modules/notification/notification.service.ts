@@ -129,7 +129,7 @@ export class NotificationService {
     tx: DatabaseTransaction,
     input: { userIds: readonly string[]; productId: string; skuUpdatedAt: Date; newPrice: number },
   ): Promise<void> => {
-    for (const userId of new Set(input.userIds))
+    for (const userId of [...new Set(input.userIds)].sort())
       await this.repository.create(tx, {
         userId,
         preferenceCategory: "wishPushEnabled",
@@ -149,7 +149,7 @@ export class NotificationService {
     tx: DatabaseTransaction,
     input: { userIds: readonly string[]; productId: string; skuUpdatedAt: Date },
   ): Promise<void> => {
-    for (const userId of new Set(input.userIds))
+    for (const userId of [...new Set(input.userIds)].sort())
       await this.repository.create(tx, {
         userId,
         preferenceCategory: "wishPushEnabled",

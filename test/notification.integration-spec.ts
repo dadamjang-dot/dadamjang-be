@@ -63,12 +63,19 @@ const waitFor = async (condition: () => Promise<boolean>) => {
   throw new Error("Timed out waiting for notification lock barrier");
 };
 
-const startPushDeviceBlocker = async (pool: Pool, pushDeviceId: string) => {
+const startPushDeviceBlocker = async (pool: Pool, pushDeviceIds: string | readonly string[]) => {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
     await client.query("SET LOCAL lock_timeout = '2s'; SET LOCAL statement_timeout = '30s'");
-    await client.query(`SELECT "pushDeviceId" FROM "pushDevices" WHERE "pushDeviceId" = $1 FOR UPDATE`, [pushDeviceId]);
+    await client.query(
+      `SELECT "pushDeviceId"
+       FROM "pushDevices"
+       WHERE "pushDeviceId" = ANY($1::uuid[])
+       ORDER BY "pushDeviceId"
+       FOR UPDATE`,
+      [typeof pushDeviceIds === "string" ? [pushDeviceIds] : pushDeviceIds],
+    );
     const pid = (await client.query<{ pid: number }>(`SELECT pg_backend_pid() AS pid`)).rows[0]?.pid;
     if (!pid) throw new Error("Failed to identify notification blocker");
     return { client, pid };
@@ -909,6 +916,115 @@ describe("FO notification GraphQL integration", () => {
     expect(await createdDeliveryRows(pool, SECOND_USER.userId)).toEqual(
       expectedRows.map(({ dedupeKey }) => ({ dedupeKey, pushDeviceId: secondDeviceId })),
     );
+  });
+
+  it("commits opposite wish recipient orders without a deadlock", async () => {
+    await seedSecondUser(pool);
+    const firstDeviceId = await seedPushDevice(pool, FIXTURE.userId, "wish-order-first");
+    const secondDeviceId = await seedPushDevice(pool, SECOND_USER.userId, "wish-order-second");
+    const blocker = await startPushDeviceBlocker(pool, [firstDeviceId, secondDeviceId]);
+    const skuUpdatedAt = new Date("2026-08-31T09:45:00.000Z");
+    const create = (userIds: readonly string[]) =>
+      db.transaction((tx) =>
+        notificationService.createWishPriceDrop(tx, {
+          userIds,
+          productId: FIXTURE.productId,
+          skuUpdatedAt,
+          newPrice: 8500,
+        }),
+      );
+    const outcomesPromise = Promise.allSettled([
+      create([FIXTURE.userId, SECOND_USER.userId]),
+      create([SECOND_USER.userId, FIXTURE.userId]),
+    ]);
+    let released = false;
+    try {
+      await waitFor(async () => (await blockedQueries(pool, blocker.pid)).length >= 2);
+      await releaseBlocker(blocker.client);
+      released = true;
+      const outcomes = await outcomesPromise;
+      expect(
+        outcomes.map((outcome) =>
+          outcome.status === "rejected" &&
+          typeof outcome.reason === "object" &&
+          outcome.reason !== null &&
+          "code" in outcome.reason
+            ? outcome.reason.code
+            : null,
+        ),
+      ).toEqual([null, null]);
+      expect(outcomes.map(({ status }) => status)).toEqual(["fulfilled", "fulfilled"]);
+    } finally {
+      if (!released) await rollbackBlocker(blocker.client);
+      await outcomesPromise;
+    }
+
+    const dedupeKey = `wish-price:${FIXTURE.productId}:${skuUpdatedAt.toISOString()}:8500`;
+    expect(await createdNotificationRows(pool, FIXTURE.userId)).toEqual([expect.objectContaining({ dedupeKey })]);
+    expect(await createdNotificationRows(pool, SECOND_USER.userId)).toEqual([expect.objectContaining({ dedupeKey })]);
+    expect(await createdDeliveryRows(pool, FIXTURE.userId)).toEqual([{ dedupeKey, pushDeviceId: firstDeviceId }]);
+    expect(await createdDeliveryRows(pool, SECOND_USER.userId)).toEqual([{ dedupeKey, pushDeviceId: secondDeviceId }]);
+  });
+
+  it("serializes preference disable after in-flight creation and suppresses later delivery", async () => {
+    const pushDeviceId = await seedPushDevice(pool, FIXTURE.userId, "preference-order");
+    const blocker = await startPushDeviceBlocker(pool, pushDeviceId);
+    const firstUpdatedAt = new Date("2026-08-31T09:50:00.000Z");
+    const secondUpdatedAt = new Date("2026-08-31T09:51:00.000Z");
+    const creation = db.transaction((tx) =>
+      notificationService.createWishPriceDrop(tx, {
+        userIds: [FIXTURE.userId],
+        productId: FIXTURE.productId,
+        skuUpdatedAt: firstUpdatedAt,
+        newPrice: 8200,
+      }),
+    );
+    const creationOutcome = creation.then(
+      () => ({ status: "fulfilled" as const }),
+      (reason: unknown) => ({ status: "rejected" as const, reason }),
+    );
+    let update: ReturnType<NotificationService["updatePreferences"]> | undefined;
+    let updateSettled = false;
+    let released = false;
+    try {
+      await waitFor(async () => (await blockedQueries(pool, blocker.pid)).length === 1);
+      update = notificationService.updatePreferences(FIXTURE.userId, { pushEnabled: false }).then(
+        (preferences) => {
+          updateSettled = true;
+          return preferences;
+        },
+        (error: unknown) => {
+          updateSettled = true;
+          throw error;
+        },
+      );
+      await waitFor(async () => updateSettled || (await blockedQueries(pool, blocker.pid)).length >= 2);
+      expect(updateSettled).toBe(false);
+      expect((await blockedQueries(pool, blocker.pid)).length).toBeGreaterThanOrEqual(2);
+      await releaseBlocker(blocker.client);
+      released = true;
+      const preferences = await update;
+      expect(preferences.pushEnabled).toBe(false);
+      expect(await creationOutcome).toEqual({ status: "fulfilled" });
+    } finally {
+      if (!released) await rollbackBlocker(blocker.client);
+      await Promise.allSettled([creationOutcome, ...(update ? [update] : [])]);
+    }
+
+    await db.transaction((tx) =>
+      notificationService.createWishRestock(tx, {
+        userIds: [FIXTURE.userId],
+        productId: FIXTURE.productId,
+        skuUpdatedAt: secondUpdatedAt,
+      }),
+    );
+    expect(await createdNotificationRows(pool, FIXTURE.userId)).toHaveLength(2);
+    expect(await createdDeliveryRows(pool, FIXTURE.userId)).toEqual([
+      {
+        dedupeKey: `wish-price:${FIXTURE.productId}:${firstUpdatedAt.toISOString()}:8200`,
+        pushDeviceId,
+      },
+    ]);
   });
 
   it("keeps app alerts while overall and category preferences suppress Push", async () => {

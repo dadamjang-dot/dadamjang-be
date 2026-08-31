@@ -252,6 +252,7 @@ export class NotificationRepository {
     userId: string,
     preferenceCategory: NotificationPreferenceCategory,
   ) => {
+    await store.insert(notificationPreferences).values({ userId }).onConflictDoNothing();
     const [preferences] = await store
       .select({
         pushEnabled: notificationPreferences.pushEnabled,
@@ -259,8 +260,10 @@ export class NotificationRepository {
       })
       .from(notificationPreferences)
       .where(eq(notificationPreferences.userId, userId))
-      .limit(1);
-    if (preferences && (!preferences.pushEnabled || !preferences.categoryEnabled)) return [];
+      .limit(1)
+      .for("share");
+    const eligiblePreferences = requireResult(preferences);
+    if (!eligiblePreferences.pushEnabled || !eligiblePreferences.categoryEnabled) return [];
     return store
       .select({ pushDeviceId: pushDevices.pushDeviceId })
       .from(pushDevices)
