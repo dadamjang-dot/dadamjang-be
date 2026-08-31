@@ -51,7 +51,11 @@ export class FoAuthService {
         throw new CustomUnauthorizedException("이메일 또는 비밀번호가 올바르지 않습니다.");
       if (currentUser.anonymizedAt) throw new CustomUnauthorizedException("이메일 또는 비밀번호가 올바르지 않습니다.");
       if (currentUser.deactivatedAt) {
-        const reactivationToken = await this.foAccountService.createReactivationToken(currentUser.userId, deviceId);
+        const reactivationToken = await this.foAccountService.createReactivationToken(
+          currentUser.userId,
+          deviceId,
+          store,
+        );
         return { status: FoSigninStatus.ReactivationRequired, reactivationToken };
       }
       const tokenPayload = await this.authService.issueTokensForUser(currentUser, deviceId, store, signinStartedAt);

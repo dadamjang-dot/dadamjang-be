@@ -50,12 +50,18 @@ export class AuthService {
       await bcrypt.compare(input.password, invalidPasswordHash);
       throw new CustomUnauthorizedException(AuthErrorMessage.AuthRequired);
     }
-    const passwordHash = user.password;
     return this.withSigninLock(user.userId, deviceId, async (store) => {
-      if (!(await bcrypt.compare(input.password, passwordHash)))
-        throw new CustomUnauthorizedException(AuthErrorMessage.AuthRequired);
-      this.assertPortalRole((user as User & { role?: UserRoleValue }).role ?? UserRole.User, input.portal);
-      return this.issueTokensForUser(user, deviceId, store, signinStartedAt);
+      return this.repository.withActiveUserSession(
+        user.userId,
+        async (currentUser, transaction) => {
+          const passwordHash = currentUser.password ?? invalidPasswordHash;
+          if (currentUser.password === null || !(await bcrypt.compare(input.password, passwordHash)))
+            throw new CustomUnauthorizedException(AuthErrorMessage.AuthRequired);
+          this.assertPortalRole((currentUser as User & { role?: UserRoleValue }).role ?? UserRole.User, input.portal);
+          return this.issueTokensForUser(currentUser, deviceId, transaction, signinStartedAt);
+        },
+        store,
+      );
     });
   };
   refresh = async (userId: string, deviceId: string, refreshToken: string) => {

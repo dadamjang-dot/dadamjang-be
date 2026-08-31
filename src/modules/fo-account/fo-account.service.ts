@@ -3,6 +3,7 @@ import { randomBytes } from "crypto";
 import { hashToken } from "src/common/security/token-hash";
 import { AuthService } from "src/modules/auth/auth.service";
 import type { TokenPayload } from "src/modules/auth/auth.types";
+import type { DatabaseTransaction } from "src/modules/database/database.module";
 import type { FoAccountDeactivationPayload } from "./fo-account.types";
 import { FoAccountRepository } from "./fo-account.repository";
 
@@ -15,9 +16,9 @@ export class FoAccountService {
 
   deactivate = (userId: string): Promise<FoAccountDeactivationPayload> => this.repository.deactivate(userId);
 
-  createReactivationToken = async (userId: string, deviceId: string): Promise<string> => {
+  createReactivationToken = async (userId: string, deviceId: string, store?: DatabaseTransaction): Promise<string> => {
     const reactivationToken = randomBytes(32).toString("base64url");
-    await this.repository.insertReactivationToken(userId, hashToken(reactivationToken), hashToken(deviceId));
+    await this.repository.insertReactivationToken(userId, hashToken(reactivationToken), hashToken(deviceId), store);
     return reactivationToken;
   };
 

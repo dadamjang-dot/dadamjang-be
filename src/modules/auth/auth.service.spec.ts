@@ -74,6 +74,10 @@ describe("AuthService", () => {
           value: await action(undefined),
         }),
       ),
+      withActiveUserSession: jest.fn(
+        async (_userId: string, action: (lockedUser: typeof user, store: undefined) => Promise<unknown>) =>
+          action({ ...user, role: "ADMIN" }, undefined),
+      ),
       findRefreshToken: jest.fn().mockResolvedValue(undefined),
       saveRefreshToken: jest.fn().mockResolvedValue(true),
     };
@@ -169,6 +173,10 @@ describe("AuthService", () => {
             value: await action(undefined),
           }),
         ),
+        withActiveUserSession: jest.fn(
+          async (_userId: string, action: (lockedUser: typeof user, store: undefined) => Promise<unknown>) =>
+            action({ ...user, password }, undefined),
+        ),
       },
       {
         normalizeUserid: (value: string) => value,
@@ -180,6 +188,76 @@ describe("AuthService", () => {
         deviceId: "device",
       }),
     ).rejects.toThrow(AuthErrorMessage.AuthRequired);
+  });
+
+  it("rejects an old password after the locked user row has a new password", async () => {
+    const oldPassword = await bcrypt.hash("old-password", 4);
+    const newPassword = await bcrypt.hash("new-password", 4);
+    const currentUser = { ...user, password: newPassword };
+    const store = {};
+    const repository = {
+      signinStartedAt: jest.fn().mockResolvedValue(new Date()),
+      findByUserid: jest.fn().mockResolvedValue({ ...user, password: oldPassword }),
+      withSigninLock: jest.fn(
+        async (_userId: string, _deviceId: string, action: (store: object) => Promise<unknown>) => ({
+          acquired: true,
+          value: await action(store),
+        }),
+      ),
+      withActiveUserSession: jest.fn(
+        async (_userId: string, action: (lockedUser: typeof currentUser, store: object) => Promise<unknown>) =>
+          action(currentUser, store),
+      ),
+      findRefreshToken: jest.fn().mockResolvedValue(undefined),
+      saveRefreshToken: jest.fn().mockResolvedValue(true),
+    };
+    const jwtService = {
+      signAsync: jest.fn().mockResolvedValueOnce("access-token").mockResolvedValueOnce("refresh-token"),
+      decode: jest.fn().mockReturnValue({ exp: Math.floor(Date.now() / 1000) + 3600 }),
+    };
+    const service = new AuthService(
+      repository as never,
+      jwtService as never,
+      { getOrThrow: jest.fn((name: string) => (name.endsWith("EXP") ? "1h" : "secret")) } as never,
+      { normalizeUserid: (value: string) => value } as never,
+      { assertAllowed: jest.fn().mockResolvedValue(undefined) } as never,
+    );
+
+    await expect(
+      service.signin({ userid: user.userid, password: "old-password", portal: AuthPortal.FO }, "device", {
+        ip: "127.0.0.1",
+      }),
+    ).rejects.toThrow(AuthErrorMessage.AuthRequired);
+    expect(jwtService.signAsync).not.toHaveBeenCalled();
+    expect(repository.saveRefreshToken).not.toHaveBeenCalled();
+  });
+
+  it("validates the portal against the role on the locked user row", async () => {
+    const password = await bcrypt.hash("password", 4);
+    const store = {};
+    const repository = {
+      signinStartedAt: jest.fn().mockResolvedValue(new Date()),
+      findByUserid: jest.fn().mockResolvedValue({ ...user, password, role: "USER" }),
+      withSigninLock: jest.fn(
+        async (_userId: string, _deviceId: string, action: (transaction: object) => Promise<unknown>) => ({
+          acquired: true,
+          value: await action(store),
+        }),
+      ),
+      withActiveUserSession: jest.fn(
+        async (_userId: string, action: (lockedUser: typeof user, transaction: object) => Promise<unknown>) =>
+          action({ ...user, password, role: "ADMIN" }, store),
+      ),
+    };
+    const service = createService(repository, { normalizeUserid: (value: string) => value });
+    service.issueTokensForUser = jest.fn().mockResolvedValue({}) as never;
+
+    await expect(
+      service.signin({ userid: user.userid, password: "password", portal: AuthPortal.FO }, "device", {
+        ip: "127.0.0.1",
+      }),
+    ).rejects.toThrow(AuthErrorMessage.AuthRequired);
+    expect(service.issueTokensForUser).not.toHaveBeenCalled();
   });
 
   it("uses the dummy password comparison for a passwordless account", async () => {

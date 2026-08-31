@@ -139,6 +139,43 @@ describe("KakaoFlowService", () => {
     await expect(completeLogin("flow-id", "device-b", callbackToken)).rejects.toThrow();
   });
 
+  it("creates a reactivation token in the Kakao flow transaction", async () => {
+    const store = {};
+    const createReactivationToken = jest.fn().mockResolvedValue("reactivation-token");
+    const repository = {
+      completeLoginFlow: jest.fn(
+        async (
+          _flowId: string,
+          _deviceIdHash: string,
+          _callbackToken: string,
+          _signupToken: string,
+          completeExistingUser: (
+            value: Omit<typeof user, "deactivatedAt"> & { deactivatedAt: Date | null },
+            transaction: object,
+          ) => Promise<object>,
+        ) => ({
+          kind: "existing" as const,
+          result: await completeExistingUser({ ...user, deactivatedAt: new Date() }, store),
+        }),
+      ),
+    };
+    const service = new KakaoFlowService(
+      repository as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      { createReactivationToken } as never,
+    );
+
+    await expect(service.completeLogin("flow-id", "device", "callback-token")).resolves.toMatchObject({
+      status: "REACTIVATION_REQUIRED",
+      reactivationToken: "reactivation-token",
+    });
+    expect(createReactivationToken).toHaveBeenCalledWith(user.userId, "device", store);
+  });
+
   it("creates a Kakao-only account without a password", async () => {
     const completeSignup = jest.fn().mockResolvedValue({ role: UserRole.User });
     const repository = { completeSignup } as unknown as KakaoFlowRepository;

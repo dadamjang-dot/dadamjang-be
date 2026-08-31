@@ -69,7 +69,7 @@ export class KakaoFlowService {
           if (!hasBuyerCapability(user.role)) throw new InvalidFoAuthProofError();
           if (user.anonymizedAt) throw new InvalidFoAuthProofError();
           if (user.deactivatedAt) {
-            const reactivationToken = await this.foAccountService.createReactivationToken(user.userId, deviceId);
+            const reactivationToken = await this.foAccountService.createReactivationToken(user.userId, deviceId, store);
             return {
               status: "REACTIVATION_REQUIRED" as const,
               tokenPayload: null,

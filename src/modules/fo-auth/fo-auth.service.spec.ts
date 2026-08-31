@@ -120,4 +120,36 @@ describe("FoAuthService", () => {
       compare.mockImplementation(actualCompare);
     }
   });
+
+  it("creates a reactivation token in the locked sign-in transaction", async () => {
+    const store = {};
+    const createReactivationToken = jest.fn().mockResolvedValue("reactivation-token");
+    const repository = {
+      findByEmail: jest.fn().mockResolvedValue({ ...user, password: "hash" }),
+      findUserForSignin: jest.fn().mockResolvedValue({ ...user, password: "hash", deactivatedAt: new Date() }),
+    };
+    const authService = {
+      signinStartedAt: jest.fn().mockResolvedValue(new Date()),
+      withSigninLock: jest.fn(
+        async (_userId: string, _deviceId: string, action: (transaction: object) => Promise<unknown>) => action(store),
+      ),
+    };
+    const service = new FoAuthService(
+      repository as never,
+      authService as never,
+      { normalizeEmail: (value: string) => value } as never,
+      { assertAllowed: jest.fn().mockResolvedValue(undefined) } as never,
+      { createReactivationToken } as never,
+    );
+    const compare = jest.mocked(bcrypt.compare).mockResolvedValue(true as never);
+
+    try {
+      await expect(
+        service.signin({ email: user.email, password: "password" }, "device", { ip: "127.0.0.1" }),
+      ).resolves.toMatchObject({ status: "REACTIVATION_REQUIRED", reactivationToken: "reactivation-token" });
+      expect(createReactivationToken).toHaveBeenCalledWith(user.userId, "device", store);
+    } finally {
+      compare.mockImplementation(actualCompare);
+    }
+  });
 });
