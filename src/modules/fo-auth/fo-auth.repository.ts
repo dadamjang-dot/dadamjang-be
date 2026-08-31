@@ -35,6 +35,9 @@ export class FoAuthRepository {
 
   findByEmail = (email: string) => this.db.query.users.findFirst({ where: eq(users.email, email) });
 
+  findUserForSignin = async (userId: string, store: RefreshTokenStore) =>
+    (await store.select().from(users).where(eq(users.userId, userId)).limit(1).for("no key update"))[0];
+
   activeConsentDocuments = (now: Date) =>
     this.db
       .select()

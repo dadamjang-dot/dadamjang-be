@@ -32,6 +32,20 @@ const waitForAdvisoryWaiters = async (pool: Pool, expected: number) => {
   throw new Error(`Timed out waiting for ${expected} advisory lock waiters`);
 };
 
+const waitForLockWaiters = async (pool: Pool, expected: number) => {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const waiting = await pool.query<{ count: string }>(
+      `SELECT count(*)
+       FROM pg_stat_activity
+       WHERE pid <> pg_backend_pid()
+         AND wait_event_type = 'Lock'`,
+    );
+    if (Number(waiting.rows[0]?.count) >= expected) return;
+    await wait(10);
+  }
+  throw new Error(`Timed out waiting for ${expected} database lock waiters`);
+};
+
 const installRefreshSessionFailure = async (pool: Pool) => {
   await pool.query(`
     CREATE OR REPLACE FUNCTION reject_test_refresh_session() RETURNS trigger AS $$
@@ -209,6 +223,7 @@ describe("FO auth GraphQL integration", () => {
   });
 
   it("returns reactivation instead of a session for a deactivated email account", async () => {
+    const issuedAfter = Date.now();
     await pool.query(
       `UPDATE "users"
        SET "deactivatedAt" = now(), "scheduledAnonymizationAt" = now() + interval '30 days'
@@ -231,13 +246,77 @@ describe("FO auth GraphQL integration", () => {
       tokenPayload: null,
       reactivationToken: expect.any(String),
     });
-    const state = await pool.query<{ sessions: number; tokens: number }>(
+    const reactivationToken = response.body.data.signinFo.reactivationToken as string;
+    const state = await pool.query<{
+      sessions: number;
+      tokenHash: string;
+      deviceIdHash: string;
+      expiresAt: Date;
+    }>(
       `SELECT
         (SELECT count(*)::int FROM "refreshToken" WHERE "userId" = $1) AS sessions,
-        (SELECT count(*)::int FROM "accountReactivationTokens" WHERE "userId" = $1 AND "deviceIdHash" = $2) AS tokens`,
-      [FIXTURE.userId, hashToken("deactivated-email-device")],
+        "tokenHash", "deviceIdHash", "expiresAt"
+       FROM "accountReactivationTokens"
+       WHERE "userId" = $1`,
+      [FIXTURE.userId],
     );
-    expect(state.rows[0]).toEqual({ sessions: 0, tokens: 1 });
+    expect(Buffer.from(reactivationToken, "base64url")).toHaveLength(32);
+    expect(state.rows[0]).toEqual({
+      sessions: 0,
+      tokenHash: hashToken(reactivationToken),
+      deviceIdHash: hashToken("deactivated-email-device"),
+      expiresAt: expect.any(Date),
+    });
+    expect(state.rows[0]?.tokenHash).not.toBe(reactivationToken);
+    expect(state.rows[0]?.deviceIdHash).not.toBe("deactivated-email-device");
+    expect(state.rows[0]?.expiresAt.getTime()).toBeGreaterThanOrEqual(issuedAfter + 10 * 60_000);
+    expect(state.rows[0]?.expiresAt.getTime()).toBeLessThanOrEqual(Date.now() + 10 * 60_000);
+  });
+
+  it("observes email deactivation before persisting a sign-in session", async () => {
+    const deviceId = "racing-email-deactivation-device";
+    const locker = await pool.connect();
+    let transactionOpen = true;
+    await locker.query("BEGIN");
+    try {
+      await locker.query(`SELECT 1 FROM "users" WHERE "userId" = $1 FOR UPDATE`, [FIXTURE.userId]);
+      const responsePromise = Promise.resolve(
+        request(app.getHttpServer())
+          .post("/graphql")
+          .set("x-device-id", deviceId)
+          .send({
+            query: `mutation SigninFo($input: SigninFoInput!) {
+              signinFo(input: $input) { status tokenPayload { accessToken } reactivationToken }
+            }`,
+            variables: { input: { email: "integration@example.test", password: FIXTURE.password } },
+          }),
+      );
+      await waitForLockWaiters(pool, 1);
+      await locker.query(
+        `UPDATE "users"
+         SET "deactivatedAt" = now(), "scheduledAnonymizationAt" = now() + interval '30 days'
+         WHERE "userId" = $1`,
+        [FIXTURE.userId],
+      );
+      await locker.query("COMMIT");
+      transactionOpen = false;
+      const response = await responsePromise;
+
+      expect(response.body.errors).toBeUndefined();
+      expect(response.body.data.signinFo).toEqual({
+        status: "REACTIVATION_REQUIRED",
+        tokenPayload: null,
+        reactivationToken: expect.any(String),
+      });
+    } finally {
+      if (transactionOpen) await locker.query("ROLLBACK");
+      locker.release();
+    }
+    const sessions = await pool.query<{ count: number }>(
+      `SELECT count(*)::int AS count FROM "refreshToken" WHERE "userId" = $1 AND "deviceId" = $2`,
+      [FIXTURE.userId, deviceId],
+    );
+    expect(sessions.rows[0]?.count).toBe(0);
   });
 
   it("does not reveal whether an email account is missing or passwordless", async () => {
@@ -491,6 +570,69 @@ describe("FO auth GraphQL integration", () => {
       [FIXTURE.userId, hashToken(deviceId)],
     );
     expect(state.rows[0]).toEqual({ sessions: 0, tokens: 1 });
+  });
+
+  it("observes Kakao account deactivation before persisting a sign-in session", async () => {
+    const deviceId = "racing-kakao-deactivation-device";
+    const flowId = "d0000000-0000-4000-8000-000000000011";
+    const callbackToken = "racing-kakao-deactivation-callback";
+    await pool.query(
+      `INSERT INTO "authIdentity" ("userId", "provider", "providerUserId") VALUES ($1, 'kakao', 'kakao-racing')`,
+      [FIXTURE.userId],
+    );
+    await pool.query(
+      `INSERT INTO "kakaoLoginFlows"
+        ("flowId", "deviceIdHash", "providerUserId", "email", "emailVerified", "userId", "status", "callbackTokenHash", "expiresAt", "callbackAt")
+       VALUES ($1, $2, 'kakao-racing', 'integration@example.test', true, $3, 'EXISTING_USER', $4, now() + interval '10 minutes', now())`,
+      [flowId, hashToken(deviceId), FIXTURE.userId, hashToken(callbackToken)],
+    );
+    const locker = await pool.connect();
+    let transactionOpen = true;
+    await locker.query("BEGIN");
+    try {
+      await locker.query(`SELECT 1 FROM "users" WHERE "userId" = $1 FOR UPDATE`, [FIXTURE.userId]);
+      const responsePromise = Promise.resolve(
+        request(app.getHttpServer())
+          .post("/graphql")
+          .set("x-device-id", deviceId)
+          .send({
+            query: `mutation CompleteKakaoLogin($input: CompleteKakaoLoginInput!) {
+              completeKakaoLogin(input: $input) {
+                status tokenPayload { accessToken } kakaoSignupToken email emailVerificationRequired reactivationToken
+              }
+            }`,
+            variables: { input: { flowId, callbackToken } },
+          }),
+      );
+      await waitForLockWaiters(pool, 1);
+      await locker.query(
+        `UPDATE "users"
+         SET "deactivatedAt" = now(), "scheduledAnonymizationAt" = now() + interval '30 days'
+         WHERE "userId" = $1`,
+        [FIXTURE.userId],
+      );
+      await locker.query("COMMIT");
+      transactionOpen = false;
+      const response = await responsePromise;
+
+      expect(response.body.errors).toBeUndefined();
+      expect(response.body.data.completeKakaoLogin).toEqual({
+        status: "REACTIVATION_REQUIRED",
+        tokenPayload: null,
+        kakaoSignupToken: null,
+        email: null,
+        emailVerificationRequired: false,
+        reactivationToken: expect.any(String),
+      });
+    } finally {
+      if (transactionOpen) await locker.query("ROLLBACK");
+      locker.release();
+    }
+    const sessions = await pool.query<{ count: number }>(
+      `SELECT count(*)::int AS count FROM "refreshToken" WHERE "userId" = $1 AND "deviceId" = $2`,
+      [FIXTURE.userId, deviceId],
+    );
+    expect(sessions.rows[0]?.count).toBe(0);
   });
 
   it("converges repeated anonymous starts onto one current row per device and purpose", async () => {

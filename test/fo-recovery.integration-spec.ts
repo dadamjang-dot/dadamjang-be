@@ -171,6 +171,28 @@ describe("FO account recovery GraphQL integration", () => {
     expect(state.rows[0]).toEqual({ password: null, usedAt: null });
   });
 
+  it("resets an empty but non-null legacy password", async () => {
+    await pool.query(`UPDATE "users" SET "password" = '' WHERE "userId" = $1`, [FIXTURE.userId]);
+    await pool.query(
+      `INSERT INTO "passwordResetToken" ("tokenHash", "userId", "expiresAt")
+       VALUES ($1, $2, now() + interval '10 minutes')`,
+      [hashToken("empty-password-proof"), FIXTURE.userId],
+    );
+
+    const response = await resetPassword(app, "empty-password-proof", "ReplacedPassword123!");
+
+    expect(response.body.errors).toBeUndefined();
+    const state = await pool.query<{ password: string; usedAt: Date | null }>(
+      `SELECT u."password", p."usedAt"
+       FROM "users" u
+       JOIN "passwordResetToken" p ON p."userId" = u."userId"
+       WHERE u."userId" = $1 AND p."tokenHash" = $2`,
+      [FIXTURE.userId, hashToken("empty-password-proof")],
+    );
+    await expect(bcrypt.compare("ReplacedPassword123!", state.rows[0]?.password ?? "")).resolves.toBe(true);
+    expect(state.rows[0]?.usedAt).toEqual(expect.any(Date));
+  });
+
   it("revokes every sibling password-recovery proof", async () => {
     const verificationId = "e0000000-0000-4000-8000-000000000001";
     const activeCodeId = "e0000000-0000-4000-8000-000000000002";

@@ -56,6 +56,7 @@ describe("FoAuthService", () => {
         order.push("lookup");
         return user;
       }),
+      findUserForSignin: jest.fn().mockResolvedValue(user),
     };
     const authService = {
       signinStartedAt: jest.fn().mockResolvedValue(new Date()),

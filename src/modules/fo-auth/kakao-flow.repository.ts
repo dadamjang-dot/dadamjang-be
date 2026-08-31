@@ -162,7 +162,7 @@ export class KakaoFlowRepository {
           ),
         );
       if (flow.status === "EXISTING_USER" && flow.userId) {
-        const user = await tx.query.users.findFirst({ where: eq(users.userId, flow.userId) });
+        const [user] = await tx.select().from(users).where(eq(users.userId, flow.userId)).limit(1).for("no key update");
         if (!user) throw new InvalidFoAuthProofError();
         return { kind: "existing" as const, result: await completeExistingUser(user, tx) };
       }

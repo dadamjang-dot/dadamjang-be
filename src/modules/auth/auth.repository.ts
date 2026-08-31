@@ -9,7 +9,7 @@ import {
   type User,
 } from "src/modules/database/schema";
 
-export type RefreshTokenStore = Pick<Database, "delete" | "insert" | "query" | "update">;
+export type RefreshTokenStore = Pick<Database, "delete" | "insert" | "query" | "select" | "update">;
 
 const MIN_SIGNIN_REISSUE_INTERVAL_MS = 1000;
 const REFRESH_ROTATION_HISTORY_SECONDS = 60;

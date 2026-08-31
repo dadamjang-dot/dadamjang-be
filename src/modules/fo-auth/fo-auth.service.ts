@@ -43,17 +43,18 @@ export class FoAuthService {
       await bcrypt.compare(input.password, invalidPasswordHash);
       throw new CustomUnauthorizedException("이메일 또는 비밀번호가 올바르지 않습니다.");
     }
-    const passwordHash = user.password;
     return this.authService.withSigninLock(user.userId, deviceId, async (store) => {
+      const currentUser = await this.repository.findUserForSignin(user.userId, store);
+      const passwordHash = currentUser?.password ?? invalidPasswordHash;
       const validPassword = await bcrypt.compare(input.password, passwordHash);
-      if (!validPassword || !hasBuyerCapability(user.role))
+      if (!currentUser || currentUser.password === null || !validPassword || !hasBuyerCapability(currentUser.role))
         throw new CustomUnauthorizedException("이메일 또는 비밀번호가 올바르지 않습니다.");
-      if (user.anonymizedAt) throw new CustomUnauthorizedException("이메일 또는 비밀번호가 올바르지 않습니다.");
-      if (user.deactivatedAt) {
-        const reactivationToken = await this.foAccountService.createReactivationToken(user.userId, deviceId);
+      if (currentUser.anonymizedAt) throw new CustomUnauthorizedException("이메일 또는 비밀번호가 올바르지 않습니다.");
+      if (currentUser.deactivatedAt) {
+        const reactivationToken = await this.foAccountService.createReactivationToken(currentUser.userId, deviceId);
         return { status: FoSigninStatus.ReactivationRequired, reactivationToken };
       }
-      const tokenPayload = await this.authService.issueTokensForUser(user, deviceId, store, signinStartedAt);
+      const tokenPayload = await this.authService.issueTokensForUser(currentUser, deviceId, store, signinStartedAt);
       return { status: FoSigninStatus.SignedIn, tokenPayload };
     });
   };
