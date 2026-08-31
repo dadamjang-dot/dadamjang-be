@@ -1,4 +1,5 @@
 import type { INestApplication } from "@nestjs/common";
+import type { ConfigService } from "@nestjs/config";
 import { randomUUID } from "crypto";
 import { sql } from "drizzle-orm";
 import type { Pool, PoolClient } from "pg";
@@ -8,6 +9,13 @@ import { FIXTURE } from "src/database/fixtures";
 import { Database, DRIZZLE } from "src/modules/database/database.module";
 import { NotificationRepository } from "src/modules/notification/notification.repository";
 import { NotificationService } from "src/modules/notification/notification.service";
+import { NotificationOutboxWorker } from "src/modules/notification/notification.outbox";
+import {
+  ExpoPushSender,
+  RetryablePushError,
+  type ExpoPushMessage,
+  type ExpoPushReceipt,
+} from "src/modules/notification/notification.sender";
 import { FoPushPlatform } from "src/modules/notification/notification.types";
 import { resetTestFixtures, testPool } from "./support/database";
 
@@ -303,6 +311,85 @@ const expectDisabledDeliveries = async (pool: Pool, pushDeviceId: string) => {
   );
   expect(claimable.rows[0]?.count).toBe(0);
 };
+
+const seedPushDelivery = async (
+  pool: Pool,
+  pushDeviceId: string,
+  key: string,
+  input?: {
+    status?: "PENDING" | "PROCESSING" | "TICKETED" | "RECEIPT_OK" | "FAILED";
+    claimToken?: string;
+    claimedAt?: Date;
+    expoTicketId?: string;
+    receiptAvailableAt?: Date;
+    attemptCount?: number;
+    availableAt?: Date;
+    updatedAt?: Date;
+    userId?: string;
+  },
+) => {
+  const pushOutboxId = randomUUID();
+  const notificationId = await insertNotification(pool, {
+    dedupeKey: key,
+    ...(input?.userId ? { userId: input.userId } : {}),
+  });
+  await pool.query(
+    `INSERT INTO "pushOutbox"
+      ("pushOutboxId", "notificationId", "pushDeviceId", status, "attemptCount", "availableAt",
+       "claimToken", "claimedAt", "expoTicketId", "receiptAvailableAt", "updatedAt")
+     VALUES ($1, $2, $3, $4, $5, COALESCE($6, transaction_timestamp()), $7, $8, $9, $10,
+       COALESCE($11, transaction_timestamp()))`,
+    [
+      pushOutboxId,
+      notificationId,
+      pushDeviceId,
+      input?.status ?? "PENDING",
+      input?.attemptCount ?? 0,
+      input?.availableAt ?? null,
+      input?.claimToken ?? null,
+      input?.claimedAt ?? null,
+      input?.expoTicketId ?? null,
+      input?.receiptAvailableAt ?? null,
+      input?.updatedAt ?? null,
+    ],
+  );
+  return { notificationId, pushOutboxId };
+};
+
+const recordingPushSender = (input?: {
+  send?: (messages: readonly ExpoPushMessage[]) => Promise<
+    readonly (
+      | { status: "ok"; id: string }
+      | {
+          status: "error";
+          message: string;
+          details?: Readonly<{ error?: string }>;
+        }
+    )[]
+  >;
+  receipts?: (ticketIds: readonly string[]) => Promise<Readonly<Record<string, ExpoPushReceipt>>>;
+}) => {
+  const sent: ExpoPushMessage[][] = [];
+  const receiptRequests: string[][] = [];
+  const sender = {
+    send: async (messages: readonly ExpoPushMessage[]) => {
+      sent.push([...messages]);
+      return input?.send
+        ? input.send(messages)
+        : messages.map(({ data }) => ({ status: "ok" as const, id: `ticket-${data.notificationId}` }));
+    },
+    getReceipts: async (ticketIds: readonly string[]) => {
+      receiptRequests.push([...ticketIds]);
+      return input?.receipts
+        ? input.receipts(ticketIds)
+        : Object.fromEntries(ticketIds.map((ticketId) => [ticketId, { status: "ok" as const }]));
+    },
+  };
+  return { receiptRequests, sender: sender as ExpoPushSender, sent };
+};
+
+const pushWorker = (repository: NotificationRepository, sender: ExpoPushSender) =>
+  new NotificationOutboxWorker(repository, { get: () => "false" } as unknown as ConfigService, sender);
 
 describe("FO notification GraphQL integration", () => {
   let app: INestApplication;
@@ -1303,6 +1390,348 @@ describe("FO notification GraphQL integration", () => {
     expect(await createdDeliveryRows(pool, FIXTURE.userId)).toEqual([
       { dedupeKey: `style-like:${stylePostId}:${SECOND_USER.userId}`, pushDeviceId },
     ]);
+  });
+
+  it("lets two Push workers claim every delivery exactly once", async () => {
+    const pushDeviceId = await seedPushDevice(pool, FIXTURE.userId, "worker-concurrency");
+    await pool.query(
+      `WITH inserted AS (
+         INSERT INTO notifications
+           ("userId", type, title, body, route, "entityId", "dedupeKey")
+         SELECT $1, 'ORDER_STATUS', 'Title', 'Body', '/order/90000000-0000-4000-8000-000000000001',
+           '90000000-0000-4000-8000-000000000001', 'push-worker-' || value
+         FROM generate_series(1, 100) AS value
+         RETURNING "notificationId"
+       )
+       INSERT INTO "pushOutbox" ("notificationId", "pushDeviceId")
+       SELECT "notificationId", $2 FROM inserted`,
+      [FIXTURE.userId, pushDeviceId],
+    );
+    const provider = recordingPushSender();
+    const now = new Date("2026-08-31T12:00:00.000Z");
+
+    await Promise.all([
+      pushWorker(notificationRepository, provider.sender).runOnce(now),
+      pushWorker(notificationRepository, provider.sender).runOnce(now),
+    ]);
+
+    const sent = provider.sent.flat();
+    const rows = await pool.query<{ status: string; expoTicketId: string | null }>(
+      `SELECT status, "expoTicketId" FROM "pushOutbox" ORDER BY "pushOutboxId"`,
+    );
+    expect(sent).toHaveLength(100);
+    expect(new Set(sent.map(({ data }) => data.notificationId)).size).toBe(100);
+    expect(rows.rows).toHaveLength(100);
+    expect(rows.rows.every(({ status, expoTicketId }) => status === "TICKETED" && expoTicketId !== null)).toBe(true);
+  });
+
+  it("persists a cross-user worker batch with device transfer in canonical lock order", async () => {
+    await seedSecondUser(pool);
+    const highDeviceId = "ee000000-0000-4000-8000-000000000003";
+    const lowDeviceId = "11000000-0000-4000-8000-000000000003";
+    const installationId = "notification-worker-transfer-target";
+    const targetToken = "ExponentPushToken[notification-worker-transfer-target]";
+    const transferredToken = "ExponentPushToken[notification-worker-transfer-source]";
+    await pool.query(
+      `INSERT INTO "pushDevices"
+        ("pushDeviceId", "userId", "installationId", "expoPushToken", platform)
+       VALUES
+        ($1, $3, $4, $5, 'IOS'),
+        ($2, $6, 'notification-worker-transfer-source', $7, 'IOS')`,
+      [highDeviceId, lowDeviceId, FIXTURE.userId, installationId, targetToken, SECOND_USER.userId, transferredToken],
+    );
+    await seedPushDelivery(pool, highDeviceId, "push-worker-transfer-target");
+    await seedPushDelivery(pool, lowDeviceId, "push-worker-transfer-source", { userId: SECOND_USER.userId });
+    const highBlocker = await startPushDeviceBlocker(pool, highDeviceId);
+    const lowBlocker = await startPushDeviceBlocker(pool, lowDeviceId);
+    const provider = recordingPushSender();
+    const workerRun = pushWorker(notificationRepository, provider.sender).runOnce(new Date("2026-08-31T12:00:00.000Z"));
+    let transfer: Promise<unknown> | undefined;
+    let highReleased = false;
+    let lowReleased = false;
+    try {
+      await waitFor(async () => {
+        const [blockedByHigh, blockedByLow] = await Promise.all([
+          blockedQueries(pool, highBlocker.pid),
+          blockedQueries(pool, lowBlocker.pid),
+        ]);
+        return blockedByHigh.length === 1 && blockedByLow.length === 0;
+      });
+      transfer = db.transaction((tx) =>
+        notificationRepository.transferDevice(tx, {
+          userId: FIXTURE.userId,
+          installationId,
+          expoPushToken: transferredToken,
+          platform: FoPushPlatform.IOS,
+        }),
+      );
+      const outcomesPromise = Promise.allSettled([workerRun, transfer]);
+      await waitFor(async () => (await blockedQueries(pool, highBlocker.pid)).length >= 2);
+      await releaseBlocker(highBlocker.client);
+      highReleased = true;
+      await waitFor(async () => (await blockedQueries(pool, lowBlocker.pid)).length >= 1);
+      await releaseBlocker(lowBlocker.client);
+      lowReleased = true;
+      const outcomes = await outcomesPromise;
+      expect(
+        outcomes.map((outcome) => (outcome.status === "rejected" ? postgresErrorCode(outcome.reason) : null)),
+      ).toEqual([null, null]);
+      expect(outcomes.map(({ status }) => status)).toEqual(["fulfilled", "fulfilled"]);
+    } finally {
+      if (!highReleased) await rollbackBlocker(highBlocker.client);
+      if (!lowReleased) await rollbackBlocker(lowBlocker.client);
+      await Promise.allSettled([workerRun, ...(transfer ? [transfer] : [])]);
+    }
+  }, 15_000);
+
+  it("recovers a thirty-second stale claim and resets the receipt retry budget without letting its old token complete", async () => {
+    const pushDeviceId = await seedPushDevice(pool, FIXTURE.userId, "worker-stale");
+    const now = new Date("2026-08-31T12:00:00.000Z");
+    const oldClaimToken = randomUUID();
+    const delivery = await seedPushDelivery(pool, pushDeviceId, "push-worker-stale", {
+      status: "PROCESSING",
+      claimToken: oldClaimToken,
+      claimedAt: new Date(now.getTime() - 30_001),
+      attemptCount: 1,
+    });
+    const provider = recordingPushSender();
+
+    await pushWorker(notificationRepository, provider.sender).runOnce(now);
+    await expect(
+      notificationRepository.persistPushTickets(
+        [
+          {
+            ...delivery,
+            pushDeviceId,
+            claimToken: oldClaimToken,
+            attemptCount: 1,
+            expoPushToken: "ExponentPushToken[notification-worker-stale]",
+            type: "ORDER_STATUS",
+            title: "Title",
+            body: "Body",
+            entityId: "90000000-0000-4000-8000-000000000001",
+          },
+        ],
+        [{ status: "ok", id: "old-ticket" }],
+        now,
+      ),
+    ).rejects.toThrow("Push delivery claim was lost");
+    const state = await pool.query<{ status: string; expoTicketId: string | null; attemptCount: number }>(
+      `SELECT status, "expoTicketId", "attemptCount" FROM "pushOutbox" WHERE "pushOutboxId" = $1`,
+      [delivery.pushOutboxId],
+    );
+    expect(state.rows[0]).toEqual({
+      status: "TICKETED",
+      expoTicketId: `ticket-${delivery.notificationId}`,
+      attemptCount: 0,
+    });
+  });
+
+  it("terminally fails a disabled device before calling Expo", async () => {
+    const pushDeviceId = await seedPushDevice(pool, FIXTURE.userId, "worker-disabled", true);
+    const delivery = await seedPushDelivery(pool, pushDeviceId, "push-worker-disabled");
+    const provider = recordingPushSender();
+
+    await pushWorker(notificationRepository, provider.sender).runOnce(new Date("2026-08-31T12:00:00.000Z"));
+
+    const state = await pool.query<{ status: string; lastError: string | null }>(
+      `SELECT status, "lastError" FROM "pushOutbox" WHERE "pushOutboxId" = $1`,
+      [delivery.pushOutboxId],
+    );
+    expect(provider.sent).toEqual([]);
+    expect(state.rows[0]).toEqual({ status: "FAILED", lastError: "DEVICE_DISABLED" });
+  });
+
+  it("persists tickets for fifteen minutes then reconciles success and DeviceNotRegistered receipts", async () => {
+    const validDeviceId = await seedPushDevice(pool, FIXTURE.userId, "worker-receipt-valid");
+    const invalidDeviceId = await seedPushDevice(pool, FIXTURE.userId, "worker-receipt-invalid");
+    const valid = await seedPushDelivery(pool, validDeviceId, "push-worker-receipt-valid");
+    const invalid = await seedPushDelivery(pool, invalidDeviceId, "push-worker-receipt-invalid");
+    const now = new Date("2026-08-31T12:00:00.000Z");
+    const provider = recordingPushSender({
+      receipts: async (ticketIds) =>
+        Object.fromEntries(
+          ticketIds.map((ticketId) => [
+            ticketId,
+            ticketId === `ticket-${invalid.notificationId}`
+              ? { status: "error" as const, message: "unregistered", details: { error: "DeviceNotRegistered" } }
+              : { status: "ok" as const },
+          ]),
+        ),
+    });
+
+    await pushWorker(notificationRepository, provider.sender).runOnce(now);
+    const ticketed = await pool.query<{
+      pushOutboxId: string;
+      status: string;
+      receiptAvailableAt: Date | null;
+      attemptCount: number;
+    }>(
+      `SELECT "pushOutboxId", status, "receiptAvailableAt", "attemptCount"
+       FROM "pushOutbox" ORDER BY "pushOutboxId"`,
+    );
+    expect(ticketed.rows).toHaveLength(2);
+    expect(ticketed.rows.every(({ status }) => status === "TICKETED")).toBe(true);
+    expect(ticketed.rows.map(({ attemptCount }) => attemptCount)).toEqual([0, 0]);
+    expect(ticketed.rows.map(({ receiptAvailableAt }) => receiptAvailableAt)).toEqual([
+      new Date(now.getTime() + 15 * 60_000),
+      new Date(now.getTime() + 15 * 60_000),
+    ]);
+    const invalidPending = await seedPushDelivery(pool, invalidDeviceId, "push-worker-receipt-invalid-pending");
+
+    await pushWorker(notificationRepository, provider.sender).runOnce(new Date(now.getTime() + 15 * 60_000));
+
+    const states = await pool.query<{ pushOutboxId: string; status: string }>(
+      `SELECT "pushOutboxId", status FROM "pushOutbox" WHERE "pushOutboxId" = ANY($1::uuid[])`,
+      [[valid.pushOutboxId, invalid.pushOutboxId, invalidPending.pushOutboxId]],
+    );
+    const byId = Object.fromEntries(states.rows.map(({ pushOutboxId, status }) => [pushOutboxId, status]));
+    const invalidDevice = await pool.query<{ disabledReason: string | null }>(
+      `SELECT "disabledReason" FROM "pushDevices" WHERE "pushDeviceId" = $1`,
+      [invalidDeviceId],
+    );
+    expect(byId).toEqual({
+      [valid.pushOutboxId]: "RECEIPT_OK",
+      [invalid.pushOutboxId]: "FAILED",
+      [invalidPending.pushOutboxId]: "FAILED",
+    });
+    expect(invalidDevice.rows[0]).toEqual({ disabledReason: "DEVICE_NOT_REGISTERED" });
+  });
+
+  it("disables DeviceNotRegistered tickets and fails every unsettled device row", async () => {
+    const pushDeviceId = await seedPushDevice(pool, FIXTURE.userId, "worker-ticket-invalid");
+    const first = await seedPushDelivery(pool, pushDeviceId, "push-worker-ticket-invalid-first");
+    const second = await seedPushDelivery(pool, pushDeviceId, "push-worker-ticket-invalid-second");
+    const provider = recordingPushSender({
+      send: async (messages) =>
+        messages.map(() => ({
+          status: "error" as const,
+          message: "unregistered",
+          details: { error: "DeviceNotRegistered" },
+        })),
+    });
+
+    await pushWorker(notificationRepository, provider.sender).runOnce(new Date("2026-08-31T12:00:00.000Z"));
+
+    const states = await pool.query<{ status: string }>(
+      `SELECT status FROM "pushOutbox" WHERE "pushOutboxId" = ANY($1::uuid[]) ORDER BY "pushOutboxId"`,
+      [[first.pushOutboxId, second.pushOutboxId]],
+    );
+    const device = await pool.query<{ disabledReason: string | null }>(
+      `SELECT "disabledReason" FROM "pushDevices" WHERE "pushDeviceId" = $1`,
+      [pushDeviceId],
+    );
+    expect(states.rows).toEqual([{ status: "FAILED" }, { status: "FAILED" }]);
+    expect(device.rows[0]).toEqual({ disabledReason: "DEVICE_NOT_REGISTERED" });
+  });
+
+  it("uses exponential retries and terminally fails the eighth Push attempt", async () => {
+    const pushDeviceId = await seedPushDevice(pool, FIXTURE.userId, "worker-retry");
+    const delivery = await seedPushDelivery(pool, pushDeviceId, "push-worker-retry");
+    const provider = recordingPushSender({
+      send: async () => {
+        throw new RetryablePushError(503);
+      },
+    });
+    const worker = pushWorker(notificationRepository, provider.sender);
+    let attemptAt = new Date("2026-08-31T12:00:00.000Z");
+
+    for (let attempt = 1; attempt <= 8; attempt += 1) {
+      await worker.runOnce(attemptAt);
+      const state = await pool.query<{ status: string; attemptCount: number; availableAt: Date }>(
+        `SELECT status, "attemptCount", "availableAt" FROM "pushOutbox" WHERE "pushOutboxId" = $1`,
+        [delivery.pushOutboxId],
+      );
+      expect(state.rows[0]?.attemptCount).toBe(attempt);
+      expect(state.rows[0]?.status).toBe(attempt === 8 ? "FAILED" : "PENDING");
+      attemptAt = state.rows[0]?.availableAt ?? attemptAt;
+    }
+  });
+
+  it("preserves a fresh eighth Push claim while terminally failing exhausted and stale claims", async () => {
+    const pushDeviceId = await seedPushDevice(pool, FIXTURE.userId, "worker-eighth-claim");
+    const now = new Date("2026-08-31T12:00:00.000Z");
+    const claimToken = randomUUID();
+    const fresh = await seedPushDelivery(pool, pushDeviceId, "push-worker-eighth-fresh", {
+      status: "PROCESSING",
+      claimToken,
+      claimedAt: now,
+      attemptCount: 8,
+    });
+    const pending = await seedPushDelivery(pool, pushDeviceId, "push-worker-eighth-pending", {
+      attemptCount: 8,
+    });
+    const ticketed = await seedPushDelivery(pool, pushDeviceId, "push-worker-eighth-ticketed", {
+      status: "TICKETED",
+      expoTicketId: "exhausted-ticket",
+      receiptAvailableAt: now,
+      attemptCount: 8,
+    });
+    const stale = await seedPushDelivery(pool, pushDeviceId, "push-worker-eighth-stale", {
+      status: "PROCESSING",
+      claimToken: randomUUID(),
+      claimedAt: new Date(now.getTime() - 30_001),
+      attemptCount: 8,
+    });
+
+    await notificationRepository.claimPushSendBatch(now, 100);
+
+    const beforeCompletion = await pool.query<{ pushOutboxId: string; status: string }>(
+      `SELECT "pushOutboxId", status FROM "pushOutbox" WHERE "pushOutboxId" = ANY($1::uuid[])`,
+      [[fresh.pushOutboxId, pending.pushOutboxId, ticketed.pushOutboxId, stale.pushOutboxId]],
+    );
+    expect(new Map(beforeCompletion.rows.map(({ pushOutboxId, status }) => [pushOutboxId, status]))).toEqual(
+      new Map([
+        [fresh.pushOutboxId, "PROCESSING"],
+        [pending.pushOutboxId, "FAILED"],
+        [ticketed.pushOutboxId, "FAILED"],
+        [stale.pushOutboxId, "FAILED"],
+      ]),
+    );
+    await notificationRepository.persistPushTickets(
+      [
+        {
+          ...fresh,
+          pushDeviceId,
+          claimToken,
+          attemptCount: 8,
+          expoPushToken: "ExponentPushToken[notification-worker-eighth]",
+          type: "ORDER_STATUS",
+          title: "Title",
+          body: "Body",
+          entityId: "90000000-0000-4000-8000-000000000001",
+        },
+      ],
+      [{ status: "ok", id: "eighth-ticket" }],
+      now,
+    );
+    const completed = await pool.query<{ status: string; attemptCount: number }>(
+      `SELECT status, "attemptCount" FROM "pushOutbox" WHERE "pushOutboxId" = $1`,
+      [fresh.pushOutboxId],
+    );
+    expect(completed.rows[0]).toEqual({ status: "TICKETED", attemptCount: 0 });
+  });
+
+  it("purges only Push terminal rows retained for seven days", async () => {
+    const pushDeviceId = await seedPushDevice(pool, FIXTURE.userId, "worker-retention");
+    const now = new Date("2026-08-31T12:00:00.000Z");
+    const expired = await seedPushDelivery(pool, pushDeviceId, "push-worker-retention-expired", {
+      status: "FAILED",
+      updatedAt: new Date(now.getTime() - 8 * 24 * 60 * 60_000),
+    });
+    const retained = await seedPushDelivery(pool, pushDeviceId, "push-worker-retention-retained", {
+      status: "FAILED",
+      updatedAt: new Date(now.getTime() - 6 * 24 * 60 * 60_000),
+    });
+    const provider = recordingPushSender();
+
+    await pushWorker(notificationRepository, provider.sender).runOnce(now);
+
+    const rows = await pool.query<{ pushOutboxId: string }>(
+      `SELECT "pushOutboxId" FROM "pushOutbox" WHERE "pushOutboxId" = ANY($1::uuid[])`,
+      [[expired.pushOutboxId, retained.pushOutboxId]],
+    );
+    expect(rows.rows).toEqual([{ pushOutboxId: retained.pushOutboxId }]);
   });
 
   it("rejects unauthenticated inbox access", async () => {
