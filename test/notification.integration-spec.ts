@@ -7,6 +7,7 @@ import { createApp } from "src/app";
 import { FIXTURE } from "src/database/fixtures";
 import { Database, DRIZZLE } from "src/modules/database/database.module";
 import { NotificationRepository } from "src/modules/notification/notification.repository";
+import { NotificationService } from "src/modules/notification/notification.service";
 import { resetTestFixtures, testPool } from "./support/database";
 
 const SECOND_USER = {
@@ -170,6 +171,48 @@ const seedSecondUser = (pool: Pool) =>
     [SECOND_USER.userId, SECOND_USER.userid, SECOND_USER.email, FIXTURE.userId],
   );
 
+const seedPushDevice = async (pool: Pool, userId: string, key: string, disabled = false) => {
+  const pushDeviceId = randomUUID();
+  await pool.query(
+    `INSERT INTO "pushDevices"
+      ("pushDeviceId", "userId", "installationId", "expoPushToken", platform, "disabledAt", "disabledReason")
+     VALUES ($1, $2, $3, $4, 'IOS', CASE WHEN $5 THEN transaction_timestamp() ELSE NULL END,
+       CASE WHEN $5 THEN 'TEST_DISABLED' ELSE NULL END)`,
+    [pushDeviceId, userId, `notification-${key}-installation`, `ExponentPushToken[notification-${key}]`, disabled],
+  );
+  return pushDeviceId;
+};
+
+const createdNotificationRows = async (pool: Pool, userId: string) =>
+  (
+    await pool.query<{
+      type: string;
+      title: string;
+      body: string;
+      route: string;
+      entityId: string;
+      dedupeKey: string;
+    }>(
+      `SELECT type, title, body, route, "entityId", "dedupeKey"
+       FROM notifications
+       WHERE "userId" = $1
+       ORDER BY "dedupeKey"`,
+      [userId],
+    )
+  ).rows;
+
+const createdDeliveryRows = async (pool: Pool, userId: string) =>
+  (
+    await pool.query<{ dedupeKey: string; pushDeviceId: string }>(
+      `SELECT notification."dedupeKey", outbox."pushDeviceId"
+       FROM "pushOutbox" outbox
+       INNER JOIN notifications notification ON notification."notificationId" = outbox."notificationId"
+       WHERE notification."userId" = $1
+       ORDER BY notification."dedupeKey", outbox."pushDeviceId"`,
+      [userId],
+    )
+  ).rows;
+
 const insertNotification = (
   pool: Pool,
   input: {
@@ -249,6 +292,7 @@ const expectDisabledDeliveries = async (pool: Pool, pushDeviceId: string) => {
 
 describe("FO notification GraphQL integration", () => {
   let app: INestApplication;
+  let notificationService: NotificationService;
   let db: Database;
   let notificationRepository: NotificationRepository;
   let pool: Pool;
@@ -258,6 +302,7 @@ describe("FO notification GraphQL integration", () => {
     app = await createApp();
     await app.listen(0, "127.0.0.1");
     db = app.get(DRIZZLE);
+    notificationService = app.get(NotificationService);
     notificationRepository = app.get(NotificationRepository);
   });
 
@@ -752,6 +797,266 @@ describe("FO notification GraphQL integration", () => {
     );
     expect(sessions.rows[0]?.count).toBe(0);
     await expectDisabledDeliveries(pool, pushDeviceId);
+  });
+
+  it("creates exact order alerts once and delivers only to active devices", async () => {
+    const orderId = "91000000-0000-4000-8000-000000000001";
+    const activeDeviceId = await seedPushDevice(pool, FIXTURE.userId, "order-active");
+    await seedPushDevice(pool, FIXTURE.userId, "order-disabled", true);
+
+    await db.transaction(async (tx) => {
+      for (const status of ["PAID", "FULFILLING", "COMPLETED", "FAILED", "CANCELLED"] as const)
+        await notificationService.createOrderStatus(tx, { userId: FIXTURE.userId, orderId, status });
+      await notificationService.createOrderStatus(tx, { userId: FIXTURE.userId, orderId, status: "PAID" });
+      await notificationService.createOrderStatus(tx, {
+        userId: FIXTURE.userId,
+        orderId,
+        status: "PAYMENT_PENDING",
+      });
+    });
+
+    expect(await createdNotificationRows(pool, FIXTURE.userId)).toEqual([
+      {
+        type: "ORDER_STATUS",
+        title: "주문이 취소됐어요",
+        body: "주문 상세에서 취소 내용을 확인해 주세요.",
+        route: `/order/${orderId}`,
+        entityId: orderId,
+        dedupeKey: `order:${orderId}:CANCELLED`,
+      },
+      {
+        type: "ORDER_STATUS",
+        title: "주문이 완료됐어요",
+        body: "구매한 상품을 확인해 보세요.",
+        route: `/order/${orderId}`,
+        entityId: orderId,
+        dedupeKey: `order:${orderId}:COMPLETED`,
+      },
+      {
+        type: "ORDER_STATUS",
+        title: "주문 처리가 완료되지 않았어요",
+        body: "주문 상세에서 상태를 확인해 주세요.",
+        route: `/order/${orderId}`,
+        entityId: orderId,
+        dedupeKey: `order:${orderId}:FAILED`,
+      },
+      {
+        type: "ORDER_STATUS",
+        title: "상품을 준비하고 있어요",
+        body: "준비가 끝나면 다시 알려드릴게요.",
+        route: `/order/${orderId}`,
+        entityId: orderId,
+        dedupeKey: `order:${orderId}:FULFILLING`,
+      },
+      {
+        type: "ORDER_STATUS",
+        title: "결제가 완료됐어요",
+        body: "주문 상품을 준비할게요.",
+        route: `/order/${orderId}`,
+        entityId: orderId,
+        dedupeKey: `order:${orderId}:PAID`,
+      },
+    ]);
+    expect(await createdDeliveryRows(pool, FIXTURE.userId)).toEqual(
+      ["CANCELLED", "COMPLETED", "FAILED", "FULFILLING", "PAID"].map((status) => ({
+        dedupeKey: `order:${orderId}:${status}`,
+        pushDeviceId: activeDeviceId,
+      })),
+    );
+  });
+
+  it("creates exact wish alerts once for every distinct recipient", async () => {
+    await seedSecondUser(pool);
+    const firstDeviceId = await seedPushDevice(pool, FIXTURE.userId, "wish-first");
+    const secondDeviceId = await seedPushDevice(pool, SECOND_USER.userId, "wish-second");
+    const skuUpdatedAt = new Date("2026-08-31T09:30:45.678Z");
+    const input = {
+      userIds: [FIXTURE.userId, SECOND_USER.userId, FIXTURE.userId],
+      productId: FIXTURE.productId,
+      skuUpdatedAt,
+    } as const;
+
+    await db.transaction(async (tx) => {
+      await notificationService.createWishPriceDrop(tx, { ...input, newPrice: 9000 });
+      await notificationService.createWishPriceDrop(tx, { ...input, newPrice: 9000 });
+      await notificationService.createWishRestock(tx, input);
+      await notificationService.createWishRestock(tx, input);
+    });
+
+    const expectedRows = [
+      {
+        type: "WISH_PRICE_DROP",
+        title: "위시 상품 가격이 내려갔어요",
+        body: "찜한 상품을 지금 확인해 보세요.",
+        route: `/product/${FIXTURE.productId}`,
+        entityId: FIXTURE.productId,
+        dedupeKey: `wish-price:${FIXTURE.productId}:${skuUpdatedAt.toISOString()}:9000`,
+      },
+      {
+        type: "WISH_RESTOCK",
+        title: "위시 상품이 다시 입고됐어요",
+        body: "품절되기 전에 확인해 보세요.",
+        route: `/product/${FIXTURE.productId}`,
+        entityId: FIXTURE.productId,
+        dedupeKey: `wish-stock:${FIXTURE.productId}:${skuUpdatedAt.toISOString()}`,
+      },
+    ];
+    expect(await createdNotificationRows(pool, FIXTURE.userId)).toEqual(expectedRows);
+    expect(await createdNotificationRows(pool, SECOND_USER.userId)).toEqual(expectedRows);
+    expect(await createdDeliveryRows(pool, FIXTURE.userId)).toEqual(
+      expectedRows.map(({ dedupeKey }) => ({ dedupeKey, pushDeviceId: firstDeviceId })),
+    );
+    expect(await createdDeliveryRows(pool, SECOND_USER.userId)).toEqual(
+      expectedRows.map(({ dedupeKey }) => ({ dedupeKey, pushDeviceId: secondDeviceId })),
+    );
+  });
+
+  it("keeps app alerts while overall and category preferences suppress Push", async () => {
+    await seedSecondUser(pool);
+    const pushDeviceId = await seedPushDevice(pool, FIXTURE.userId, "preferences");
+    const orderId = "91000000-0000-4000-8000-000000000001";
+    const firstUpdatedAt = new Date("2026-08-31T10:00:00.000Z");
+    const secondUpdatedAt = new Date("2026-08-31T10:01:00.000Z");
+    const stylePostIds = [
+      "82000000-0000-4000-8000-000000000001",
+      "82000000-0000-4000-8000-000000000002",
+      "82000000-0000-4000-8000-000000000003",
+      "82000000-0000-4000-8000-000000000004",
+    ];
+    await pool.query(
+      `INSERT INTO "notificationPreferences"
+        ("userId", "pushEnabled", "orderPushEnabled", "wishPushEnabled", "stylePushEnabled")
+       VALUES ($1, true, false, true, true)`,
+      [FIXTURE.userId],
+    );
+
+    await db.transaction(async (tx) => {
+      await notificationService.createOrderStatus(tx, { userId: FIXTURE.userId, orderId, status: "PAID" });
+      await notificationService.createWishPriceDrop(tx, {
+        userIds: [FIXTURE.userId],
+        productId: FIXTURE.productId,
+        skuUpdatedAt: firstUpdatedAt,
+        newPrice: 9000,
+      });
+      await notificationService.createStyleLike(tx, {
+        authorUserId: FIXTURE.userId,
+        actorUserId: SECOND_USER.userId,
+        stylePostId: stylePostIds[0] as string,
+      });
+    });
+    await pool.query(
+      `UPDATE "notificationPreferences"
+       SET "orderPushEnabled" = true, "wishPushEnabled" = false
+       WHERE "userId" = $1`,
+      [FIXTURE.userId],
+    );
+    await db.transaction(async (tx) => {
+      await notificationService.createOrderStatus(tx, { userId: FIXTURE.userId, orderId, status: "FULFILLING" });
+      await notificationService.createWishRestock(tx, {
+        userIds: [FIXTURE.userId],
+        productId: FIXTURE.productId,
+        skuUpdatedAt: firstUpdatedAt,
+      });
+      await notificationService.createStyleLike(tx, {
+        authorUserId: FIXTURE.userId,
+        actorUserId: SECOND_USER.userId,
+        stylePostId: stylePostIds[1] as string,
+      });
+    });
+    await pool.query(
+      `UPDATE "notificationPreferences"
+       SET "wishPushEnabled" = true, "stylePushEnabled" = false
+       WHERE "userId" = $1`,
+      [FIXTURE.userId],
+    );
+    await db.transaction(async (tx) => {
+      await notificationService.createWishPriceDrop(tx, {
+        userIds: [FIXTURE.userId],
+        productId: FIXTURE.productId,
+        skuUpdatedAt: secondUpdatedAt,
+        newPrice: 8000,
+      });
+      await notificationService.createStyleLike(tx, {
+        authorUserId: FIXTURE.userId,
+        actorUserId: SECOND_USER.userId,
+        stylePostId: stylePostIds[2] as string,
+      });
+    });
+    await pool.query(`UPDATE "notificationPreferences" SET "pushEnabled" = false WHERE "userId" = $1`, [
+      FIXTURE.userId,
+    ]);
+    await db.transaction(async (tx) => {
+      await notificationService.createOrderStatus(tx, { userId: FIXTURE.userId, orderId, status: "COMPLETED" });
+      await notificationService.createWishRestock(tx, {
+        userIds: [FIXTURE.userId],
+        productId: FIXTURE.productId,
+        skuUpdatedAt: secondUpdatedAt,
+      });
+      await notificationService.createStyleLike(tx, {
+        authorUserId: FIXTURE.userId,
+        actorUserId: SECOND_USER.userId,
+        stylePostId: stylePostIds[3] as string,
+      });
+    });
+
+    expect(await createdNotificationRows(pool, FIXTURE.userId)).toHaveLength(11);
+    expect(await createdDeliveryRows(pool, FIXTURE.userId)).toEqual([
+      { dedupeKey: `order:${orderId}:FULFILLING`, pushDeviceId },
+      {
+        dedupeKey: `style-like:${stylePostIds[0]}:${SECOND_USER.userId}`,
+        pushDeviceId,
+      },
+      {
+        dedupeKey: `style-like:${stylePostIds[1]}:${SECOND_USER.userId}`,
+        pushDeviceId,
+      },
+      {
+        dedupeKey: `wish-price:${FIXTURE.productId}:${firstUpdatedAt.toISOString()}:9000`,
+        pushDeviceId,
+      },
+      {
+        dedupeKey: `wish-price:${FIXTURE.productId}:${secondUpdatedAt.toISOString()}:8000`,
+        pushDeviceId,
+      },
+    ]);
+  });
+
+  it("creates one exact style alert for a non-self actor", async () => {
+    await seedSecondUser(pool);
+    const pushDeviceId = await seedPushDevice(pool, FIXTURE.userId, "style");
+    const stylePostId = "82000000-0000-4000-8000-000000000010";
+
+    await db.transaction(async (tx) => {
+      await notificationService.createStyleLike(tx, {
+        authorUserId: FIXTURE.userId,
+        actorUserId: FIXTURE.userId,
+        stylePostId,
+      });
+      await notificationService.createStyleLike(tx, {
+        authorUserId: FIXTURE.userId,
+        actorUserId: SECOND_USER.userId,
+        stylePostId,
+      });
+      await notificationService.createStyleLike(tx, {
+        authorUserId: FIXTURE.userId,
+        actorUserId: SECOND_USER.userId,
+        stylePostId,
+      });
+    });
+
+    expect(await createdNotificationRows(pool, FIXTURE.userId)).toEqual([
+      {
+        type: "STYLE_LIKE",
+        title: "스타일에 좋아요가 달렸어요",
+        body: "내 스타일 게시물을 확인해 보세요.",
+        route: `/style/${stylePostId}`,
+        entityId: stylePostId,
+        dedupeKey: `style-like:${stylePostId}:${SECOND_USER.userId}`,
+      },
+    ]);
+    expect(await createdDeliveryRows(pool, FIXTURE.userId)).toEqual([
+      { dedupeKey: `style-like:${stylePostId}:${SECOND_USER.userId}`, pushDeviceId },
+    ]);
   });
 
   it("rejects unauthenticated inbox access", async () => {

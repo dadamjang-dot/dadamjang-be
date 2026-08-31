@@ -13,6 +13,14 @@ import type { RegisterFoPushDeviceInput, UpdateFoNotificationPreferencesInput } 
 
 export type FoNotificationCursor = { createdAt: Date; notificationId: string };
 
+type NotificationPreferenceCategory = "orderPushEnabled" | "wishPushEnabled" | "stylePushEnabled";
+
+type CreateNotificationInput = {
+  userId: string;
+  preferenceCategory: NotificationPreferenceCategory;
+  notification: typeof notifications.$inferInsert;
+};
+
 const notificationFields = {
   notificationId: notifications.notificationId,
   type: notifications.type,
@@ -95,6 +103,23 @@ export class NotificationRepository {
       })
       .returning();
     return requireResult(preferences);
+  };
+
+  create = async (store: DatabaseTransaction, input: CreateNotificationInput) => {
+    const [notification] = await store
+      .insert(notifications)
+      .values(input.notification)
+      .onConflictDoNothing()
+      .returning({ notificationId: notifications.notificationId });
+    if (!notification) return;
+    const devices = await this.activeEligibleDevices(store, input.userId, input.preferenceCategory);
+    if (!devices.length) return;
+    await store.insert(pushOutbox).values(
+      devices.map(({ pushDeviceId }) => ({
+        notificationId: notification.notificationId,
+        pushDeviceId,
+      })),
+    );
   };
 
   lockActiveRefreshSession = async (store: DatabaseTransaction, userId: string, installationId: string) => {
@@ -220,6 +245,28 @@ export class NotificationRepository {
     await store.delete(notifications).where(eq(notifications.userId, userId));
     await store.delete(notificationPreferences).where(eq(notificationPreferences.userId, userId));
     await store.delete(pushDevices).where(eq(pushDevices.userId, userId));
+  };
+
+  private activeEligibleDevices = async (
+    store: DatabaseTransaction,
+    userId: string,
+    preferenceCategory: NotificationPreferenceCategory,
+  ) => {
+    const [preferences] = await store
+      .select({
+        pushEnabled: notificationPreferences.pushEnabled,
+        categoryEnabled: notificationPreferences[preferenceCategory],
+      })
+      .from(notificationPreferences)
+      .where(eq(notificationPreferences.userId, userId))
+      .limit(1);
+    if (preferences && (!preferences.pushEnabled || !preferences.categoryEnabled)) return [];
+    return store
+      .select({ pushDeviceId: pushDevices.pushDeviceId })
+      .from(pushDevices)
+      .where(and(eq(pushDevices.userId, userId), isNull(pushDevices.disabledAt)))
+      .orderBy(pushDevices.pushDeviceId)
+      .for("share");
   };
 
   private disableDeviceIds = async (store: DatabaseTransaction, pushDeviceIds: string[], reason: string) => {
