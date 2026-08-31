@@ -27,6 +27,11 @@ type MigrationArtifact = {
   readonly retired: boolean;
 };
 
+type PostgreSqlConstraintError = {
+  readonly code?: string;
+  readonly constraint?: string;
+};
+
 const databasePool = (database: string) => createDatabasePool({ ...process.env, POSTGRES_DATABASE: database });
 
 const sha256 = (value: string) => createHash("sha256").update(value).digest("hex");
@@ -153,6 +158,18 @@ const waitForAdvisoryLock = async (pool: Pool) => {
     await wait(10);
   }
   return false;
+};
+
+const expectConstraintError = async (operation: () => Promise<unknown>, code: string, constraint: string) => {
+  const outcome = await operation().then(
+    () => ({ status: "fulfilled" as const }),
+    (error: PostgreSqlConstraintError) => ({
+      code: error.code,
+      constraint: error.constraint,
+      status: "rejected" as const,
+    }),
+  );
+  expect(outcome).toEqual({ code, constraint, status: "rejected" });
 };
 
 describe("database migration PostgreSQL integration", () => {
@@ -407,6 +424,846 @@ describe("database migration PostgreSQL integration", () => {
       },
     ]);
     expect(lifecycleMigrationJournal.rows).toEqual([{ count: "1" }]);
+  });
+
+  it("adds the notification schema without changing existing commerce rows and applies it once", async () => {
+    const migrationsBeforeNotifications = (await readMigrationArtifacts())
+      .filter(({ name, retired }) => !retired && name < "0026_notifications_push_outbox.sql")
+      .map(({ name }) => name);
+    await runHistoricalMigrations(migrationPool, undefined, migrationsBeforeNotifications);
+    await seedHistoricalMigration(migrationPool);
+    await migrationPool.query(
+      `INSERT INTO "productSkus"
+        ("skuId", "productId", "code", "optionName", "price", "stock", "position")
+       VALUES (
+         '71000000-0000-4000-8000-000000000026',
+         '70000000-0000-4000-8000-000000000001',
+         'NOTIFICATION-MIGRATION-SKU',
+         'Migration SKU',
+         15000,
+         3,
+         0
+       )`,
+    );
+    await migrationPool.query(
+      `INSERT INTO "wishes" ("wishId", "userId", "productId")
+       VALUES (
+         '72000000-0000-4000-8000-000000000026',
+         '10000000-0000-4000-8000-000000000001',
+         '70000000-0000-4000-8000-000000000001'
+       )`,
+    );
+    await migrationPool.query(
+      `INSERT INTO "orders"
+        ("orderId", "orderNumber", "userId", "status", "paymentStatus", "totalAmount")
+       VALUES (
+         '73000000-0000-4000-8000-000000000026',
+         'NOTIFICATION-MIGRATION-ORDER',
+         '10000000-0000-4000-8000-000000000001',
+         'PAID',
+         'APPROVED',
+         15000
+       )`,
+    );
+    await migrationPool.query(
+      `INSERT INTO "orderItems"
+        ("orderItemId", "orderId", "productId", "skuId", "productTitle", "skuOptionName", "unitPrice", "quantity")
+       VALUES (
+         '74000000-0000-4000-8000-000000000026',
+         '73000000-0000-4000-8000-000000000026',
+         '70000000-0000-4000-8000-000000000001',
+         '71000000-0000-4000-8000-000000000026',
+         'Migration Source Product',
+         'Migration SKU',
+         15000,
+         1
+       )`,
+    );
+    const commerceBefore = await migrationPool.query<{
+      orderItems: string;
+      orders: string;
+      products: string;
+      skus: string;
+      users: string;
+      wishes: string;
+    }>(
+      `SELECT
+         (SELECT string_agg("userId"::text, ',' ORDER BY "userId") FROM "users") AS users,
+         (SELECT string_agg("productId"::text, ',' ORDER BY "productId") FROM "products") AS products,
+         (SELECT string_agg("skuId"::text, ',' ORDER BY "skuId") FROM "productSkus") AS skus,
+         (SELECT string_agg("wishId"::text, ',' ORDER BY "wishId") FROM "wishes") AS wishes,
+         (SELECT string_agg("orderId"::text, ',' ORDER BY "orderId") FROM "orders") AS orders,
+         (SELECT string_agg("orderItemId"::text, ',' ORDER BY "orderItemId") FROM "orderItems") AS "orderItems"`,
+    );
+
+    await migrate({ pool: migrationPool });
+    await migrate({ pool: migrationPool });
+
+    const commerceAfter = await migrationPool.query<{
+      orderItems: string;
+      orders: string;
+      products: string;
+      skus: string;
+      users: string;
+      wishes: string;
+    }>(
+      `SELECT
+         (SELECT string_agg("userId"::text, ',' ORDER BY "userId") FROM "users") AS users,
+         (SELECT string_agg("productId"::text, ',' ORDER BY "productId") FROM "products") AS products,
+         (SELECT string_agg("skuId"::text, ',' ORDER BY "skuId") FROM "productSkus") AS skus,
+         (SELECT string_agg("wishId"::text, ',' ORDER BY "wishId") FROM "wishes") AS wishes,
+         (SELECT string_agg("orderId"::text, ',' ORDER BY "orderId") FROM "orders") AS orders,
+         (SELECT string_agg("orderItemId"::text, ',' ORDER BY "orderItemId") FROM "orderItems") AS "orderItems"`,
+    );
+    const tables = await migrationPool.query<{ table_name: string }>(
+      `SELECT table_name
+       FROM information_schema.tables
+       WHERE table_schema = 'public'
+         AND table_name IN ('notifications', 'pushDevices', 'notificationPreferences', 'pushOutbox')
+       ORDER BY table_name`,
+    );
+    const varcharStateColumns = await migrationPool.query<{
+      column_name: string;
+      data_type: string;
+      table_name: string;
+    }>(
+      `SELECT table_name, column_name, data_type
+       FROM information_schema.columns
+       WHERE table_schema = 'public'
+         AND (
+           (table_name = 'notifications' AND column_name = 'type')
+           OR (table_name = 'pushDevices' AND column_name = 'platform')
+           OR (table_name = 'pushOutbox' AND column_name = 'status')
+         )
+       ORDER BY table_name, column_name`,
+    );
+    const timestampColumns = await migrationPool.query<{
+      column_name: string;
+      data_type: string;
+      table_name: string;
+    }>(
+      `SELECT table_name, column_name, data_type
+       FROM information_schema.columns
+       WHERE table_schema = 'public'
+         AND table_name IN ('notifications', 'pushDevices', 'notificationPreferences', 'pushOutbox')
+         AND data_type LIKE 'timestamp%'
+       ORDER BY table_name, column_name`,
+    );
+    const defaults = await migrationPool.query<{
+      column_default: string;
+      column_name: string;
+      table_name: string;
+    }>(
+      `SELECT table_name, column_name, column_default
+       FROM information_schema.columns
+       WHERE table_schema = 'public'
+         AND table_name IN ('notifications', 'pushDevices', 'notificationPreferences', 'pushOutbox')
+         AND column_default IS NOT NULL
+       ORDER BY table_name, column_name`,
+    );
+    const foreignKeys = await migrationPool.query<{
+      constraint_name: string;
+      delete_rule: string;
+    }>(
+      `SELECT tc.constraint_name, rc.delete_rule
+       FROM information_schema.table_constraints tc
+       JOIN information_schema.referential_constraints rc
+         ON rc.constraint_schema = tc.constraint_schema
+        AND rc.constraint_name = tc.constraint_name
+       WHERE tc.constraint_schema = 'public'
+         AND tc.table_name IN ('notifications', 'pushDevices', 'notificationPreferences', 'pushOutbox')
+         AND tc.constraint_type = 'FOREIGN KEY'
+       ORDER BY tc.constraint_name`,
+    );
+    const checks = await migrationPool.query<{ constraint_name: string; definition: string }>(
+      `SELECT conname AS constraint_name, pg_get_constraintdef(oid) AS definition
+       FROM pg_constraint
+       WHERE connamespace = 'public'::regnamespace
+         AND conname IN (
+           'notifications_type_check',
+           'push_devices_platform_check',
+           'push_devices_disable_check',
+           'push_outbox_status_check',
+           'push_outbox_attempt_count_check',
+           'push_outbox_claim_check',
+           'push_outbox_ticket_pair_check',
+           'push_outbox_ticket_state_check'
+         )
+       ORDER BY conname`,
+    );
+    const indexes = await migrationPool.query<{ indexdef: string; indexname: string; predicate: string | null }>(
+      `SELECT
+         index_class.relname AS indexname,
+         pg_get_indexdef(index_class.oid) AS indexdef,
+         pg_get_expr(indexes.indpred, indexes.indrelid) AS predicate
+       FROM pg_index indexes
+       JOIN pg_class index_class ON index_class.oid = indexes.indexrelid
+       WHERE index_class.relname IN (
+         'notifications_user_created_idx',
+         'notifications_user_unread_idx',
+         'push_devices_user_state_idx',
+         'push_outbox_pending_idx',
+         'push_outbox_ticketed_receipt_idx',
+         'push_outbox_processing_idx',
+         'push_outbox_terminal_updated_idx',
+         'push_outbox_device_status_idx'
+       )
+       ORDER BY index_class.relname`,
+    );
+    const notificationMigrationJournal = await migrationPool.query<{ count: string }>(
+      `SELECT count(*) FROM "_migrations" WHERE "name" = '0026_notifications_push_outbox.sql'`,
+    );
+
+    expect(commerceAfter.rows).toEqual(commerceBefore.rows);
+    expect(tables.rows).toEqual([
+      { table_name: "notificationPreferences" },
+      { table_name: "notifications" },
+      { table_name: "pushDevices" },
+      { table_name: "pushOutbox" },
+    ]);
+    expect(varcharStateColumns.rows).toEqual([
+      { column_name: "type", data_type: "character varying", table_name: "notifications" },
+      { column_name: "platform", data_type: "character varying", table_name: "pushDevices" },
+      { column_name: "status", data_type: "character varying", table_name: "pushOutbox" },
+    ]);
+    expect(timestampColumns.rows).toEqual([
+      { column_name: "updatedAt", data_type: "timestamp with time zone", table_name: "notificationPreferences" },
+      { column_name: "createdAt", data_type: "timestamp with time zone", table_name: "notifications" },
+      { column_name: "readAt", data_type: "timestamp with time zone", table_name: "notifications" },
+      { column_name: "createdAt", data_type: "timestamp with time zone", table_name: "pushDevices" },
+      { column_name: "disabledAt", data_type: "timestamp with time zone", table_name: "pushDevices" },
+      { column_name: "lastSeenAt", data_type: "timestamp with time zone", table_name: "pushDevices" },
+      { column_name: "updatedAt", data_type: "timestamp with time zone", table_name: "pushDevices" },
+      { column_name: "availableAt", data_type: "timestamp with time zone", table_name: "pushOutbox" },
+      { column_name: "claimedAt", data_type: "timestamp with time zone", table_name: "pushOutbox" },
+      { column_name: "createdAt", data_type: "timestamp with time zone", table_name: "pushOutbox" },
+      { column_name: "receiptAvailableAt", data_type: "timestamp with time zone", table_name: "pushOutbox" },
+      { column_name: "updatedAt", data_type: "timestamp with time zone", table_name: "pushOutbox" },
+    ]);
+    expect(defaults.rows).toEqual([
+      { column_default: "true", column_name: "orderPushEnabled", table_name: "notificationPreferences" },
+      { column_default: "true", column_name: "pushEnabled", table_name: "notificationPreferences" },
+      { column_default: "true", column_name: "stylePushEnabled", table_name: "notificationPreferences" },
+      { column_default: "now()", column_name: "updatedAt", table_name: "notificationPreferences" },
+      { column_default: "true", column_name: "wishPushEnabled", table_name: "notificationPreferences" },
+      { column_default: "now()", column_name: "createdAt", table_name: "notifications" },
+      { column_default: "gen_random_uuid()", column_name: "notificationId", table_name: "notifications" },
+      { column_default: "now()", column_name: "createdAt", table_name: "pushDevices" },
+      { column_default: "now()", column_name: "lastSeenAt", table_name: "pushDevices" },
+      { column_default: "gen_random_uuid()", column_name: "pushDeviceId", table_name: "pushDevices" },
+      { column_default: "now()", column_name: "updatedAt", table_name: "pushDevices" },
+      { column_default: "0", column_name: "attemptCount", table_name: "pushOutbox" },
+      { column_default: "now()", column_name: "availableAt", table_name: "pushOutbox" },
+      { column_default: "now()", column_name: "createdAt", table_name: "pushOutbox" },
+      { column_default: "gen_random_uuid()", column_name: "pushOutboxId", table_name: "pushOutbox" },
+      { column_default: "'PENDING'::character varying", column_name: "status", table_name: "pushOutbox" },
+      { column_default: "now()", column_name: "updatedAt", table_name: "pushOutbox" },
+    ]);
+    expect(foreignKeys.rows).toEqual([
+      { constraint_name: "notification_preferences_user_fk", delete_rule: "NO ACTION" },
+      { constraint_name: "notifications_user_fk", delete_rule: "NO ACTION" },
+      { constraint_name: "push_devices_user_fk", delete_rule: "NO ACTION" },
+      { constraint_name: "push_outbox_device_fk", delete_rule: "CASCADE" },
+      { constraint_name: "push_outbox_notification_fk", delete_rule: "CASCADE" },
+    ]);
+    expect(checks.rows.map(({ constraint_name }) => constraint_name)).toEqual([
+      "notifications_type_check",
+      "push_devices_disable_check",
+      "push_devices_platform_check",
+      "push_outbox_attempt_count_check",
+      "push_outbox_claim_check",
+      "push_outbox_status_check",
+      "push_outbox_ticket_pair_check",
+      "push_outbox_ticket_state_check",
+    ]);
+    const checkDefinitions = Object.fromEntries(
+      checks.rows.map(({ constraint_name, definition }) => [constraint_name, definition]),
+    );
+    expect(checkDefinitions.notifications_type_check).toContain("ORDER_STATUS");
+    expect(checkDefinitions.notifications_type_check).toContain("WISH_PRICE_DROP");
+    expect(checkDefinitions.notifications_type_check).toContain("WISH_RESTOCK");
+    expect(checkDefinitions.notifications_type_check).toContain("STYLE_LIKE");
+    expect(checkDefinitions.push_devices_platform_check).toContain("IOS");
+    expect(checkDefinitions.push_devices_platform_check).toContain("ANDROID");
+    expect(checkDefinitions.push_devices_disable_check).toContain("disabledReason");
+    expect(checkDefinitions.push_outbox_status_check).toContain("RECEIPT_OK");
+    expect(checkDefinitions.push_outbox_attempt_count_check).toContain('"attemptCount" >= 0');
+    expect(checkDefinitions.push_outbox_claim_check).toContain("PROCESSING");
+    expect(checkDefinitions.push_outbox_ticket_pair_check).toContain("receiptAvailableAt");
+    expect(checkDefinitions.push_outbox_ticket_state_check).toContain("TICKETED");
+    expect(indexes.rows.map(({ indexname }) => indexname)).toEqual([
+      "notifications_user_created_idx",
+      "notifications_user_unread_idx",
+      "push_devices_user_state_idx",
+      "push_outbox_device_status_idx",
+      "push_outbox_pending_idx",
+      "push_outbox_processing_idx",
+      "push_outbox_terminal_updated_idx",
+      "push_outbox_ticketed_receipt_idx",
+    ]);
+    const indexByName = Object.fromEntries(indexes.rows.map((index) => [index.indexname, index]));
+    expect(indexByName.notifications_user_created_idx?.indexdef).toContain(
+      '("userId", "createdAt" DESC, "notificationId" DESC)',
+    );
+    expect(indexByName.notifications_user_created_idx?.predicate).toBeNull();
+    expect(indexByName.notifications_user_unread_idx?.indexdef).toContain(
+      '("userId", "createdAt" DESC, "notificationId" DESC)',
+    );
+    expect(indexByName.notifications_user_unread_idx?.predicate).toContain('"readAt" IS NULL');
+    expect(indexByName.push_devices_user_state_idx?.indexdef).toContain('("userId", "disabledAt", "pushDeviceId")');
+    expect(indexByName.push_devices_user_state_idx?.predicate).toBeNull();
+    expect(indexByName.push_outbox_device_status_idx?.indexdef).toContain('("pushDeviceId", status, "pushOutboxId")');
+    expect(indexByName.push_outbox_device_status_idx?.predicate).toBeNull();
+    expect(indexByName.push_outbox_pending_idx?.indexdef).toContain('("availableAt", "createdAt", "pushOutboxId")');
+    expect(indexByName.push_outbox_pending_idx?.predicate).toContain("PENDING");
+    expect(indexByName.push_outbox_ticketed_receipt_idx?.indexdef).toContain(
+      '("receiptAvailableAt", "createdAt", "pushOutboxId")',
+    );
+    expect(indexByName.push_outbox_ticketed_receipt_idx?.predicate).toContain("TICKETED");
+    expect(indexByName.push_outbox_processing_idx?.indexdef).toContain('("claimedAt", "createdAt", "pushOutboxId")');
+    expect(indexByName.push_outbox_processing_idx?.predicate).toContain("PROCESSING");
+    expect(indexByName.push_outbox_terminal_updated_idx?.indexdef).toContain('("updatedAt", "pushOutboxId")');
+    expect(indexByName.push_outbox_terminal_updated_idx?.predicate).toContain("RECEIPT_OK");
+    expect(indexByName.push_outbox_terminal_updated_idx?.predicate).toContain("FAILED");
+    expect(notificationMigrationJournal.rows).toEqual([{ count: "1" }]);
+  });
+
+  it("enforces notification uniqueness, ownership, state matrices, and cascades", async () => {
+    await migrate({ pool: migrationPool });
+    const userA = "10000000-0000-4000-8000-000000000126";
+    const userB = "10000000-0000-4000-8000-000000000226";
+    const missingUser = "10000000-0000-4000-8000-000000000326";
+    await migrationPool.query(
+      `INSERT INTO "users" ("userId", "userid", "email", "password")
+       VALUES
+         ($1, 'notification-user-a', 'notification-user-a@example.test', 'x'),
+         ($2, 'notification-user-b', 'notification-user-b@example.test', 'x')`,
+      [userA, userB],
+    );
+    const notificationA = "81000000-0000-4000-8000-000000000126";
+    const notificationB = "81000000-0000-4000-8000-000000000226";
+    const notificationC = "81000000-0000-4000-8000-000000000326";
+    const notificationD = "81000000-0000-4000-8000-000000000426";
+    await migrationPool.query(
+      `INSERT INTO "notifications"
+        ("notificationId", "userId", "type", "title", "body", "route", "entityId", "dedupeKey")
+       VALUES
+         ($1, $5, 'ORDER_STATUS', 'Order', 'Order body', '/order/1', '91000000-0000-4000-8000-000000000126', 'same-dedupe'),
+         ($2, $6, 'WISH_PRICE_DROP', 'Price', 'Price body', '/product/1', '91000000-0000-4000-8000-000000000226', 'same-dedupe'),
+         ($3, $5, 'WISH_RESTOCK', 'Stock', 'Stock body', '/product/2', '91000000-0000-4000-8000-000000000326', 'stock-dedupe'),
+         ($4, $5, 'STYLE_LIKE', 'Like', 'Like body', '/style/1', '91000000-0000-4000-8000-000000000426', 'style-dedupe')`,
+      [notificationA, notificationB, notificationC, notificationD, userA, userB],
+    );
+    await expectConstraintError(
+      () =>
+        migrationPool.query(
+          `INSERT INTO "notifications"
+            ("notificationId", "userId", "type", "title", "body", "route", "entityId", "dedupeKey")
+           VALUES (
+             '81000000-0000-4000-8000-000000000526',
+             $1,
+             'ORDER_STATUS',
+             'Duplicate',
+             'Duplicate body',
+             '/order/2',
+             '91000000-0000-4000-8000-000000000526',
+             'same-dedupe'
+           )`,
+          [userA],
+        ),
+      "23505",
+      "notifications_user_dedupe_unique",
+    );
+    await expectConstraintError(
+      () =>
+        migrationPool.query(
+          `INSERT INTO "notifications"
+            ("notificationId", "userId", "type", "title", "body", "route", "entityId", "dedupeKey")
+           VALUES (
+             '81000000-0000-4000-8000-000000000626',
+             $1,
+             'PROMOTION',
+             'Invalid',
+             'Invalid body',
+             '/product/3',
+             '91000000-0000-4000-8000-000000000626',
+             'invalid-type'
+           )`,
+          [userA],
+        ),
+      "23514",
+      "notifications_type_check",
+    );
+    await expectConstraintError(
+      () =>
+        migrationPool.query(
+          `INSERT INTO "notifications"
+            ("notificationId", "userId", "type", "title", "body", "route", "entityId", "dedupeKey")
+           VALUES (
+             '81000000-0000-4000-8000-000000000726',
+             $1,
+             'ORDER_STATUS',
+             'Missing user',
+             'Missing user body',
+             '/order/3',
+             '91000000-0000-4000-8000-000000000726',
+             'missing-user'
+           )`,
+          [missingUser],
+        ),
+      "23503",
+      "notifications_user_fk",
+    );
+
+    const deviceA = "82000000-0000-4000-8000-000000000126";
+    const deviceB = "82000000-0000-4000-8000-000000000226";
+    await migrationPool.query(
+      `INSERT INTO "pushDevices"
+        ("pushDeviceId", "userId", "installationId", "expoPushToken", "platform")
+       VALUES
+         ($1, $3, 'installation-a', 'ExponentPushToken[device-a]', 'IOS'),
+         ($2, $4, 'installation-b', 'ExponentPushToken[device-b]', 'ANDROID')`,
+      [deviceA, deviceB, userA, userB],
+    );
+    await expectConstraintError(
+      () =>
+        migrationPool.query(
+          `INSERT INTO "pushDevices"
+            ("pushDeviceId", "userId", "installationId", "expoPushToken", "platform")
+           VALUES (
+             '82000000-0000-4000-8000-000000000326',
+             $1,
+             'installation-a',
+             'ExponentPushToken[device-c]',
+             'IOS'
+           )`,
+          [userB],
+        ),
+      "23505",
+      "push_devices_installation_unique",
+    );
+    await expectConstraintError(
+      () =>
+        migrationPool.query(
+          `INSERT INTO "pushDevices"
+            ("pushDeviceId", "userId", "installationId", "expoPushToken", "platform")
+           VALUES (
+             '82000000-0000-4000-8000-000000000426',
+             $1,
+             'installation-d',
+             'ExponentPushToken[device-a]',
+             'ANDROID'
+           )`,
+          [userB],
+        ),
+      "23505",
+      "push_devices_expo_token_unique",
+    );
+    await expectConstraintError(
+      () =>
+        migrationPool.query(
+          `INSERT INTO "pushDevices"
+            ("pushDeviceId", "userId", "installationId", "expoPushToken", "platform")
+           VALUES (
+             '82000000-0000-4000-8000-000000000526',
+             $1,
+             'installation-web',
+             'ExponentPushToken[device-web]',
+             'WEB'
+           )`,
+          [userA],
+        ),
+      "23514",
+      "push_devices_platform_check",
+    );
+    await expectConstraintError(
+      () =>
+        migrationPool.query(
+          `INSERT INTO "pushDevices"
+            ("pushDeviceId", "userId", "installationId", "expoPushToken", "platform", "disabledAt")
+           VALUES (
+             '82000000-0000-4000-8000-000000000626',
+             $1,
+             'installation-disabled-at',
+             'ExponentPushToken[device-disabled-at]',
+             'IOS',
+             now()
+           )`,
+          [userA],
+        ),
+      "23514",
+      "push_devices_disable_check",
+    );
+    await expectConstraintError(
+      () =>
+        migrationPool.query(
+          `INSERT INTO "pushDevices"
+            ("pushDeviceId", "userId", "installationId", "expoPushToken", "platform", "disabledReason")
+           VALUES (
+             '82000000-0000-4000-8000-000000000726',
+             $1,
+             'installation-disabled-reason',
+             'ExponentPushToken[device-disabled-reason]',
+             'IOS',
+             'LOGOUT'
+           )`,
+          [userA],
+        ),
+      "23514",
+      "push_devices_disable_check",
+    );
+    await expectConstraintError(
+      () =>
+        migrationPool.query(
+          `INSERT INTO "pushDevices"
+            ("pushDeviceId", "userId", "installationId", "expoPushToken", "platform")
+           VALUES (
+             '82000000-0000-4000-8000-000000000826',
+             $1,
+             'installation-missing-user',
+             'ExponentPushToken[device-missing-user]',
+             'IOS'
+           )`,
+          [missingUser],
+        ),
+      "23503",
+      "push_devices_user_fk",
+    );
+
+    await migrationPool.query(`INSERT INTO "notificationPreferences" ("userId") VALUES ($1)`, [userA]);
+    const defaultPreferences = await migrationPool.query<{
+      orderPushEnabled: boolean;
+      pushEnabled: boolean;
+      stylePushEnabled: boolean;
+      wishPushEnabled: boolean;
+    }>(
+      `SELECT "pushEnabled", "orderPushEnabled", "wishPushEnabled", "stylePushEnabled"
+       FROM "notificationPreferences"
+       WHERE "userId" = $1`,
+      [userA],
+    );
+    expect(defaultPreferences.rows).toEqual([
+      { orderPushEnabled: true, pushEnabled: true, stylePushEnabled: true, wishPushEnabled: true },
+    ]);
+    await expectConstraintError(
+      () => migrationPool.query(`INSERT INTO "notificationPreferences" ("userId") VALUES ($1)`, [missingUser]),
+      "23503",
+      "notification_preferences_user_fk",
+    );
+
+    await migrationPool.query(
+      `INSERT INTO "pushOutbox" ("pushOutboxId", "notificationId", "pushDeviceId")
+       VALUES ('83000000-0000-4000-8000-000000000126', $1, $2)`,
+      [notificationA, deviceA],
+    );
+    await expectConstraintError(
+      () =>
+        migrationPool.query(
+          `INSERT INTO "pushOutbox" ("pushOutboxId", "notificationId", "pushDeviceId")
+           VALUES ('83000000-0000-4000-8000-000000000226', $1, $2)`,
+          [notificationA, deviceA],
+        ),
+      "23505",
+      "push_outbox_notification_device_unique",
+    );
+    await expectConstraintError(
+      () =>
+        migrationPool.query(
+          `INSERT INTO "pushOutbox" ("pushOutboxId", "notificationId", "pushDeviceId")
+           VALUES (
+             '83000000-0000-4000-8000-000000000326',
+             '81000000-0000-4000-8000-000000000826',
+             $1
+           )`,
+          [deviceA],
+        ),
+      "23503",
+      "push_outbox_notification_fk",
+    );
+    await expectConstraintError(
+      () =>
+        migrationPool.query(
+          `INSERT INTO "pushOutbox" ("pushOutboxId", "notificationId", "pushDeviceId")
+           VALUES (
+             '83000000-0000-4000-8000-000000000426',
+             $1,
+             '82000000-0000-4000-8000-000000000926'
+           )`,
+          [notificationB],
+        ),
+      "23503",
+      "push_outbox_device_fk",
+    );
+
+    let matrixSequence = 100;
+    const nextMatrixId = () => {
+      matrixSequence += 1;
+      return `83000000-0000-4000-8000-${String(matrixSequence).padStart(12, "0")}`;
+    };
+    const insertMatrixOutbox = (input: {
+      readonly attemptCount?: number;
+      readonly claimedAt?: string | null;
+      readonly claimToken?: string | null;
+      readonly expoTicketId?: string | null;
+      readonly pushOutboxId: string;
+      readonly receiptAvailableAt?: string | null;
+      readonly status: string;
+    }) =>
+      migrationPool.query(
+        `INSERT INTO "pushOutbox"
+          ("pushOutboxId", "notificationId", "pushDeviceId", "status", "attemptCount", "claimedAt", "claimToken", "expoTicketId", "receiptAvailableAt")
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        [
+          input.pushOutboxId,
+          notificationB,
+          deviceB,
+          input.status,
+          input.attemptCount ?? 0,
+          input.claimedAt ?? null,
+          input.claimToken ?? null,
+          input.expoTicketId ?? null,
+          input.receiptAvailableAt ?? null,
+        ],
+      );
+    const validMatrixStates = [
+      { status: "PENDING" },
+      {
+        claimedAt: "2026-08-31T01:00:00Z",
+        claimToken: "84000000-0000-4000-8000-000000000126",
+        status: "PROCESSING",
+      },
+      {
+        claimedAt: "2026-08-31T01:00:00Z",
+        claimToken: "84000000-0000-4000-8000-000000000226",
+        expoTicketId: "ticket-processing",
+        receiptAvailableAt: "2026-08-31T01:15:00Z",
+        status: "PROCESSING",
+      },
+      {
+        expoTicketId: "ticket-ticketed",
+        receiptAvailableAt: "2026-08-31T01:15:00Z",
+        status: "TICKETED",
+      },
+      {
+        expoTicketId: "ticket-receipt-ok",
+        receiptAvailableAt: "2026-08-31T01:15:00Z",
+        status: "RECEIPT_OK",
+      },
+      { status: "FAILED" },
+      {
+        expoTicketId: "ticket-failed",
+        receiptAvailableAt: "2026-08-31T01:15:00Z",
+        status: "FAILED",
+      },
+    ] as const;
+    for (const state of validMatrixStates) {
+      const pushOutboxId = nextMatrixId();
+      await expect(insertMatrixOutbox({ ...state, pushOutboxId })).resolves.toEqual(
+        expect.objectContaining({ rowCount: 1 }),
+      );
+      await migrationPool.query(`DELETE FROM "pushOutbox" WHERE "pushOutboxId" = $1`, [pushOutboxId]);
+    }
+    await expectConstraintError(
+      () => insertMatrixOutbox({ pushOutboxId: nextMatrixId(), status: "SENT" }),
+      "23514",
+      "push_outbox_status_check",
+    );
+    await expectConstraintError(
+      () => insertMatrixOutbox({ attemptCount: -1, pushOutboxId: nextMatrixId(), status: "PENDING" }),
+      "23514",
+      "push_outbox_attempt_count_check",
+    );
+    await expectConstraintError(
+      () =>
+        insertMatrixOutbox({
+          claimedAt: "2026-08-31T01:00:00Z",
+          claimToken: "84000000-0000-4000-8000-000000000326",
+          pushOutboxId: nextMatrixId(),
+          status: "PENDING",
+        }),
+      "23514",
+      "push_outbox_claim_check",
+    );
+    await expectConstraintError(
+      () => insertMatrixOutbox({ pushOutboxId: nextMatrixId(), status: "PROCESSING" }),
+      "23514",
+      "push_outbox_claim_check",
+    );
+    await expectConstraintError(
+      () =>
+        insertMatrixOutbox({
+          claimToken: "84000000-0000-4000-8000-000000000426",
+          pushOutboxId: nextMatrixId(),
+          status: "PROCESSING",
+        }),
+      "23514",
+      "push_outbox_claim_check",
+    );
+    await expectConstraintError(
+      () =>
+        insertMatrixOutbox({
+          claimedAt: "2026-08-31T01:00:00Z",
+          pushOutboxId: nextMatrixId(),
+          status: "PROCESSING",
+        }),
+      "23514",
+      "push_outbox_claim_check",
+    );
+    await expectConstraintError(
+      () =>
+        insertMatrixOutbox({
+          claimedAt: "2026-08-31T01:00:00Z",
+          claimToken: "84000000-0000-4000-8000-000000000526",
+          expoTicketId: "ticket-without-receipt",
+          pushOutboxId: nextMatrixId(),
+          status: "PROCESSING",
+        }),
+      "23514",
+      "push_outbox_ticket_pair_check",
+    );
+    await expectConstraintError(
+      () =>
+        insertMatrixOutbox({
+          claimedAt: "2026-08-31T01:00:00Z",
+          claimToken: "84000000-0000-4000-8000-000000000626",
+          pushOutboxId: nextMatrixId(),
+          receiptAvailableAt: "2026-08-31T01:15:00Z",
+          status: "PROCESSING",
+        }),
+      "23514",
+      "push_outbox_ticket_pair_check",
+    );
+    await expectConstraintError(
+      () =>
+        insertMatrixOutbox({
+          expoTicketId: "ticket-pending",
+          pushOutboxId: nextMatrixId(),
+          receiptAvailableAt: "2026-08-31T01:15:00Z",
+          status: "PENDING",
+        }),
+      "23514",
+      "push_outbox_ticket_state_check",
+    );
+    await expectConstraintError(
+      () => insertMatrixOutbox({ pushOutboxId: nextMatrixId(), status: "TICKETED" }),
+      "23514",
+      "push_outbox_ticket_state_check",
+    );
+    await expectConstraintError(
+      () => insertMatrixOutbox({ pushOutboxId: nextMatrixId(), status: "RECEIPT_OK" }),
+      "23514",
+      "push_outbox_ticket_state_check",
+    );
+
+    const cascadeNotification = "81000000-0000-4000-8000-000000001026";
+    await migrationPool.query(
+      `INSERT INTO "notifications"
+        ("notificationId", "userId", "type", "title", "body", "route", "entityId", "dedupeKey")
+       VALUES ($1, $2, 'ORDER_STATUS', 'Cascade notification', 'Body', '/order/4', $3, 'cascade-notification')`,
+      [cascadeNotification, userA, "91000000-0000-4000-8000-000000001026"],
+    );
+    await migrationPool.query(
+      `INSERT INTO "pushOutbox" ("pushOutboxId", "notificationId", "pushDeviceId")
+       VALUES ('83000000-0000-4000-8000-000000001026', $1, $2)`,
+      [cascadeNotification, deviceA],
+    );
+    await migrationPool.query(`DELETE FROM "notifications" WHERE "notificationId" = $1`, [cascadeNotification]);
+    const notificationCascade = await migrationPool.query<{ outbox: string; device: string }>(
+      `SELECT
+         (SELECT count(*) FROM "pushOutbox" WHERE "pushOutboxId" = '83000000-0000-4000-8000-000000001026') AS outbox,
+         (SELECT count(*) FROM "pushDevices" WHERE "pushDeviceId" = $1) AS device`,
+      [deviceA],
+    );
+    expect(notificationCascade.rows).toEqual([{ device: "1", outbox: "0" }]);
+
+    const cascadeDevice = "82000000-0000-4000-8000-000000001126";
+    const deviceCascadeNotification = "81000000-0000-4000-8000-000000001126";
+    await migrationPool.query(
+      `INSERT INTO "pushDevices"
+        ("pushDeviceId", "userId", "installationId", "expoPushToken", "platform")
+       VALUES ($1, $2, 'installation-cascade', 'ExponentPushToken[device-cascade]', 'IOS')`,
+      [cascadeDevice, userA],
+    );
+    await migrationPool.query(
+      `INSERT INTO "notifications"
+        ("notificationId", "userId", "type", "title", "body", "route", "entityId", "dedupeKey")
+       VALUES ($1, $2, 'STYLE_LIKE', 'Cascade device', 'Body', '/style/2', $3, 'cascade-device')`,
+      [deviceCascadeNotification, userA, "91000000-0000-4000-8000-000000001126"],
+    );
+    await migrationPool.query(
+      `INSERT INTO "pushOutbox" ("pushOutboxId", "notificationId", "pushDeviceId")
+       VALUES ('83000000-0000-4000-8000-000000001126', $1, $2)`,
+      [deviceCascadeNotification, cascadeDevice],
+    );
+    await migrationPool.query(`DELETE FROM "pushDevices" WHERE "pushDeviceId" = $1`, [cascadeDevice]);
+    const deviceCascade = await migrationPool.query<{ notification: string; outbox: string }>(
+      `SELECT
+         (SELECT count(*) FROM "pushOutbox" WHERE "pushOutboxId" = '83000000-0000-4000-8000-000000001126') AS outbox,
+         (SELECT count(*) FROM "notifications" WHERE "notificationId" = $1) AS notification`,
+      [deviceCascadeNotification],
+    );
+    expect(deviceCascade.rows).toEqual([{ notification: "1", outbox: "0" }]);
+  });
+
+  it("rolls back a partially applied notification migration and succeeds on rerun", async () => {
+    const migrationsBeforeNotifications = (await readMigrationArtifacts())
+      .filter(({ name, retired }) => !retired && name < "0026_notifications_push_outbox.sql")
+      .map(({ name }) => name);
+    await runHistoricalMigrations(migrationPool, undefined, migrationsBeforeNotifications);
+    await migrationPool.query(`CREATE TABLE "pushDevices" ("blocker" integer)`);
+
+    const failedMigration = await migrate({ pool: migrationPool }).then(
+      () => ({ status: "fulfilled" as const }),
+      (error: { code?: string }) => ({ code: error.code, status: "rejected" as const }),
+    );
+    const rolledBackTables = await migrationPool.query<{
+      notificationPreferences: string | null;
+      notifications: string | null;
+      pushDevices: string | null;
+      pushOutbox: string | null;
+    }>(
+      `SELECT
+         to_regclass('"notifications"')::text AS notifications,
+         to_regclass('"pushDevices"')::text AS "pushDevices",
+         to_regclass('"notificationPreferences"')::text AS "notificationPreferences",
+         to_regclass('"pushOutbox"')::text AS "pushOutbox"`,
+    );
+    const failedJournal = await migrationPool.query<{ count: string }>(
+      `SELECT count(*) FROM "_migrations" WHERE "name" = '0026_notifications_push_outbox.sql'`,
+    );
+
+    expect(failedMigration).toEqual({ code: "42P07", status: "rejected" });
+    expect(rolledBackTables.rows).toEqual([
+      { notificationPreferences: null, notifications: null, pushDevices: '"pushDevices"', pushOutbox: null },
+    ]);
+    expect(failedJournal.rows).toEqual([{ count: "0" }]);
+
+    await migrationPool.query(`DROP TABLE "pushDevices"`);
+    await migrate({ pool: migrationPool });
+    const rerunTables = await migrationPool.query<{
+      notificationPreferences: string | null;
+      notifications: string | null;
+      pushDevices: string | null;
+      pushOutbox: string | null;
+    }>(
+      `SELECT
+         to_regclass('"notifications"')::text AS notifications,
+         to_regclass('"pushDevices"')::text AS "pushDevices",
+         to_regclass('"notificationPreferences"')::text AS "notificationPreferences",
+         to_regclass('"pushOutbox"')::text AS "pushOutbox"`,
+    );
+    const rerunJournal = await migrationPool.query<{ count: string }>(
+      `SELECT count(*) FROM "_migrations" WHERE "name" = '0026_notifications_push_outbox.sql'`,
+    );
+    expect(rerunTables.rows).toEqual([
+      {
+        notificationPreferences: '"notificationPreferences"',
+        notifications: "notifications",
+        pushDevices: '"pushDevices"',
+        pushOutbox: '"pushOutbox"',
+      },
+    ]);
+    expect(rerunJournal.rows).toEqual([{ count: "1" }]);
   });
 
   it("backfills the latest price snapshot for an existing published product", async () => {

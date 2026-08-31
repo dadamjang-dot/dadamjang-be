@@ -68,6 +68,154 @@ export const accountReactivationTokens = pgTable("accountReactivationTokens", {
   createdAt: timestamp("createdAt", { withTimezone: true }).defaultNow().notNull(),
 });
 
+export const notifications = pgTable(
+  "notifications",
+  {
+    notificationId: uuid("notificationId").primaryKey().defaultRandom(),
+    userId: uuid("userId").notNull(),
+    type: varchar("type", { length: 30 }).notNull(),
+    title: varchar("title", { length: 160 }).notNull(),
+    body: varchar("body", { length: 500 }).notNull(),
+    route: varchar("route", { length: 500 }).notNull(),
+    entityId: uuid("entityId").notNull(),
+    dedupeKey: varchar("dedupeKey", { length: 500 }).notNull(),
+    readAt: timestamp("readAt", { withTimezone: true }),
+    createdAt: timestamp("createdAt", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    foreignKey({
+      columns: [table.userId],
+      foreignColumns: [users.userId],
+      name: "notifications_user_fk",
+    }),
+    unique("notifications_user_dedupe_unique").on(table.userId, table.dedupeKey),
+    check(
+      "notifications_type_check",
+      sql`${table.type} IN ('ORDER_STATUS', 'WISH_PRICE_DROP', 'WISH_RESTOCK', 'STYLE_LIKE')`,
+    ),
+    index("notifications_user_created_idx").on(table.userId, table.createdAt.desc(), table.notificationId.desc()),
+    index("notifications_user_unread_idx")
+      .on(table.userId, table.createdAt.desc(), table.notificationId.desc())
+      .where(sql`${table.readAt} IS NULL`),
+  ],
+);
+
+export const pushDevices = pgTable(
+  "pushDevices",
+  {
+    pushDeviceId: uuid("pushDeviceId").primaryKey().defaultRandom(),
+    userId: uuid("userId").notNull(),
+    installationId: varchar("installationId", { length: 255 }).notNull(),
+    expoPushToken: varchar("expoPushToken", { length: 255 }).notNull(),
+    platform: varchar("platform", { length: 20 }).notNull(),
+    disabledAt: timestamp("disabledAt", { withTimezone: true }),
+    disabledReason: varchar("disabledReason", { length: 80 }),
+    lastSeenAt: timestamp("lastSeenAt", { withTimezone: true }).defaultNow().notNull(),
+    createdAt: timestamp("createdAt", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    foreignKey({
+      columns: [table.userId],
+      foreignColumns: [users.userId],
+      name: "push_devices_user_fk",
+    }),
+    unique("push_devices_installation_unique").on(table.installationId),
+    unique("push_devices_expo_token_unique").on(table.expoPushToken),
+    check("push_devices_platform_check", sql`${table.platform} IN ('IOS', 'ANDROID')`),
+    check(
+      "push_devices_disable_check",
+      sql`(${table.disabledAt} IS NULL AND ${table.disabledReason} IS NULL)
+        OR (${table.disabledAt} IS NOT NULL AND ${table.disabledReason} IS NOT NULL)`,
+    ),
+    index("push_devices_user_state_idx").on(table.userId, table.disabledAt, table.pushDeviceId),
+  ],
+);
+
+export const notificationPreferences = pgTable(
+  "notificationPreferences",
+  {
+    userId: uuid("userId").primaryKey(),
+    pushEnabled: boolean("pushEnabled").notNull().default(true),
+    orderPushEnabled: boolean("orderPushEnabled").notNull().default(true),
+    wishPushEnabled: boolean("wishPushEnabled").notNull().default(true),
+    stylePushEnabled: boolean("stylePushEnabled").notNull().default(true),
+    updatedAt: timestamp("updatedAt", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    foreignKey({
+      columns: [table.userId],
+      foreignColumns: [users.userId],
+      name: "notification_preferences_user_fk",
+    }),
+  ],
+);
+
+export const pushOutbox = pgTable(
+  "pushOutbox",
+  {
+    pushOutboxId: uuid("pushOutboxId").primaryKey().defaultRandom(),
+    notificationId: uuid("notificationId").notNull(),
+    pushDeviceId: uuid("pushDeviceId").notNull(),
+    status: varchar("status", { length: 20 }).notNull().default("PENDING"),
+    attemptCount: integer("attemptCount").notNull().default(0),
+    availableAt: timestamp("availableAt", { withTimezone: true }).defaultNow().notNull(),
+    claimToken: uuid("claimToken"),
+    claimedAt: timestamp("claimedAt", { withTimezone: true }),
+    expoTicketId: varchar("expoTicketId", { length: 255 }),
+    receiptAvailableAt: timestamp("receiptAvailableAt", { withTimezone: true }),
+    lastError: varchar("lastError", { length: 500 }),
+    createdAt: timestamp("createdAt", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    foreignKey({
+      columns: [table.notificationId],
+      foreignColumns: [notifications.notificationId],
+      name: "push_outbox_notification_fk",
+    }).onDelete("cascade"),
+    foreignKey({
+      columns: [table.pushDeviceId],
+      foreignColumns: [pushDevices.pushDeviceId],
+      name: "push_outbox_device_fk",
+    }).onDelete("cascade"),
+    unique("push_outbox_notification_device_unique").on(table.notificationId, table.pushDeviceId),
+    check(
+      "push_outbox_status_check",
+      sql`${table.status} IN ('PENDING', 'PROCESSING', 'TICKETED', 'RECEIPT_OK', 'FAILED')`,
+    ),
+    check("push_outbox_attempt_count_check", sql`${table.attemptCount} >= 0`),
+    check(
+      "push_outbox_claim_check",
+      sql`(${table.status} = 'PROCESSING' AND ${table.claimToken} IS NOT NULL AND ${table.claimedAt} IS NOT NULL)
+        OR (${table.status} <> 'PROCESSING' AND ${table.claimToken} IS NULL AND ${table.claimedAt} IS NULL)`,
+    ),
+    check(
+      "push_outbox_ticket_pair_check",
+      sql`(${table.expoTicketId} IS NULL AND ${table.receiptAvailableAt} IS NULL)
+        OR (${table.expoTicketId} IS NOT NULL AND ${table.receiptAvailableAt} IS NOT NULL)`,
+    ),
+    check(
+      "push_outbox_ticket_state_check",
+      sql`(${table.status} <> 'PENDING' OR ${table.expoTicketId} IS NULL)
+        AND (${table.status} NOT IN ('TICKETED', 'RECEIPT_OK') OR ${table.expoTicketId} IS NOT NULL)`,
+    ),
+    index("push_outbox_pending_idx")
+      .on(table.availableAt, table.createdAt, table.pushOutboxId)
+      .where(sql`${table.status} = 'PENDING'`),
+    index("push_outbox_ticketed_receipt_idx")
+      .on(table.receiptAvailableAt, table.createdAt, table.pushOutboxId)
+      .where(sql`${table.status} = 'TICKETED'`),
+    index("push_outbox_processing_idx")
+      .on(table.claimedAt, table.createdAt, table.pushOutboxId)
+      .where(sql`${table.status} = 'PROCESSING'`),
+    index("push_outbox_terminal_updated_idx")
+      .on(table.updatedAt, table.pushOutboxId)
+      .where(sql`${table.status} IN ('RECEIPT_OK', 'FAILED')`),
+    index("push_outbox_device_status_idx").on(table.pushDeviceId, table.status, table.pushOutboxId),
+  ],
+);
+
 export const refreshTokens = pgTable(
   "refreshToken",
   {
