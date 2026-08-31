@@ -514,6 +514,84 @@ describe("PostgreSQL GraphQL integration", () => {
     }
   });
 
+  it("notifies only a new non-self style like and lifetime-dedupes re-likes", async () => {
+    const authorUserId = "10000000-0000-4000-8000-000000000099";
+    const stylePostId = "82000000-0000-4000-8000-000000000091";
+    const selfStylePostId = "82000000-0000-4000-8000-000000000092";
+    await pool.query(
+      `INSERT INTO "users" ("userId", userid, email, password)
+       VALUES ($1, 'style-author', 'style-author@example.test', 'x')`,
+      [authorUserId],
+    );
+    await pool.query(
+      `INSERT INTO "stylePosts" ("stylePostId", "authorId", title, content, category)
+       VALUES
+         ($1, $3, 'Other style', 'Other style', 'CLOTHING'),
+         ($2, $4, 'Self style', 'Self style', 'CLOTHING')`,
+      [stylePostId, selfStylePostId, authorUserId, FIXTURE.userId],
+    );
+    await pool.query(
+      `INSERT INTO "pushDevices" ("userId", "installationId", "expoPushToken", platform)
+       VALUES ($1, 'style-author-device', 'ExponentPushToken[style-author-device]', 'IOS')`,
+      [authorUserId],
+    );
+    const accessToken = await signin(request.agent(app.getHttpServer()));
+    const auth = { Authorization: `Bearer ${accessToken}` };
+    const like = (postId: string) =>
+      request(app.getHttpServer())
+        .post("/graphql")
+        .set(auth)
+        .send({ query: `mutation { likeStylePost(stylePostId: "${postId}") { isLiked } }` });
+    const unlike = (postId: string) =>
+      request(app.getHttpServer())
+        .post("/graphql")
+        .set(auth)
+        .send({ query: `mutation { unlikeStylePost(stylePostId: "${postId}") { isLiked } }` });
+    const notificationCount = async (userId: string, dedupeKey: string) => {
+      const result = await pool.query<{ count: number }>(
+        `SELECT count(*)::int AS count FROM "notifications" WHERE "userId" = $1 AND "dedupeKey" = $2`,
+        [userId, dedupeKey],
+      );
+      return result.rows[0]?.count;
+    };
+    const dedupeKey = `style-like:${stylePostId}:${FIXTURE.userId}`;
+
+    expect((await like(stylePostId)).body.errors).toBeUndefined();
+    expect(await notificationCount(authorUserId, dedupeKey)).toBe(1);
+    expect((await like(stylePostId)).body.errors).toBeUndefined();
+    expect(await notificationCount(authorUserId, dedupeKey)).toBe(1);
+    expect((await unlike(stylePostId)).body.errors).toBeUndefined();
+    expect(await notificationCount(authorUserId, dedupeKey)).toBe(1);
+    expect((await like(stylePostId)).body.errors).toBeUndefined();
+    expect(await notificationCount(authorUserId, dedupeKey)).toBe(1);
+    expect((await like(selfStylePostId)).body.errors).toBeUndefined();
+    expect(await notificationCount(FIXTURE.userId, `style-like:${selfStylePostId}:${FIXTURE.userId}`)).toBe(0);
+
+    const delivered = await pool.query<{
+      body: string;
+      outboxCount: number;
+      route: string;
+      title: string;
+      type: string;
+    }>(
+      `SELECT n.type, n.title, n.body, n.route, count(o."pushOutboxId")::int AS "outboxCount"
+       FROM "notifications" n
+       LEFT JOIN "pushOutbox" o ON o."notificationId" = n."notificationId"
+       WHERE n."userId" = $1 AND n."dedupeKey" = $2
+       GROUP BY n."notificationId"`,
+      [authorUserId, dedupeKey],
+    );
+    expect(delivered.rows).toEqual([
+      {
+        type: "STYLE_LIKE",
+        title: "스타일에 좋아요가 달렸어요",
+        body: "내 스타일 게시물을 확인해 보세요.",
+        route: `/style/${stylePostId}`,
+        outboxCount: 1,
+      },
+    ]);
+  });
+
   it("paginates style posts with category and sort-aware cursors", async () => {
     const postIds = [
       "82000000-0000-4000-8000-000000000001",
@@ -740,6 +818,11 @@ describe("PostgreSQL GraphQL integration", () => {
       [checkout.body.data.checkoutCart.orderId],
     );
     expect(events.rows).toEqual([{ eventType: "ORDER_PAYMENT_PENDING" }, { eventType: "CHECKOUT_IDEMPOTENCY_REUSED" }]);
+    const notifications = await pool.query<{ count: number }>(
+      `SELECT count(*)::int AS count FROM "notifications" WHERE "userId" = $1 AND "entityId" = $2`,
+      [FIXTURE.userId, checkout.body.data.checkoutCart.orderId],
+    );
+    expect(notifications.rows[0]?.count).toBe(0);
   });
 
   it("uses stock as a non-reserving checkout availability snapshot", async () => {

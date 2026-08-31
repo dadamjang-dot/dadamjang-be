@@ -27,6 +27,25 @@ const adminToken = (agent: Agent) => signin(agent, "BO", ADMIN_FIXTURE.userid, A
 const graphql = (app: INestApplication, token: string, query: string, variables?: Record<string, unknown>) =>
   request(app.getHttpServer()).post("/graphql").set("Authorization", `Bearer ${token}`).send({ query, variables });
 
+const seedPushDevice = (pool: Pool, userId: string, installationId: string) =>
+  pool.query(
+    `INSERT INTO "pushDevices" ("userId", "installationId", "expoPushToken", platform)
+     VALUES ($1, $2, $3, 'IOS')`,
+    [userId, installationId, `ExponentPushToken[${installationId}]`],
+  );
+
+const notificationDeliveryCounts = async (pool: Pool, userId: string, dedupeKey: string) => {
+  const result = await pool.query<{ notificationCount: number; outboxCount: number }>(
+    `SELECT count(DISTINCT n."notificationId")::int AS "notificationCount",
+      count(o."pushOutboxId")::int AS "outboxCount"
+     FROM "notifications" n
+     LEFT JOIN "pushOutbox" o ON o."notificationId" = n."notificationId"
+     WHERE n."userId" = $1 AND n."dedupeKey" = $2`,
+    [userId, dedupeKey],
+  );
+  return result.rows[0];
+};
+
 const waitForAdvisoryWaiters = async (pool: Pool, expected: number) => {
   for (let attempt = 0; attempt < 500; attempt += 1) {
     const result = await pool.query<{ count: number }>(
@@ -299,6 +318,7 @@ describe("Admin GraphQL integration", () => {
   });
 
   it("allows only declared order transitions and resolves concurrent updates once", async () => {
+    await seedPushDevice(pool, FIXTURE.userId, "order-concurrency-device");
     const token = await adminToken(request.agent(app.getHttpServer()));
     const mutation = `mutation Transition($input: TransitionOrderInput!) {
       transitionOrder(input: $input) { orderId status allowedNextStatuses auditLogs { action metadataJson } }
@@ -324,6 +344,28 @@ describe("Admin GraphQL integration", () => {
     expect(results.filter((result) => result.body.errors?.[0].extensions.code === "CONFLICT")).toHaveLength(1);
     const audit = await pool.query(`SELECT 1 FROM "auditLogs" WHERE "entityId" = $1`, [ADMIN_FIXTURE.orderId]);
     expect(audit.rowCount).toBe(1);
+    expect(await notificationDeliveryCounts(pool, FIXTURE.userId, `order:${ADMIN_FIXTURE.orderId}:FULFILLING`)).toEqual(
+      { notificationCount: 1, outboxCount: 1 },
+    );
+  });
+
+  it("emits one notification for each committed fulfillment transition", async () => {
+    await seedPushDevice(pool, FIXTURE.userId, "order-fulfillment-device");
+    const token = await adminToken(request.agent(app.getHttpServer()));
+    const mutation = `mutation Transition($input: TransitionOrderInput!) {
+      transitionOrder(input: $input) { orderId status }
+    }`;
+
+    for (const nextStatus of ["FULFILLING", "COMPLETED"] as const) {
+      const response = await graphql(app, token, mutation, {
+        input: { orderId: ADMIN_FIXTURE.orderId, nextStatus },
+      });
+      expect(response.body.errors).toBeUndefined();
+      expect(response.body.data.transitionOrder.status).toBe(nextStatus);
+      expect(
+        await notificationDeliveryCounts(pool, FIXTURE.userId, `order:${ADMIN_FIXTURE.orderId}:${nextStatus}`),
+      ).toEqual({ notificationCount: 1, outboxCount: 1 });
+    }
   });
 
   it("does not let an admin mark a payment-pending order as paid", async () => {
@@ -348,6 +390,10 @@ describe("Admin GraphQL integration", () => {
       [ADMIN_FIXTURE.orderId],
     );
     expect(order.rows[0]).toEqual({ paymentStatus: "PENDING", status: "PAYMENT_PENDING" });
+    expect(await notificationDeliveryCounts(pool, FIXTURE.userId, `order:${ADMIN_FIXTURE.orderId}:PAID`)).toEqual({
+      notificationCount: 0,
+      outboxCount: 0,
+    });
   });
 
   it.each([
@@ -360,10 +406,14 @@ describe("Admin GraphQL integration", () => {
   ])(
     "atomically keeps a payment-pending order coherent when transitioning to $nextStatus",
     async ({ nextStatus, paymentStatus, paymentFailureReason }) => {
+      await seedPushDevice(pool, FIXTURE.userId, `order-${nextStatus.toLowerCase()}-device`);
       await pool.query(
         `UPDATE "orders" SET status = 'PAYMENT_PENDING', "paymentStatus" = 'PENDING' WHERE "orderId" = $1`,
         [ADMIN_FIXTURE.orderId],
       );
+      expect(
+        await notificationDeliveryCounts(pool, FIXTURE.userId, `order:${ADMIN_FIXTURE.orderId}:PAYMENT_PENDING`),
+      ).toEqual({ notificationCount: 0, outboxCount: 0 });
       const token = await adminToken(request.agent(app.getHttpServer()));
       const mutation = `mutation Transition($input: TransitionOrderInput!) {
         transitionOrder(input: $input) {
@@ -398,6 +448,9 @@ describe("Admin GraphQL integration", () => {
         ADMIN_FIXTURE.orderId,
       ]);
       expect(order.rows[0]).toEqual({ status: nextStatus, paymentStatus, paymentFailureReason });
+      expect(
+        await notificationDeliveryCounts(pool, FIXTURE.userId, `order:${ADMIN_FIXTURE.orderId}:${nextStatus}`),
+      ).toEqual({ notificationCount: 1, outboxCount: 1 });
     },
   );
 

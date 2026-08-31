@@ -25,6 +25,7 @@ import {
   users,
 } from "src/modules/database/schema";
 import { EmailService } from "src/modules/email/email.service";
+import { NotificationService } from "src/modules/notification/notification.service";
 import {
   getAllowedOrderTransitions,
   getOrderTransitionRule,
@@ -90,6 +91,7 @@ export class AdminService {
   constructor(
     @Inject(DRIZZLE) private readonly db: Database,
     private readonly emailService: EmailService,
+    private readonly notificationService: NotificationService,
   ) {}
 
   getDashboard = async () => {
@@ -484,6 +486,11 @@ export class AdminService {
         )
         .returning();
       if (!updated) throw new CustomConflictException(AdminErrorMessage.OrderChanged);
+      await this.notificationService.createOrderStatus(tx, {
+        orderId: updated.orderId,
+        status: input.nextStatus,
+        userId: updated.userId,
+      });
       await tx.insert(auditLogs).values({
         actorUserId: adminUserId,
         action: "ORDER_STATUS_CHANGED",

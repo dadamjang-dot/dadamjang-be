@@ -29,6 +29,7 @@ const createService = (rows: readonly unknown[]) => {
     { select: jest.fn().mockReturnValue(query) } as never,
     {} as never,
     { getOrThrow: jest.fn().mockReturnValue("cursor-secret") } as never,
+    {} as never,
   );
   return { query, service };
 };
@@ -88,6 +89,7 @@ describe("StylePostsService author hydration", () => {
       { select } as never,
       { getStylePostImageUrl: jest.fn() } as never,
       { getOrThrow: jest.fn().mockReturnValue("cursor-secret") } as never,
+      {} as never,
     );
 
     const post = await service.get(stylePostId);
@@ -154,6 +156,7 @@ describe("StylePostsService ranking budget", () => {
       { select, transaction } as never,
       {} as never,
       { getOrThrow: jest.fn().mockReturnValue("cursor-secret") } as never,
+      {} as never,
     );
 
     await expect(service.list()).resolves.toEqual({ nodes: [], hasNextPage: false, nextCursor: null });
