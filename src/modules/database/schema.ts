@@ -854,6 +854,7 @@ export const wishes = pgTable(
   (table) => [
     unique("wishes_user_product_unique").on(table.userId, table.productId),
     index("wishes_user_created_idx").on(table.userId, table.createdAt),
+    index("wishes_product_user_idx").on(table.productId, table.userId),
   ],
 );
 
