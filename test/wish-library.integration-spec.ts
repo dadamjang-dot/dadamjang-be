@@ -15,7 +15,7 @@ const signin = async (app: INestApplication) => {
         signin(input: $input) { accessToken }
       }`,
       variables: {
-        input: { userid: FIXTURE.userid, password: FIXTURE.password, portal: "Fo" },
+        input: { userid: FIXTURE.userid, password: FIXTURE.password, portal: "FO" },
       },
     });
 

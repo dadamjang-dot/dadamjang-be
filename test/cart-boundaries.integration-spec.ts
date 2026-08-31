@@ -15,7 +15,7 @@ const signin = async (app: INestApplication) => {
       query: `mutation Signin($input: SigninAuthInput!) {
         signin(input: $input) { accessToken }
       }`,
-      variables: { input: { userid: FIXTURE.userid, password: FIXTURE.password, portal: "Fo" } },
+      variables: { input: { userid: FIXTURE.userid, password: FIXTURE.password, portal: "FO" } },
     });
   expect(response.body.errors).toBeUndefined();
   return response.body.data.signin.accessToken as string;

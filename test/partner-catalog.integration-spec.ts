@@ -88,7 +88,7 @@ describe("partner catalog GraphQL integration", () => {
           signin(input: $input) { accessToken }
         }`,
         variables: {
-          input: { userid: FIXTURE.userid, password: FIXTURE.password, portal: "Partner" },
+          input: { userid: FIXTURE.userid, password: FIXTURE.password, portal: "PARTNER" },
         },
       })
       .expect(200);

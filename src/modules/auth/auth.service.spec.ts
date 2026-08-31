@@ -83,7 +83,7 @@ describe("AuthService", () => {
     ) => Promise<object>;
 
     try {
-      await signin({ userid: " ADMIN ", password: "password", portal: AuthPortal.Bo }, "device-1", {
+      await signin({ userid: " ADMIN ", password: "password", portal: AuthPortal.BO }, "device-1", {
         ip: "203.0.113.10",
         deviceId: "device-1",
       });
@@ -115,13 +115,13 @@ describe("AuthService", () => {
     const origin = { ip: "203.0.113.10", deviceId: "device-1" };
 
     await expect(
-      signin({ userid: " MEMBER ", password: "wrong", portal: AuthPortal.Fo }, "device-1", origin),
+      signin({ userid: " MEMBER ", password: "wrong", portal: AuthPortal.FO }, "device-1", origin),
     ).rejects.toThrow(AuthErrorMessage.AuthRequired);
     await expect(
-      signin({ userid: " MEMBER ", password: "wrong", portal: AuthPortal.Partner }, "device-1", origin),
+      signin({ userid: " MEMBER ", password: "wrong", portal: AuthPortal.PARTNER }, "device-1", origin),
     ).rejects.toThrow(AuthErrorMessage.AuthRequired);
     await expect(
-      signin({ userid: " MEMBER ", password: "wrong", portal: AuthPortal.Bo }, "device-1", origin),
+      signin({ userid: " MEMBER ", password: "wrong", portal: AuthPortal.BO }, "device-1", origin),
     ).rejects.toThrow(AuthErrorMessage.AuthRequired);
 
     expect(admissionLimiter.assertAllowed).toHaveBeenNthCalledWith(
@@ -163,7 +163,7 @@ describe("AuthService", () => {
       },
     );
     await expect(
-      service.signin({ userid: "user", password: "password", portal: AuthPortal.Partner }, "device", {
+      service.signin({ userid: "user", password: "password", portal: AuthPortal.PARTNER }, "device", {
         ip: "unknown",
         deviceId: "device",
       }),

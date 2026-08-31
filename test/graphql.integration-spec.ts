@@ -59,7 +59,7 @@ const signin = async (agent: ReturnType<typeof request.agent>) => {
         signin(input: $input) { accessToken role }
       }`,
       variables: {
-        input: { userid: FIXTURE.userid, password: FIXTURE.password, portal: "Fo" },
+        input: { userid: FIXTURE.userid, password: FIXTURE.password, portal: "FO" },
       },
     });
   expect(response.body.errors).toBeUndefined();
@@ -147,6 +147,19 @@ describe("PostgreSQL GraphQL integration", () => {
       `SELECT name, checksum FROM "_migrations" ORDER BY name`,
     );
     expect(after.rows).toEqual(before.rows);
+  });
+
+  it("exposes uppercase auth portal enum names used by clients", async () => {
+    const response = await request(app.getHttpServer())
+      .post("/graphql")
+      .send({ query: `{ __type(name: "AuthPortal") { enumValues { name } } }` })
+      .expect(200);
+
+    expect(response.body.data.__type.enumValues.map(({ name }: { name: string }) => name).sort()).toEqual([
+      "BO",
+      "FO",
+      "PARTNER",
+    ]);
   });
 
   it("signs in, resolves me, refreshes, and logs out", async () => {
