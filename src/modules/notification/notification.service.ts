@@ -15,11 +15,12 @@ import {
   UpdateFoNotificationPreferencesInput,
 } from "./notification.types";
 
-type EncodedNotificationCursor = { createdAt: string; notificationId: string };
-
 const DEFAULT_PAGE_SIZE = 30;
 const MAX_PAGE_SIZE = 100;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
 
 const pageSize = (first?: number) => Math.min(Math.max(first ?? DEFAULT_PAGE_SIZE, 1), MAX_PAGE_SIZE);
 
@@ -33,7 +34,9 @@ const encodeCursor = (notification: FoNotification) =>
 
 const decodeCursor = (value: string) => {
   try {
-    const cursor = JSON.parse(Buffer.from(value, "base64url").toString("utf8")) as EncodedNotificationCursor;
+    const cursor: unknown = JSON.parse(Buffer.from(value, "base64url").toString("utf8"));
+    if (!isRecord(cursor) || typeof cursor.createdAt !== "string" || typeof cursor.notificationId !== "string")
+      throw new Error();
     const createdAt = new Date(cursor.createdAt);
     if (!UUID_PATTERN.test(cursor.notificationId) || Number.isNaN(createdAt.getTime())) throw new Error();
     return { createdAt, notificationId: cursor.notificationId };
@@ -86,7 +89,11 @@ export class NotificationService {
   updatePreferences = (
     userId: string,
     input: UpdateFoNotificationPreferencesInput,
-  ): Promise<FoNotificationPreferences> => this.repository.updatePreferences(userId, input);
+  ): Promise<FoNotificationPreferences> => {
+    if (Object.values(input).some((value) => value === null))
+      throw new CustomBadRequestException("알림 설정이 올바르지 않습니다.");
+    return this.repository.updatePreferences(userId, input);
+  };
 
   registerDevice = async (
     userId: string,
@@ -97,7 +104,7 @@ export class NotificationService {
     if (!expoPushToken || expoPushToken.length > 255)
       throw new CustomBadRequestException("Expo Push token이 올바르지 않습니다.");
     return this.db.transaction(async (tx) => {
-      if (!(await this.repository.hasActiveRefreshSession(tx, userId, installationId)))
+      if (!(await this.repository.lockActiveRefreshSession(tx, userId, installationId)))
         throw new CustomUnauthorizedException("로그인이 필요합니다.");
       return this.repository.transferDevice(tx, { ...input, expoPushToken, userId, installationId });
     });

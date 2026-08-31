@@ -97,17 +97,21 @@ export class NotificationRepository {
     return requireResult(preferences);
   };
 
-  hasActiveRefreshSession = async (store: DatabaseTransaction, userId: string, installationId: string) =>
-    Boolean(
-      await store.query.refreshTokens.findFirst({
-        columns: { id: true },
-        where: and(
+  lockActiveRefreshSession = async (store: DatabaseTransaction, userId: string, installationId: string) => {
+    const [session] = await store
+      .select({ id: refreshTokens.id })
+      .from(refreshTokens)
+      .where(
+        and(
           eq(refreshTokens.userId, userId),
           eq(refreshTokens.deviceId, installationId),
           gt(refreshTokens.refreshTokenExp, sql`transaction_timestamp()`),
         ),
-      }),
-    );
+      )
+      .limit(1)
+      .for("share");
+    return Boolean(session);
+  };
 
   transferDevice = async (
     store: DatabaseTransaction,
@@ -128,7 +132,17 @@ export class NotificationRepository {
       .for("update");
     const tokenDevice = devices.find(({ expoPushToken }) => expoPushToken === input.expoPushToken);
     if (tokenDevice?.disabledReason === "DEVICE_NOT_REGISTERED") return false;
-    const installationDevice = devices.find(({ installationId }) => installationId === input.installationId);
+    let installationDevice = devices.find(({ installationId }) => installationId === input.installationId);
+    if (installationDevice?.disabledReason === "DEVICE_NOT_REGISTERED") {
+      await store
+        .update(pushDevices)
+        .set({
+          installationId: `retired-installation:${installationDevice.pushDeviceId}`,
+          updatedAt: sql`transaction_timestamp()`,
+        })
+        .where(eq(pushDevices.pushDeviceId, installationDevice.pushDeviceId));
+      installationDevice = undefined;
+    }
     const target = installationDevice ?? tokenDevice;
     if (target && tokenDevice && target.pushDeviceId !== tokenDevice.pushDeviceId) {
       await this.disableDeviceIds(store, [tokenDevice.pushDeviceId], "DEVICE_TRANSFERRED");
@@ -179,6 +193,7 @@ export class NotificationRepository {
       .select({ pushDeviceId: pushDevices.pushDeviceId })
       .from(pushDevices)
       .where(and(eq(pushDevices.userId, userId), eq(pushDevices.installationId, installationId)))
+      .orderBy(pushDevices.pushDeviceId)
       .for("update");
     await this.disableDeviceIds(
       store,
@@ -192,6 +207,7 @@ export class NotificationRepository {
       .select({ pushDeviceId: pushDevices.pushDeviceId })
       .from(pushDevices)
       .where(eq(pushDevices.userId, userId))
+      .orderBy(pushDevices.pushDeviceId)
       .for("update");
     await this.disableDeviceIds(
       store,
@@ -201,17 +217,6 @@ export class NotificationRepository {
   };
 
   deleteUserData = async (store: DatabaseTransaction, userId: string) => {
-    const notificationIds = store
-      .select({ notificationId: notifications.notificationId })
-      .from(notifications)
-      .where(eq(notifications.userId, userId));
-    const deviceIds = store
-      .select({ pushDeviceId: pushDevices.pushDeviceId })
-      .from(pushDevices)
-      .where(eq(pushDevices.userId, userId));
-    await store
-      .delete(pushOutbox)
-      .where(or(inArray(pushOutbox.notificationId, notificationIds), inArray(pushOutbox.pushDeviceId, deviceIds)));
     await store.delete(notifications).where(eq(notifications.userId, userId));
     await store.delete(notificationPreferences).where(eq(notificationPreferences.userId, userId));
     await store.delete(pushDevices).where(eq(pushDevices.userId, userId));

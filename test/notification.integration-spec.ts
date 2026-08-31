@@ -1,9 +1,12 @@
 import type { INestApplication } from "@nestjs/common";
 import { randomUUID } from "crypto";
-import type { Pool } from "pg";
+import { sql } from "drizzle-orm";
+import type { Pool, PoolClient } from "pg";
 import request from "supertest";
 import { createApp } from "src/app";
 import { FIXTURE } from "src/database/fixtures";
+import { Database, DRIZZLE } from "src/modules/database/database.module";
+import { NotificationRepository } from "src/modules/notification/notification.repository";
 import { resetTestFixtures, testPool } from "./support/database";
 
 const SECOND_USER = {
@@ -49,6 +52,116 @@ const registerDevice = (app: INestApplication, accessToken: string, deviceId: st
     }`,
     { input: { expoPushToken, platform: "IOS" } },
   );
+
+const waitFor = async (condition: () => Promise<boolean>) => {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    if (await condition()) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error("Timed out waiting for notification lock barrier");
+};
+
+const startPushDeviceBlocker = async (pool: Pool, pushDeviceId: string) => {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query("SET LOCAL lock_timeout = '2s'; SET LOCAL statement_timeout = '30s'");
+    await client.query(`SELECT "pushDeviceId" FROM "pushDevices" WHERE "pushDeviceId" = $1 FOR UPDATE`, [pushDeviceId]);
+    const pid = (await client.query<{ pid: number }>(`SELECT pg_backend_pid() AS pid`)).rows[0]?.pid;
+    if (!pid) throw new Error("Failed to identify notification blocker");
+    return { client, pid };
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    client.release();
+    throw error;
+  }
+};
+
+const blockedQueries = async (pool: Pool, blockerPid: number) => {
+  const result = await pool.query<{ query: string }>(
+    `WITH RECURSIVE blocked(pid) AS (
+       SELECT pid
+       FROM pg_stat_activity
+       WHERE datname = current_database()
+         AND pid <> pg_backend_pid()
+         AND $1 = ANY(pg_blocking_pids(pid))
+       UNION
+       SELECT activity.pid
+       FROM pg_stat_activity activity
+       INNER JOIN blocked ON blocked.pid = ANY(pg_blocking_pids(activity.pid))
+       WHERE activity.datname = current_database()
+         AND activity.pid <> pg_backend_pid()
+     )
+     SELECT activity.query
+     FROM pg_stat_activity activity
+     INNER JOIN blocked ON blocked.pid = activity.pid
+     ORDER BY activity.pid`,
+    [blockerPid],
+  );
+  return result.rows.map(({ query }) => query);
+};
+
+const rowCanBeLocked = async (pool: Pool, query: string, values: readonly unknown[]) => {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query("SET LOCAL lock_timeout = '100ms'");
+    await client.query(query, [...values]);
+    await client.query("ROLLBACK");
+    return true;
+  } catch {
+    await client.query("ROLLBACK").catch(() => undefined);
+    return false;
+  } finally {
+    client.release();
+  }
+};
+
+const releaseBlocker = async (client: PoolClient) => {
+  await client.query("COMMIT");
+  client.release();
+};
+
+const rollbackBlocker = async (client: PoolClient) => {
+  await client.query("ROLLBACK").catch(() => undefined);
+  client.release();
+};
+
+const raceAfterQueuedRegistration = async <T>(
+  pool: Pool,
+  pushDeviceId: string,
+  userId: string,
+  installationId: string,
+  registration: () => PromiseLike<request.Response>,
+  participant: () => PromiseLike<T>,
+) => {
+  const blocker = await startPushDeviceBlocker(pool, pushDeviceId);
+  const registrationRequest = Promise.resolve(registration());
+  let participantRequest: Promise<T> | undefined;
+  let released = false;
+  try {
+    await waitFor(async () => (await blockedQueries(pool, blocker.pid)).length === 1);
+    const refreshSessionCanBeLocked = await rowCanBeLocked(
+      pool,
+      `SELECT id FROM "refreshToken" WHERE "userId" = $1 AND "deviceId" = $2 FOR UPDATE NOWAIT`,
+      [userId, installationId],
+    );
+    participantRequest = Promise.resolve(participant());
+    await waitFor(async () => (await blockedQueries(pool, blocker.pid)).length >= 2);
+    const queries = await blockedQueries(pool, blocker.pid);
+    await releaseBlocker(blocker.client);
+    released = true;
+    const [registrationResponse, participantResponse] = await Promise.all([registrationRequest, participantRequest]);
+    return { participantResponse, queries, refreshSessionCanBeLocked, registrationResponse };
+  } catch (error) {
+    if (!released) await rollbackBlocker(blocker.client);
+    await Promise.allSettled([registrationRequest, ...(participantRequest ? [participantRequest] : [])]);
+    throw error;
+  }
+};
+
+const rawCursor = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url");
 
 const seedSecondUser = (pool: Pool) =>
   pool.query(
@@ -136,12 +249,16 @@ const expectDisabledDeliveries = async (pool: Pool, pushDeviceId: string) => {
 
 describe("FO notification GraphQL integration", () => {
   let app: INestApplication;
+  let db: Database;
+  let notificationRepository: NotificationRepository;
   let pool: Pool;
 
   beforeAll(async () => {
     pool = testPool();
     app = await createApp();
     await app.listen(0, "127.0.0.1");
+    db = app.get(DRIZZLE);
+    notificationRepository = app.get(NotificationRepository);
   });
 
   beforeEach(async () => {
@@ -231,6 +348,35 @@ describe("FO notification GraphQL integration", () => {
     expect(defaultPage.body.data.foNotifications.nodes).toHaveLength(30);
     expect(cappedPage.body.data.foNotifications).toMatchObject({ hasNextPage: true });
     expect(cappedPage.body.data.foNotifications.nodes).toHaveLength(100);
+  });
+
+  it("rejects cursor fields that rely on JSON type coercion", async () => {
+    const deviceId = "notification-cursor-validation-device";
+    const token = await signin(app, deviceId);
+    const notificationId = "81000000-0000-4000-8000-000000000001";
+    const payloads = [
+      { createdAt: 0, notificationId },
+      { createdAt: "2026-08-31T01:00:00.000Z", notificationId: [notificationId] },
+    ];
+
+    const responses = await Promise.all(
+      payloads.map((payload) =>
+        authenticated(
+          app,
+          token.accessToken,
+          deviceId,
+          `query InvalidFoNotificationCursor($after: String) {
+            foNotifications(first: 1, after: $after) { nodes { notificationId } }
+          }`,
+          { after: rawCursor(payload) },
+        ),
+      ),
+    );
+
+    expect(responses.map((response) => response.body.errors?.[0]?.extensions.code)).toEqual([
+      "BAD_USER_INPUT",
+      "BAD_USER_INPUT",
+    ]);
   });
 
   it("authorizes singular lookup and read mutations by the authenticated owner", async () => {
@@ -342,6 +488,23 @@ describe("FO notification GraphQL integration", () => {
     });
   });
 
+  it("rejects explicit null notification preferences", async () => {
+    const deviceId = "notification-null-preference-device";
+    const token = await signin(app, deviceId);
+
+    const response = await authenticated(
+      app,
+      token.accessToken,
+      deviceId,
+      `mutation UpdateFoNotificationPreferences($input: UpdateFoNotificationPreferencesInput!) {
+        updateFoNotificationPreferences(input: $input) { pushEnabled }
+      }`,
+      { input: { pushEnabled: null } },
+    );
+
+    expect(response.body.errors?.[0]?.extensions.code).toBe("BAD_USER_INPUT");
+  });
+
   it("transfers installations and tokens only for active FO refresh sessions", async () => {
     const sharedDevice = "notification-shared-device";
     const secondDevice = "notification-second-device";
@@ -413,11 +576,135 @@ describe("FO notification GraphQL integration", () => {
        FROM "pushDevices" WHERE "installationId" = $1`,
       [deviceId],
     );
+    const rejectedAgain = await registerDevice(app, token.accessToken, deviceId, invalidToken);
+    const tombstone = await pool.query<{
+      installationId: string;
+      disabledReason: string | null;
+    }>(`SELECT "installationId", "disabledReason" FROM "pushDevices" WHERE "expoPushToken" = $1`, [invalidToken]);
 
     expect(rejected.body).toEqual({ data: { registerFoPushDevice: false } });
     expect(stillDisabled.rows[0]).toEqual({ disabledReason: "DEVICE_NOT_REGISTERED" });
     expect(replaced.body).toEqual({ data: { registerFoPushDevice: true } });
     expect(active.rows[0]).toEqual({ expoPushToken: replacementToken, disabledAt: null, disabledReason: null });
+    expect(rejectedAgain.body).toEqual({ data: { registerFoPushDevice: false } });
+    expect(tombstone.rows[0]?.disabledReason).toBe("DEVICE_NOT_REGISTERED");
+    expect(tombstone.rows[0]?.installationId).not.toBe(deviceId);
+  });
+
+  it("serializes device registration before logout and leaves the installation disabled", async () => {
+    const deviceId = "notification-logout-race-device";
+    const token = await signin(app, deviceId);
+    await registerDevice(app, token.accessToken, deviceId, "ExponentPushToken[notification-logout-race-old]");
+    const device = await pool.query<{ pushDeviceId: string }>(
+      `SELECT "pushDeviceId" FROM "pushDevices" WHERE "installationId" = $1`,
+      [deviceId],
+    );
+
+    const raced = await raceAfterQueuedRegistration(
+      pool,
+      device.rows[0]?.pushDeviceId as string,
+      FIXTURE.userId,
+      deviceId,
+      () => registerDevice(app, token.accessToken, deviceId, "ExponentPushToken[notification-logout-race-new]"),
+      () =>
+        request(app.getHttpServer())
+          .post("/graphql")
+          .set("Authorization", `Bearer ${token.refreshToken}`)
+          .send({ query: `mutation NotificationRaceLogout { logout }` }),
+    );
+    const active = await pool.query<{ count: number }>(
+      `SELECT count(*)::int AS count FROM "pushDevices" WHERE "installationId" = $1 AND "disabledAt" IS NULL`,
+      [deviceId],
+    );
+
+    expect(raced.refreshSessionCanBeLocked).toBe(false);
+    expect(raced.queries.some((query) => query.includes('delete from "refreshToken"'))).toBe(true);
+    expect(raced.registrationResponse.body).toEqual({ data: { registerFoPushDevice: true } });
+    expect(raced.participantResponse.body).toEqual({ data: { logout: true } });
+    expect(active.rows[0]?.count).toBe(0);
+  });
+
+  it("serializes device registration before deactivation and leaves every device disabled", async () => {
+    const deviceId = "notification-deactivation-race-device";
+    const token = await signin(app, deviceId);
+    await registerDevice(app, token.accessToken, deviceId, "ExponentPushToken[notification-deactivation-race-old]");
+    const device = await pool.query<{ pushDeviceId: string }>(
+      `SELECT "pushDeviceId" FROM "pushDevices" WHERE "installationId" = $1`,
+      [deviceId],
+    );
+
+    const raced = await raceAfterQueuedRegistration(
+      pool,
+      device.rows[0]?.pushDeviceId as string,
+      FIXTURE.userId,
+      deviceId,
+      () => registerDevice(app, token.accessToken, deviceId, "ExponentPushToken[notification-deactivation-race-new]"),
+      () =>
+        authenticated(
+          app,
+          token.accessToken,
+          deviceId,
+          `mutation NotificationRaceDeactivation { deactivateFoAccount { ok } }`,
+        ),
+    );
+    const state = await pool.query<{ activeDevices: number; sessions: number }>(
+      `SELECT
+        (SELECT count(*)::int FROM "pushDevices" WHERE "userId" = $1 AND "disabledAt" IS NULL) AS "activeDevices",
+        (SELECT count(*)::int FROM "refreshToken" WHERE "userId" = $1) AS sessions`,
+      [FIXTURE.userId],
+    );
+
+    expect(raced.refreshSessionCanBeLocked).toBe(false);
+    expect(raced.queries.some((query) => query.includes('delete from "refreshToken"'))).toBe(true);
+    expect(raced.registrationResponse.body).toEqual({ data: { registerFoPushDevice: true } });
+    expect(raced.participantResponse.body.data.deactivateFoAccount).toEqual({ ok: true });
+    expect(state.rows[0]).toEqual({ activeDevices: 0, sessions: 0 });
+  });
+
+  it("locks multi-device disables by pushDeviceId before waiting on later rows", async () => {
+    const lowDeviceId = "11000000-0000-4000-8000-000000000001";
+    const highDeviceId = "ee000000-0000-4000-8000-000000000001";
+    const targetToken = "ExponentPushToken[notification-lock-order-target]";
+    const transferredToken = "ExponentPushToken[notification-lock-order-transferred]";
+    await pool.query(
+      `INSERT INTO "pushDevices"
+        ("pushDeviceId", "userId", "installationId", "expoPushToken", platform)
+       VALUES
+        ($1, $3, 'notification-device-lock-order-other', $4, 'IOS'),
+        ($2, $3, $5, $6, 'IOS')`,
+      [highDeviceId, lowDeviceId, FIXTURE.userId, transferredToken, "notification-device-lock-order", targetToken],
+    );
+    const blocker = await startPushDeviceBlocker(pool, highDeviceId);
+    const disableRequest = db.transaction(async (tx) => {
+      await tx.execute(sql`SET LOCAL enable_indexscan = off`);
+      await tx.execute(sql`SET LOCAL enable_bitmapscan = off`);
+      await notificationRepository.disableUserDevices(tx, FIXTURE.userId, "LOCK_ORDER_TEST");
+    });
+    let released = false;
+    let lowDeviceCanBeLocked: boolean | undefined;
+    try {
+      await waitFor(async () => (await blockedQueries(pool, blocker.pid)).length === 1);
+      lowDeviceCanBeLocked = await rowCanBeLocked(
+        pool,
+        `SELECT "pushDeviceId" FROM "pushDevices" WHERE "pushDeviceId" = $1 FOR UPDATE NOWAIT`,
+        [lowDeviceId],
+      );
+      await releaseBlocker(blocker.client);
+      released = true;
+      await disableRequest;
+    } finally {
+      if (!released) {
+        await rollbackBlocker(blocker.client);
+        await Promise.allSettled([disableRequest]);
+      }
+    }
+    const active = await pool.query<{ count: number }>(
+      `SELECT count(*)::int AS count FROM "pushDevices" WHERE "userId" = $1 AND "disabledAt" IS NULL`,
+      [FIXTURE.userId],
+    );
+
+    expect(lowDeviceCanBeLocked).toBe(false);
+    expect(active.rows[0]?.count).toBe(0);
   });
 
   it("disables a device and terminally fails unsettled deliveries on unregister", async () => {

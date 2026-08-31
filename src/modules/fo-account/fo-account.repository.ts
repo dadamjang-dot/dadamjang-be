@@ -68,8 +68,8 @@ export class FoAccountRepository {
             .returning({ scheduledAnonymizationAt: users.scheduledAnonymizationAt })
         )[0],
       );
-      await this.notificationRepository.disableUserDevices(tx, userId, "ACCOUNT_DEACTIVATED");
       await tx.delete(refreshTokens).where(eq(refreshTokens.userId, userId));
+      await this.notificationRepository.disableUserDevices(tx, userId, "ACCOUNT_DEACTIVATED");
       if (!updated.scheduledAnonymizationAt) throw new Error("Scheduled anonymization timestamp is missing");
       return { ok: true, scheduledAnonymizationAt: updated.scheduledAnonymizationAt };
     });
