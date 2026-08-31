@@ -28,11 +28,12 @@ type KakaoSignupInput = {
   readonly deviceIdHash: string;
   readonly userId: string;
   readonly userid: string;
-  readonly password: string;
+  readonly password: string | null;
   readonly consents: readonly ConsentAcceptanceInput[];
 };
 
 type IssueTokens = (user: User, store: RefreshTokenStore) => Promise<TokenPayload>;
+type CompleteExistingUser<T> = (user: User, store: RefreshTokenStore) => Promise<T>;
 
 @Injectable()
 export class KakaoFlowRepository {
@@ -125,12 +126,12 @@ export class KakaoFlowRepository {
     )[0];
   };
 
-  completeLoginFlow = (
+  completeLoginFlow = <T>(
     flowId: string,
     deviceIdHash: string,
     callbackToken: string,
     signupToken: string,
-    issueTokens: IssueTokens,
+    completeExistingUser: CompleteExistingUser<T>,
   ) =>
     this.db.transaction(async (tx) => {
       const now = new Date();
@@ -163,7 +164,7 @@ export class KakaoFlowRepository {
       if (flow.status === "EXISTING_USER" && flow.userId) {
         const user = await tx.query.users.findFirst({ where: eq(users.userId, flow.userId) });
         if (!user) throw new InvalidFoAuthProofError();
-        return { kind: "existing" as const, tokenPayload: await issueTokens(user, tx) };
+        return { kind: "existing" as const, result: await completeExistingUser(user, tx) };
       }
       if (flow.status !== "SIGNUP_REQUIRED") throw new InvalidFoAuthProofError();
       await tx.insert(kakaoSignupTokens).values({

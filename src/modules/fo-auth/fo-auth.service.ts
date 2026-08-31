@@ -8,9 +8,10 @@ import { AdmissionLimiter, type RequestOrigin } from "src/modules/admission/admi
 import { hasBuyerCapability } from "src/auth/role";
 import { AuthService } from "src/modules/auth/auth.service";
 import { EmailService } from "src/modules/email/email.service";
+import { FoAccountService } from "src/modules/fo-account/fo-account.service";
 import { ExistingFoIdentityError, InvalidFoAuthProofError } from "./fo-auth.error";
 import { FoAuthRepository } from "./fo-auth.repository";
-import type { ConsentAcceptanceInput, SigninFoInput, SignupFoInput } from "./fo-auth.types";
+import { FoSigninStatus, type ConsentAcceptanceInput, type SigninFoInput, type SignupFoInput } from "./fo-auth.types";
 
 const invalidPasswordHash = "$2b$10$nmo8L8VvFVH2sB.e3T0hP.TQMDhHxk88WTtFBkDgnjAlnHDR4W/rW";
 const signupConsentTypes = ["AGE_OVER_14", "SERVICE_TERMS", "PRIVACY_COLLECTION", "MARKETING"];
@@ -22,6 +23,7 @@ export class FoAuthService {
     private readonly authService: AuthService,
     private readonly emailService: EmailService,
     private readonly admissionLimiter: AdmissionLimiter,
+    private readonly foAccountService: FoAccountService,
   ) {}
 
   signin = async (input: SigninFoInput, deviceId: string, origin: RequestOrigin) => {
@@ -37,15 +39,22 @@ export class FoAuthService {
     );
     const signinStartedAt = await this.authService.signinStartedAt();
     const user = await this.repository.findByEmail(email);
-    if (!user) {
+    if (!user || user.password === null) {
       await bcrypt.compare(input.password, invalidPasswordHash);
       throw new CustomUnauthorizedException("이메일 또는 비밀번호가 올바르지 않습니다.");
     }
+    const passwordHash = user.password;
     return this.authService.withSigninLock(user.userId, deviceId, async (store) => {
-      const validPassword = await bcrypt.compare(input.password, user.password);
+      const validPassword = await bcrypt.compare(input.password, passwordHash);
       if (!validPassword || !hasBuyerCapability(user.role))
         throw new CustomUnauthorizedException("이메일 또는 비밀번호가 올바르지 않습니다.");
-      return this.authService.issueTokensForUser(user, deviceId, store, signinStartedAt);
+      if (user.anonymizedAt) throw new CustomUnauthorizedException("이메일 또는 비밀번호가 올바르지 않습니다.");
+      if (user.deactivatedAt) {
+        const reactivationToken = await this.foAccountService.createReactivationToken(user.userId, deviceId);
+        return { status: FoSigninStatus.ReactivationRequired, reactivationToken };
+      }
+      const tokenPayload = await this.authService.issueTokensForUser(user, deviceId, store, signinStartedAt);
+      return { status: FoSigninStatus.SignedIn, tokenPayload };
     });
   };
 

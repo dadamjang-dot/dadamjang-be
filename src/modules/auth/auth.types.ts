@@ -94,4 +94,6 @@ export class AuthViewer {
   email!: string;
   @Field()
   role!: string;
+  @Field()
+  hasPassword!: boolean;
 }

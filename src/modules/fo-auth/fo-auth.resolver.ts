@@ -9,6 +9,7 @@ import { TokenPayload } from "src/modules/auth/auth.types";
 import { FoAuthService } from "./fo-auth.service";
 import {
   FindFoEmailPayload,
+  FoSigninResult,
   MarketingConsentPayload,
   SigninFoInput,
   SignupConsentDocument,
@@ -19,10 +20,10 @@ import {
 export class FoAuthResolver {
   constructor(private readonly service: FoAuthService) {}
 
-  @Mutation(() => TokenPayload)
+  @Mutation(() => FoSigninResult)
   async signinFo(@Args("input") input: SigninFoInput, @Context("req") req: Request, @Context("res") res: Response) {
     const result = await this.service.signin(input, deviceIdFromRequest(req), requestOriginFromRequest(req));
-    setTokenCookies(res, result);
+    if ("tokenPayload" in result && result.tokenPayload) setTokenCookies(res, result.tokenPayload);
     return result;
   }
 

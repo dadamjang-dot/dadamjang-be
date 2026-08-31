@@ -271,7 +271,7 @@ export class EmailRepository {
         delivery.kind === EmailDeliveryKind.SignupCode
           ? { email: delivery.email }
           : await tx.query.users.findFirst({ where: eq(users.email, delivery.email) });
-      if (!user) {
+      if (!user || ("password" in user && !user.password)) {
         await tx
           .update(emailDeliveryOutbox)
           .set({ ...redactedDelivery, claimToken: null, claimedAt: null, status: "SUPPRESSED", updatedAt: now })
@@ -513,7 +513,7 @@ export class EmailRepository {
       const userId = linkProof?.userId ?? emailProof?.userId;
       if (!userId) return false;
       const [user] = await tx.select().from(users).where(eq(users.userId, userId)).for("update");
-      if (!user) return false;
+      if (!user?.password) return false;
       const now = new Date();
       const [consumedProof] = linkProof
         ? await tx

@@ -4,6 +4,7 @@ import { UserRole } from "src/auth/role";
 import { AdmissionLimiter, type RequestOrigin } from "src/modules/admission/admission-limiter";
 import { AuthService } from "src/modules/auth/auth.service";
 import { EmailService } from "src/modules/email/email.service";
+import { FoAccountService } from "src/modules/fo-account/fo-account.service";
 import { InvalidFoAuthProofError } from "./fo-auth.error";
 import { FoAuthService } from "./fo-auth.service";
 import { KakaoFlowRepository } from "./kakao-flow.repository";
@@ -17,6 +18,9 @@ const user = {
   role: UserRole.User,
   createdAt: new Date(),
   updatedAt: new Date(),
+  deactivatedAt: null,
+  scheduledAnonymizationAt: null,
+  anonymizedAt: null,
 };
 
 const callbackToken = "token-seen-only-by-device-b";
@@ -39,7 +43,7 @@ const createService = () => {
         if (deviceIdHash !== hashToken("device-b") || presentedCallbackToken !== callbackToken || consumed)
           throw new InvalidFoAuthProofError();
         consumed = true;
-        return { kind: "existing" as const, tokenPayload: await issueTokens(user, {}) };
+        return { kind: "existing" as const, result: await issueTokens(user, {}) };
       },
     ),
   } as unknown as KakaoFlowRepository;
@@ -59,6 +63,7 @@ const createService = () => {
       { normalizeEmail: (email: string) => email } as EmailService,
       {} as ConfigService,
       { assertAllowed: jest.fn().mockResolvedValue(undefined) } as unknown as AdmissionLimiter,
+      { createReactivationToken: jest.fn() } as unknown as FoAccountService,
     ),
   };
 };
@@ -84,6 +89,7 @@ describe("KakaoFlowService", () => {
       emailService: EmailService,
       configService: ConfigService,
       admissionLimiter: AdmissionLimiter,
+      foAccountService: FoAccountService,
     ) => KakaoFlowService;
     const service = new Service(
       repository,
@@ -92,6 +98,7 @@ describe("KakaoFlowService", () => {
       {} as EmailService,
       { get: () => undefined } as unknown as ConfigService,
       admissionLimiter,
+      { createReactivationToken: jest.fn() } as unknown as FoAccountService,
     );
     const start = service.start as unknown as (deviceId: string, origin: RequestOrigin) => Promise<object>;
 
@@ -130,5 +137,30 @@ describe("KakaoFlowService", () => {
       status: "SIGNED_IN",
     });
     await expect(completeLogin("flow-id", "device-b", callbackToken)).rejects.toThrow();
+  });
+
+  it("creates a Kakao-only account without a password", async () => {
+    const completeSignup = jest.fn().mockResolvedValue({ role: UserRole.User });
+    const repository = { completeSignup } as unknown as KakaoFlowRepository;
+    const service = new KakaoFlowService(
+      repository,
+      { issueTokensForUser: jest.fn().mockResolvedValue({ role: UserRole.User }) } as unknown as AuthService,
+      { assertSignupConsents: jest.fn().mockResolvedValue(undefined) } as unknown as FoAuthService,
+      { normalizeEmail: (email: string) => email } as EmailService,
+      {} as ConfigService,
+      { assertAllowed: jest.fn().mockResolvedValue(undefined) } as unknown as AdmissionLimiter,
+      { createReactivationToken: jest.fn() } as unknown as FoAccountService,
+    );
+
+    await service.completeSignup(
+      {
+        kakaoSignupToken: "signup-token",
+        identityVerificationToken: "identity-token",
+        consents: [],
+      },
+      "device",
+    );
+
+    expect(completeSignup.mock.calls[0]?.[0]).toMatchObject({ password: null });
   });
 });

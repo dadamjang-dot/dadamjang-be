@@ -1,5 +1,6 @@
 import * as bcrypt from "bcrypt";
 import { AdmissionLimiter, type RequestOrigin } from "src/modules/admission/admission-limiter";
+import { hashToken } from "src/common/security/token-hash";
 import { AuthErrorMessage } from "./auth.error";
 import { AuthService } from "./auth.service";
 import { AuthPortal } from "./auth.types";
@@ -19,6 +20,9 @@ const user = {
   role: "USER",
   createdAt: new Date(),
   updatedAt: new Date(),
+  deactivatedAt: null,
+  scheduledAnonymizationAt: null,
+  anonymizedAt: null,
 };
 
 const createService = (repository: object, emailService: object = {}) =>
@@ -170,6 +174,40 @@ describe("AuthService", () => {
     ).rejects.toThrow(AuthErrorMessage.AuthRequired);
   });
 
+  it("uses the dummy password comparison for a passwordless account", async () => {
+    const compare = jest.mocked(bcrypt.compare).mockResolvedValue(false as never);
+    const service = createService(
+      {
+        signinStartedAt: jest.fn().mockResolvedValue(new Date()),
+        findByUserid: jest.fn().mockResolvedValue({ ...user, password: null }),
+      },
+      { normalizeUserid: (value: string) => value },
+    );
+
+    try {
+      await expect(
+        service.signin({ userid: "user", password: "password", portal: AuthPortal.FO }, "device", {
+          ip: "unknown",
+        }),
+      ).rejects.toThrow(AuthErrorMessage.AuthRequired);
+      expect(compare).toHaveBeenCalledWith("password", expect.stringMatching(/^\$2b\$/));
+    } finally {
+      compare.mockImplementation(actualCompare);
+    }
+  });
+
+  it("reports whether the viewer has a password", async () => {
+    const service = createService({
+      findViewer: jest
+        .fn()
+        .mockResolvedValueOnce({ ...user, hasPassword: true })
+        .mockResolvedValueOnce({ ...user, password: null, hasPassword: false }),
+    });
+
+    await expect(service.getViewer(user.userId)).resolves.toMatchObject({ hasPassword: true });
+    await expect(service.getViewer(user.userId)).resolves.toMatchObject({ hasPassword: false });
+  });
+
   it("rejects expired and invalid refresh tokens", async () => {
     const expired = createService({
       findRefreshToken: jest.fn().mockResolvedValue({ refreshToken: "hash", refreshTokenExp: new Date(0) }),
@@ -184,6 +222,29 @@ describe("AuthService", () => {
       hasRecentRotation: jest.fn().mockResolvedValue(false),
     });
     await expect(invalid.refresh("user-1", "device", "token")).rejects.toThrow(AuthErrorMessage.AuthRequired);
+  });
+
+  it("rejects refresh after the account is deactivated", async () => {
+    const rotateRefreshToken = jest.fn();
+    const service = new AuthService(
+      {
+        findRefreshToken: jest.fn().mockResolvedValue({
+          refreshToken: hashToken("refresh-token"),
+          refreshTokenExp: new Date(Date.now() + 60_000),
+        }),
+        findUser: jest.fn().mockResolvedValue({ ...user, deactivatedAt: new Date() }),
+        rotateRefreshToken,
+      } as never,
+      { signAsync: jest.fn(), decode: jest.fn() } as never,
+      {} as never,
+      {} as never,
+      {} as never,
+    );
+
+    await expect(service.refresh(user.userId, "device", "refresh-token")).rejects.toThrow(
+      AuthErrorMessage.AuthRequired,
+    );
+    expect(rotateRefreshToken).not.toHaveBeenCalled();
   });
 
   it("deletes the current device refresh token on logout", async () => {

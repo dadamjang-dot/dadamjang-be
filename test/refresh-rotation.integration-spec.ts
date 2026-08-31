@@ -11,7 +11,7 @@ const signinFo = (app: INestApplication, deviceId: string) =>
     .post("/graphql")
     .set("x-device-id", deviceId)
     .send({
-      query: `mutation SigninFo($input: SigninFoInput!) { signinFo(input: $input) { refreshToken } }`,
+      query: `mutation SigninFo($input: SigninFoInput!) { signinFo(input: $input) { tokenPayload { refreshToken } } }`,
       variables: { input: { email: "integration@example.test", password: "IntegrationPassword123!" } },
     });
 
@@ -49,7 +49,7 @@ describe("refresh rotation PostgreSQL integration", () => {
   it("rotates a refresh token exactly once under concurrent requests", async () => {
     const deviceId = "fo-refresh-device";
     const signedIn = await signinFo(app, deviceId);
-    const refreshToken = signedIn.body.data.signinFo.refreshToken as string;
+    const refreshToken = signedIn.body.data.signinFo.tokenPayload.refreshToken as string;
     const refresh = () => refreshFo(app, refreshToken);
 
     const responses = await Promise.all([refresh(), refresh()]);
@@ -95,7 +95,7 @@ describe("refresh rotation PostgreSQL integration", () => {
   it("classifies a predecessor older than the former ten-second window as transient", async () => {
     const deviceId = "fo-late-refresh-device";
     const signedIn = await signinFo(app, deviceId);
-    const initialRefreshToken = signedIn.body.data.signinFo.refreshToken as string;
+    const initialRefreshToken = signedIn.body.data.signinFo.tokenPayload.refreshToken as string;
     const rotated = await refreshFo(app, initialRefreshToken);
     expect(rotated.body.errors).toBeUndefined();
     await pool.query(
@@ -114,7 +114,7 @@ describe("refresh rotation PostgreSQL integration", () => {
   it("rolls back the winning refresh CAS when predecessor insertion fails", async () => {
     const deviceId = "fo-atomic-refresh-device";
     const signedIn = await signinFo(app, deviceId);
-    const refreshToken = signedIn.body.data.signinFo.refreshToken as string;
+    const refreshToken = signedIn.body.data.signinFo.tokenPayload.refreshToken as string;
     await pool.query(`
       CREATE FUNCTION reject_test_rotation_marker() RETURNS trigger AS $$
       BEGIN
@@ -153,7 +153,7 @@ describe("refresh rotation PostgreSQL integration", () => {
   it("retains multiple predecessor generations without returning successor tokens", async () => {
     const deviceId = "fo-refresh-history-device";
     const signedIn = await signinFo(app, deviceId);
-    const r0 = signedIn.body.data.signinFo.refreshToken as string;
+    const r0 = signedIn.body.data.signinFo.tokenPayload.refreshToken as string;
     const firstRotation = await refreshFo(app, r0);
     const r1 = firstRotation.body.data.refresh.refreshToken as string;
     const secondRotation = await refreshFo(app, r1);
@@ -180,7 +180,7 @@ describe("refresh rotation PostgreSQL integration", () => {
   it("clears predecessor history when the current session is revoked", async () => {
     const deviceId = "fo-revoked-refresh-device";
     const signedIn = await signinFo(app, deviceId);
-    const r0 = signedIn.body.data.signinFo.refreshToken as string;
+    const r0 = signedIn.body.data.signinFo.tokenPayload.refreshToken as string;
     const firstRotation = await refreshFo(app, r0);
     const r1 = firstRotation.body.data.refresh.refreshToken as string;
 
@@ -201,7 +201,7 @@ describe("refresh rotation PostgreSQL integration", () => {
   it("clears predecessor history when sign-in replaces the device session", async () => {
     const deviceId = "fo-replaced-refresh-device";
     const signedIn = await signinFo(app, deviceId);
-    const r0 = signedIn.body.data.signinFo.refreshToken as string;
+    const r0 = signedIn.body.data.signinFo.tokenPayload.refreshToken as string;
     const firstRotation = await refreshFo(app, r0);
     expect(firstRotation.body.errors).toBeUndefined();
     await pool.query(
@@ -228,7 +228,7 @@ describe("refresh rotation PostgreSQL integration", () => {
   it("cleans expired predecessor history in batches of at most 100", async () => {
     const deviceId = "fo-refresh-cleanup-device";
     const signedIn = await signinFo(app, deviceId);
-    const r0 = signedIn.body.data.signinFo.refreshToken as string;
+    const r0 = signedIn.body.data.signinFo.tokenPayload.refreshToken as string;
     await pool.query(
       `INSERT INTO "refreshTokenRotationMarker" ("userId", "deviceId", "rotationKey", "expiresAt")
        SELECT $1, $2, encode(sha256(('expired-' || value)::bytea), 'hex'), clock_timestamp() - interval '1 second'

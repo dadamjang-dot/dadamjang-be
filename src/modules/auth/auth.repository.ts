@@ -48,6 +48,20 @@ export class AuthRepository {
     this.db.query.users.findFirst({ where: eq(users.userid, userid) });
   findUser = (userId: string): Promise<User | undefined> =>
     this.db.query.users.findFirst({ where: eq(users.userId, userId) });
+  findViewer = async (userId: string) =>
+    (
+      await this.db
+        .select({
+          userId: users.userId,
+          userid: users.userid,
+          email: users.email,
+          role: users.role,
+          hasPassword: sql<boolean>`${users.password} IS NOT NULL`,
+        })
+        .from(users)
+        .where(eq(users.userId, userId))
+        .limit(1)
+    )[0];
   findRefreshToken = (
     userId: string,
     deviceId: string,

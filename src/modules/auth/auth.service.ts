@@ -46,12 +46,13 @@ export class AuthService {
     );
     const signinStartedAt = await this.repository.signinStartedAt();
     const user = await this.repository.findByUserid(userid);
-    if (!user) {
+    if (!user || user.password === null) {
       await bcrypt.compare(input.password, invalidPasswordHash);
       throw new CustomUnauthorizedException(AuthErrorMessage.AuthRequired);
     }
+    const passwordHash = user.password;
     return this.withSigninLock(user.userId, deviceId, async (store) => {
-      if (!(await bcrypt.compare(input.password, user.password)))
+      if (!(await bcrypt.compare(input.password, passwordHash)))
         throw new CustomUnauthorizedException(AuthErrorMessage.AuthRequired);
       this.assertPortalRole((user as User & { role?: UserRoleValue }).role ?? UserRole.User, input.portal);
       return this.issueTokensForUser(user, deviceId, store, signinStartedAt);
@@ -71,6 +72,7 @@ export class AuthService {
     }
     const user = await this.repository.findUser(userId);
     if (!user) throw new CustomUnauthorizedException(AuthErrorMessage.AuthRequired);
+    this.assertActiveUser(user);
     const tokens = await this.createTokensForUser(user, deviceId);
     const rotation = await this.repository.rotateRefreshToken({
       userId,
@@ -95,7 +97,7 @@ export class AuthService {
       throw new CustomUnauthorizedException(AuthErrorMessage.AuthRequired);
     return true;
   };
-  getViewer = async (userId: string) => this.repository.findUser(userId);
+  getViewer = async (userId: string) => this.repository.findViewer(userId);
   withSigninLock = async <T>(userId: string, deviceId: string, action: (store: RefreshTokenStore) => Promise<T>) => {
     const result = await this.repository.withSigninLock(userId, deviceId, action);
     if (!result.acquired) throw new CustomConflictException(AuthErrorMessage.SessionChanged);
@@ -103,6 +105,7 @@ export class AuthService {
   };
   signinStartedAt = () => this.repository.signinStartedAt();
   issueTokensForUser = async (user: User, deviceId: string, store?: RefreshTokenStore, signinStartedAt?: Date) => {
+    this.assertActiveUser(user);
     const previous = await this.repository.findRefreshToken(user.userId, deviceId, store);
     const tokens = await this.createTokensForUser(user, deviceId);
     const saved = await this.repository.saveRefreshToken(
@@ -155,5 +158,8 @@ export class AuthService {
       (portal === AuthPortal.PARTNER && role === UserRole.Partner) ||
       (portal === AuthPortal.BO && role === UserRole.Admin);
     if (!allowed) throw new CustomUnauthorizedException(AuthErrorMessage.AuthRequired);
+  };
+  private assertActiveUser = (user: User) => {
+    if (user.deactivatedAt || user.anonymizedAt) throw new CustomUnauthorizedException(AuthErrorMessage.AuthRequired);
   };
 }

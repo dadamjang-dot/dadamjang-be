@@ -3,6 +3,7 @@ import { AdmissionLimiter, type RequestOrigin } from "src/modules/admission/admi
 import { UserRole } from "src/auth/role";
 import { AuthService } from "src/modules/auth/auth.service";
 import { EmailService } from "src/modules/email/email.service";
+import { FoAccountService } from "src/modules/fo-account/fo-account.service";
 import { FoAuthRepository } from "./fo-auth.repository";
 import { FoAuthService } from "./fo-auth.service";
 
@@ -21,6 +22,9 @@ const user = {
   role: UserRole.User,
   createdAt: new Date(),
   updatedAt: new Date(),
+  deactivatedAt: null,
+  scheduledAnonymizationAt: null,
+  anonymizedAt: null,
 };
 
 const createService = (repository: object, authService: object, emailService: object, admissionLimiter: object) => {
@@ -29,12 +33,14 @@ const createService = (repository: object, authService: object, emailService: ob
     authService: AuthService,
     emailService: EmailService,
     admissionLimiter: AdmissionLimiter,
+    foAccountService: FoAccountService,
   ) => FoAuthService;
   return new Service(
     repository as FoAuthRepository,
     authService as AuthService,
     emailService as EmailService,
     admissionLimiter as AdmissionLimiter,
+    { createReactivationToken: jest.fn() } as unknown as FoAccountService,
   );
 };
 
@@ -90,6 +96,25 @@ describe("FoAuthService", () => {
         ],
         "이메일 또는 비밀번호가 올바르지 않습니다.",
       );
+    } finally {
+      compare.mockImplementation(actualCompare);
+    }
+  });
+
+  it("returns the generic authentication error for a passwordless account", async () => {
+    const compare = jest.mocked(bcrypt.compare).mockResolvedValue(false as never);
+    const service = createService(
+      { findByEmail: jest.fn().mockResolvedValue({ ...user, password: null }) },
+      { signinStartedAt: jest.fn().mockResolvedValue(new Date()) },
+      { normalizeEmail: (value: string) => value },
+      { assertAllowed: jest.fn().mockResolvedValue(undefined) },
+    );
+
+    try {
+      await expect(
+        service.signin({ email: user.email, password: "password" }, "device", { ip: "127.0.0.1" }),
+      ).rejects.toMatchObject({ message: "이메일 또는 비밀번호가 올바르지 않습니다." });
+      expect(compare).toHaveBeenCalledWith("password", expect.stringMatching(/^\$2b\$/));
     } finally {
       compare.mockImplementation(actualCompare);
     }

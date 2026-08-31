@@ -253,11 +253,11 @@ describe("Admin GraphQL integration", () => {
       .post("/graphql")
       .set("x-device-id", "approved-partner-signin-fo")
       .send({
-        query: `mutation SigninFo($input: SigninFoInput!) { signinFo(input: $input) { role } }`,
+        query: `mutation SigninFo($input: SigninFoInput!) { signinFo(input: $input) { tokenPayload { role } } }`,
         variables: { input: { email: ADMIN_FIXTURE.partnerOwnerEmail, password: ADMIN_FIXTURE.password } },
       });
     expect(signinFo.body.errors).toBeUndefined();
-    expect(signinFo.body.data.signinFo.role).toBe("PARTNER");
+    expect(signinFo.body.data.signinFo.tokenPayload.role).toBe("PARTNER");
 
     const legacyFoSignin = await request(app.getHttpServer())
       .post("/graphql")

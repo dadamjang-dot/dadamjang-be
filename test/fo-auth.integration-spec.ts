@@ -1,4 +1,5 @@
 import type { INestApplication } from "@nestjs/common";
+import * as bcrypt from "bcrypt";
 import type { Pool } from "pg";
 import request from "supertest";
 import { createApp } from "src/app";
@@ -185,20 +186,98 @@ describe("FO auth GraphQL integration", () => {
       .post("/graphql")
       .set("x-device-id", "fo-signin-device")
       .send({
-        query: `mutation SigninFo($input: SigninFoInput!) { signinFo(input: $input) { accessToken role } }`,
+        query: `mutation SigninFo($input: SigninFoInput!) {
+          signinFo(input: $input) { status tokenPayload { accessToken role } reactivationToken }
+        }`,
         variables: { input: { email: " INTEGRATION@EXAMPLE.TEST ", password: "IntegrationPassword123!" } },
       });
     expect(success.body.errors).toBeUndefined();
-    expect(success.body.data.signinFo.role).toBe("USER");
+    expect(success.body.data.signinFo).toEqual({
+      status: "SIGNED_IN",
+      tokenPayload: { accessToken: expect.any(String), role: "USER" },
+      reactivationToken: null,
+    });
 
     const rejected = await request(app.getHttpServer())
       .post("/graphql")
       .set("x-device-id", "fo-signin-device")
       .send({
-        query: `mutation SigninFo($input: SigninFoInput!) { signinFo(input: $input) { role } }`,
+        query: `mutation SigninFo($input: SigninFoInput!) { signinFo(input: $input) { status } }`,
         variables: { input: { email: "missing@example.test", password: "wrong-password" } },
       });
     expect(rejected.body.errors[0].message).toBe("이메일 또는 비밀번호가 올바르지 않습니다.");
+  });
+
+  it("returns reactivation instead of a session for a deactivated email account", async () => {
+    await pool.query(
+      `UPDATE "users"
+       SET "deactivatedAt" = now(), "scheduledAnonymizationAt" = now() + interval '30 days'
+       WHERE "userId" = $1`,
+      [FIXTURE.userId],
+    );
+    const response = await request(app.getHttpServer())
+      .post("/graphql")
+      .set("x-device-id", "deactivated-email-device")
+      .send({
+        query: `mutation SigninFo($input: SigninFoInput!) {
+          signinFo(input: $input) { status tokenPayload { accessToken } reactivationToken }
+        }`,
+        variables: { input: { email: "integration@example.test", password: FIXTURE.password } },
+      });
+
+    expect(response.body.errors).toBeUndefined();
+    expect(response.body.data.signinFo).toEqual({
+      status: "REACTIVATION_REQUIRED",
+      tokenPayload: null,
+      reactivationToken: expect.any(String),
+    });
+    const state = await pool.query<{ sessions: number; tokens: number }>(
+      `SELECT
+        (SELECT count(*)::int FROM "refreshToken" WHERE "userId" = $1) AS sessions,
+        (SELECT count(*)::int FROM "accountReactivationTokens" WHERE "userId" = $1 AND "deviceIdHash" = $2) AS tokens`,
+      [FIXTURE.userId, hashToken("deactivated-email-device")],
+    );
+    expect(state.rows[0]).toEqual({ sessions: 0, tokens: 1 });
+  });
+
+  it("does not reveal whether an email account is missing or passwordless", async () => {
+    await pool.query(`UPDATE "users" SET "password" = NULL WHERE "userId" = $1`, [FIXTURE.userId]);
+    const mutation = `mutation SigninFo($input: SigninFoInput!) { signinFo(input: $input) { status } }`;
+    const [passwordless, missing] = await Promise.all([
+      request(app.getHttpServer())
+        .post("/graphql")
+        .set("x-device-id", "passwordless-signin-device")
+        .send({ query: mutation, variables: { input: { email: "integration@example.test", password: "wrong" } } }),
+      request(app.getHttpServer())
+        .post("/graphql")
+        .set("x-device-id", "missing-signin-device")
+        .send({ query: mutation, variables: { input: { email: "missing@example.test", password: "wrong" } } }),
+    ]);
+
+    expect(passwordless.body.errors[0].message).toBe("이메일 또는 비밀번호가 올바르지 않습니다.");
+    expect(missing.body.errors[0].message).toBe("이메일 또는 비밀번호가 올바르지 않습니다.");
+  });
+
+  it("reports me.hasPassword from the current account state", async () => {
+    const signedIn = await request(app.getHttpServer())
+      .post("/graphql")
+      .set("x-device-id", "viewer-password-device")
+      .send({
+        query: `mutation SigninFo($input: SigninFoInput!) {
+          signinFo(input: $input) { tokenPayload { accessToken } }
+        }`,
+        variables: { input: { email: "integration@example.test", password: FIXTURE.password } },
+      });
+    const accessToken = signedIn.body.data.signinFo.tokenPayload.accessToken as string;
+    const me = () =>
+      request(app.getHttpServer())
+        .post("/graphql")
+        .set("authorization", `Bearer ${accessToken}`)
+        .send({ query: `query Me { me { hasPassword } }` });
+
+    await expect(me()).resolves.toMatchObject({ body: { data: { me: { hasPassword: true } } } });
+    await pool.query(`UPDATE "users" SET "password" = NULL WHERE "userId" = $1`, [FIXTURE.userId]);
+    await expect(me()).resolves.toMatchObject({ body: { data: { me: { hasPassword: false } } } });
   });
 
   it("allows only one overlapping sign-in to claim the same device session", async () => {
@@ -207,7 +286,9 @@ describe("FO auth GraphQL integration", () => {
         .post("/graphql")
         .set("x-device-id", "fo-concurrent-signin-device")
         .send({
-          query: `mutation SigninFo($input: SigninFoInput!) { signinFo(input: $input) { refreshToken } }`,
+          query: `mutation SigninFo($input: SigninFoInput!) {
+            signinFo(input: $input) { tokenPayload { refreshToken } }
+          }`,
           variables: { input: { email: "integration@example.test", password: "IntegrationPassword123!" } },
         });
 
@@ -260,11 +341,12 @@ describe("FO auth GraphQL integration", () => {
       });
     expect(response.body.errors).toBeUndefined();
     expect(response.body.data.signupFo.role).toBe("USER");
-    const created = await pool.query<{ userid: string; email: string }>(
-      `SELECT "userid", "email" FROM "users" WHERE "email" = 'new@example.test'`,
+    const created = await pool.query<{ userid: string; email: string; password: string }>(
+      `SELECT "userid", "email", "password" FROM "users" WHERE "email" = 'new@example.test'`,
     );
     expect(created.rows[0]?.userid).toMatch(/^member-[a-f0-9]{12}$/);
     expect(created.rows[0]?.email).toBe("new@example.test");
+    await expect(bcrypt.compare("Password123!", created.rows[0]?.password ?? "")).resolves.toBe(true);
   });
 
   it("rolls back FO account proofs when refresh-session persistence fails", async () => {
@@ -358,6 +440,57 @@ describe("FO auth GraphQL integration", () => {
       tokenPayload: { role: "USER" },
     });
     expect(rejected?.body.errors[0].message).toBe("카카오 로그인 흐름이 유효하지 않습니다.");
+  });
+
+  it("returns the exact reactivation result for a deactivated Kakao account", async () => {
+    const deviceId = "deactivated-kakao-device";
+    const flowId = "d0000000-0000-4000-8000-000000000010";
+    const callbackToken = "deactivated-kakao-callback";
+    await pool.query(
+      `UPDATE "users"
+       SET "deactivatedAt" = now(), "scheduledAnonymizationAt" = now() + interval '30 days'
+       WHERE "userId" = $1`,
+      [FIXTURE.userId],
+    );
+    await pool.query(
+      `INSERT INTO "authIdentity" ("userId", "provider", "providerUserId") VALUES ($1, 'kakao', 'kakao-deactivated')`,
+      [FIXTURE.userId],
+    );
+    await pool.query(
+      `INSERT INTO "kakaoLoginFlows"
+        ("flowId", "deviceIdHash", "providerUserId", "email", "emailVerified", "userId", "status", "callbackTokenHash", "expiresAt", "callbackAt")
+       VALUES ($1, $2, 'kakao-deactivated', 'integration@example.test', true, $3, 'EXISTING_USER', $4, now() + interval '10 minutes', now())`,
+      [flowId, hashToken(deviceId), FIXTURE.userId, hashToken(callbackToken)],
+    );
+
+    const response = await request(app.getHttpServer())
+      .post("/graphql")
+      .set("x-device-id", deviceId)
+      .send({
+        query: `mutation CompleteKakaoLogin($input: CompleteKakaoLoginInput!) {
+          completeKakaoLogin(input: $input) {
+            status tokenPayload { accessToken } kakaoSignupToken email emailVerificationRequired reactivationToken
+          }
+        }`,
+        variables: { input: { flowId, callbackToken } },
+      });
+
+    expect(response.body.errors).toBeUndefined();
+    expect(response.body.data.completeKakaoLogin).toEqual({
+      status: "REACTIVATION_REQUIRED",
+      tokenPayload: null,
+      kakaoSignupToken: null,
+      email: null,
+      emailVerificationRequired: false,
+      reactivationToken: expect.any(String),
+    });
+    const state = await pool.query<{ sessions: number; tokens: number }>(
+      `SELECT
+        (SELECT count(*)::int FROM "refreshToken" WHERE "userId" = $1) AS sessions,
+        (SELECT count(*)::int FROM "accountReactivationTokens" WHERE "userId" = $1 AND "deviceIdHash" = $2) AS tokens`,
+      [FIXTURE.userId, hashToken(deviceId)],
+    );
+    expect(state.rows[0]).toEqual({ sessions: 0, tokens: 1 });
   });
 
   it("converges repeated anonymous starts onto one current row per device and purpose", async () => {
@@ -781,14 +914,21 @@ describe("FO auth GraphQL integration", () => {
     const responses = await Promise.all(attempts.map((attempt) => completeKakaoSignup(app, attempt)));
     expect(responses.filter(({ body }) => body.errors === undefined)).toHaveLength(1);
     expect(responses.filter(({ body }) => body.errors !== undefined)).toHaveLength(1);
-    const state = await pool.query<{ users: number; identities: number; links: number; sessions: number }>(
+    const state = await pool.query<{
+      users: number;
+      identities: number;
+      links: number;
+      sessions: number;
+      passwordless: number;
+    }>(
       `SELECT
         (SELECT count(*)::int FROM "users" WHERE "email" LIKE 'kakao-provider-%@example.test') AS users,
         (SELECT count(*)::int FROM "verifiedIdentities" WHERE "ciHash" LIKE 'kakao-provider-ci-%') AS identities,
         (SELECT count(*)::int FROM "authIdentity" WHERE "providerUserId" = 'kakao-shared-provider') AS links,
-        (SELECT count(*)::int FROM "refreshToken" WHERE "deviceId" LIKE 'kakao-provider-race-%') AS sessions`,
+        (SELECT count(*)::int FROM "refreshToken" WHERE "deviceId" LIKE 'kakao-provider-race-%') AS sessions,
+        (SELECT count(*)::int FROM "users" WHERE "email" LIKE 'kakao-provider-%@example.test' AND "password" IS NULL) AS passwordless`,
     );
-    expect(state.rows[0]).toEqual({ users: 1, identities: 1, links: 1, sessions: 1 });
+    expect(state.rows[0]).toEqual({ users: 1, identities: 1, links: 1, sessions: 1, passwordless: 1 });
   });
 
   it("converges concurrent Kakao signups with the same CI on one account", async () => {

@@ -1,6 +1,5 @@
 import { Injectable } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
-import * as bcrypt from "bcrypt";
 import { randomBytes, randomUUID } from "crypto";
 import { CustomBadRequestException, CustomUnauthorizedException } from "src/common/errors/custom-exceptions";
 import { hasDatabaseErrorCode } from "src/common/errors/database-error";
@@ -10,6 +9,7 @@ import { AdmissionLimiter, type RequestOrigin } from "src/modules/admission/admi
 import type { KakaoProfile } from "src/modules/auth/auth.types";
 import { AuthService } from "src/modules/auth/auth.service";
 import { EmailService } from "src/modules/email/email.service";
+import { FoAccountService } from "src/modules/fo-account/fo-account.service";
 import { InvalidFoAuthProofError } from "./fo-auth.error";
 import { FoAuthService } from "./fo-auth.service";
 import type { CompleteKakaoSignupFoInput } from "./fo-auth.types";
@@ -24,6 +24,7 @@ export class KakaoFlowService {
     private readonly emailService: EmailService,
     private readonly configService: ConfigService,
     private readonly admissionLimiter: AdmissionLimiter,
+    private readonly foAccountService: FoAccountService,
   ) {}
 
   start = async (deviceId: string, origin: RequestOrigin) => {
@@ -66,16 +67,29 @@ export class KakaoFlowService {
         signupToken,
         async (user, store) => {
           if (!hasBuyerCapability(user.role)) throw new InvalidFoAuthProofError();
-          return this.authService.issueTokensForUser(user, deviceId, store);
+          if (user.anonymizedAt) throw new InvalidFoAuthProofError();
+          if (user.deactivatedAt) {
+            const reactivationToken = await this.foAccountService.createReactivationToken(user.userId, deviceId);
+            return {
+              status: "REACTIVATION_REQUIRED" as const,
+              tokenPayload: null,
+              kakaoSignupToken: null,
+              email: null,
+              emailVerificationRequired: false,
+              reactivationToken,
+            };
+          }
+          return {
+            status: "SIGNED_IN" as const,
+            tokenPayload: await this.authService.issueTokensForUser(user, deviceId, store),
+            kakaoSignupToken: null,
+            email: null,
+            emailVerificationRequired: false,
+            reactivationToken: null,
+          };
         },
       );
-      if (result.kind === "existing") {
-        return {
-          status: "SIGNED_IN" as const,
-          tokenPayload: result.tokenPayload,
-          emailVerificationRequired: false,
-        };
-      }
+      if (result.kind === "existing") return result.result;
       return {
         status: "SIGNUP_REQUIRED" as const,
         kakaoSignupToken: signupToken,
@@ -104,7 +118,7 @@ export class KakaoFlowService {
           deviceIdHash: hashToken(deviceId),
           userId: randomUUID(),
           userid: `member-${randomBytes(6).toString("hex")}`,
-          password: await bcrypt.hash(randomBytes(32).toString("base64url"), 10),
+          password: null,
           consents: input.consents,
         },
         async (user, store) => {

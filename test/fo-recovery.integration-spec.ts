@@ -150,6 +150,27 @@ describe("FO account recovery GraphQL integration", () => {
     expect(tokens.rowCount).toBe(0);
   });
 
+  it("does not let a stale recovery proof add a password to a passwordless account", async () => {
+    await pool.query(`UPDATE "users" SET "password" = NULL WHERE "userId" = $1`, [FIXTURE.userId]);
+    await pool.query(
+      `INSERT INTO "passwordResetToken" ("tokenHash", "userId", "expiresAt")
+       VALUES ($1, $2, now() + interval '10 minutes')`,
+      [hashToken("stale-passwordless-proof"), FIXTURE.userId],
+    );
+
+    const response = await resetPassword(app, "stale-passwordless-proof", "AddedPassword123!");
+
+    expect(response.body.errors[0].message).toBe(EmailErrorMessage.InvalidRecoveryToken);
+    const state = await pool.query<{ password: string | null; usedAt: Date | null }>(
+      `SELECT u."password", p."usedAt"
+       FROM "users" u
+       JOIN "passwordResetToken" p ON p."userId" = u."userId"
+       WHERE u."userId" = $1 AND p."tokenHash" = $2`,
+      [FIXTURE.userId, hashToken("stale-passwordless-proof")],
+    );
+    expect(state.rows[0]).toEqual({ password: null, usedAt: null });
+  });
+
   it("revokes every sibling password-recovery proof", async () => {
     const verificationId = "e0000000-0000-4000-8000-000000000001";
     const activeCodeId = "e0000000-0000-4000-8000-000000000002";
