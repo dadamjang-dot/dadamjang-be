@@ -8,6 +8,7 @@ import { FIXTURE } from "src/database/fixtures";
 import { Database, DRIZZLE } from "src/modules/database/database.module";
 import { NotificationRepository } from "src/modules/notification/notification.repository";
 import { NotificationService } from "src/modules/notification/notification.service";
+import { FoPushPlatform } from "src/modules/notification/notification.types";
 import { resetTestFixtures, testPool } from "./support/database";
 
 const SECOND_USER = {
@@ -61,6 +62,12 @@ const waitFor = async (condition: () => Promise<boolean>) => {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   throw new Error("Timed out waiting for notification lock barrier");
+};
+
+const postgresErrorCode = (value: unknown): string | null => {
+  if (typeof value !== "object" || value === null) return null;
+  if ("code" in value && typeof value.code === "string") return value.code;
+  return "cause" in value ? postgresErrorCode(value.cause) : null;
 };
 
 const startPushDeviceBlocker = async (pool: Pool, pushDeviceIds: string | readonly string[]) => {
@@ -964,6 +971,129 @@ describe("FO notification GraphQL integration", () => {
     expect(await createdNotificationRows(pool, SECOND_USER.userId)).toEqual([expect.objectContaining({ dedupeKey })]);
     expect(await createdDeliveryRows(pool, FIXTURE.userId)).toEqual([{ dedupeKey, pushDeviceId: firstDeviceId }]);
     expect(await createdDeliveryRows(pool, SECOND_USER.userId)).toEqual([{ dedupeKey, pushDeviceId: secondDeviceId }]);
+  });
+
+  it("commits wish fanout with a cross-user device transfer without a deadlock", async () => {
+    await seedSecondUser(pool);
+    const highDeviceId = "ee000000-0000-4000-8000-000000000002";
+    const lowDeviceId = "11000000-0000-4000-8000-000000000002";
+    const installationId = "notification-wish-transfer-target";
+    const targetToken = "ExponentPushToken[notification-wish-transfer-target]";
+    const transferredToken = "ExponentPushToken[notification-wish-transfer-source]";
+    await pool.query(
+      `INSERT INTO "pushDevices"
+        ("pushDeviceId", "userId", "installationId", "expoPushToken", platform)
+       VALUES
+        ($1, $3, $4, $5, 'IOS'),
+        ($2, $6, 'notification-wish-transfer-source', $7, 'IOS')`,
+      [highDeviceId, lowDeviceId, FIXTURE.userId, installationId, targetToken, SECOND_USER.userId, transferredToken],
+    );
+    const highBlocker = await startPushDeviceBlocker(pool, highDeviceId);
+    const lowBlocker = await startPushDeviceBlocker(pool, lowDeviceId);
+    const skuUpdatedAt = new Date("2026-08-31T09:47:00.000Z");
+    const creation = db.transaction((tx) =>
+      notificationService.createWishRestock(tx, {
+        userIds: [FIXTURE.userId, SECOND_USER.userId],
+        productId: FIXTURE.productId,
+        skuUpdatedAt,
+      }),
+    );
+    await waitFor(async () => (await blockedQueries(pool, highBlocker.pid)).length === 1);
+    const transfer = db.transaction((tx) =>
+      notificationRepository.transferDevice(tx, {
+        userId: FIXTURE.userId,
+        installationId,
+        expoPushToken: transferredToken,
+        platform: FoPushPlatform.IOS,
+      }),
+    );
+    const outcomesPromise = Promise.allSettled([creation, transfer]);
+    let highReleased = false;
+    let lowReleased = false;
+    try {
+      await waitFor(async () => {
+        const [blockedByHigh, blockedByLow] = await Promise.all([
+          blockedQueries(pool, highBlocker.pid),
+          blockedQueries(pool, lowBlocker.pid),
+        ]);
+        return blockedByHigh.length + blockedByLow.length >= 2;
+      });
+      await releaseBlocker(highBlocker.client);
+      highReleased = true;
+      await waitFor(async () => (await blockedQueries(pool, lowBlocker.pid)).length >= 2);
+      await releaseBlocker(lowBlocker.client);
+      lowReleased = true;
+      const outcomes = await outcomesPromise;
+      expect(
+        outcomes.map((outcome) => (outcome.status === "rejected" ? postgresErrorCode(outcome.reason) : null)),
+      ).toEqual([null, null]);
+      expect(outcomes.map(({ status }) => status)).toEqual(["fulfilled", "fulfilled"]);
+    } finally {
+      if (!highReleased) await rollbackBlocker(highBlocker.client);
+      if (!lowReleased) await rollbackBlocker(lowBlocker.client);
+      await outcomesPromise;
+    }
+
+    const dedupeKey = `wish-stock:${FIXTURE.productId}:${skuUpdatedAt.toISOString()}`;
+    const expectedNotification = {
+      type: "WISH_RESTOCK",
+      title: "위시 상품이 다시 입고됐어요",
+      body: "품절되기 전에 확인해 보세요.",
+      route: `/product/${FIXTURE.productId}`,
+      entityId: FIXTURE.productId,
+      dedupeKey,
+    };
+    expect(await createdNotificationRows(pool, FIXTURE.userId)).toEqual([expectedNotification]);
+    expect(await createdNotificationRows(pool, SECOND_USER.userId)).toEqual([expectedNotification]);
+    expect(await createdDeliveryRows(pool, FIXTURE.userId)).toEqual([{ dedupeKey, pushDeviceId: highDeviceId }]);
+    expect(await createdDeliveryRows(pool, SECOND_USER.userId)).toEqual([{ dedupeKey, pushDeviceId: lowDeviceId }]);
+    const deliveries = await pool.query<{
+      userId: string;
+      pushDeviceId: string;
+      status: string;
+      lastError: string | null;
+    }>(
+      `SELECT notification."userId", outbox."pushDeviceId", outbox.status, outbox."lastError"
+       FROM "pushOutbox" outbox
+       INNER JOIN notifications notification ON notification."notificationId" = outbox."notificationId"
+       ORDER BY notification."userId"`,
+    );
+    expect(deliveries.rows).toEqual([
+      { userId: FIXTURE.userId, pushDeviceId: highDeviceId, status: "FAILED", lastError: "DEVICE_TRANSFERRED" },
+      { userId: SECOND_USER.userId, pushDeviceId: lowDeviceId, status: "FAILED", lastError: "DEVICE_TRANSFERRED" },
+    ]);
+    const devices = await pool.query<{
+      pushDeviceId: string;
+      userId: string;
+      installationId: string;
+      expoPushToken: string;
+      disabledAt: Date | null;
+      disabledReason: string | null;
+    }>(
+      `SELECT "pushDeviceId", "userId", "installationId", "expoPushToken", "disabledAt", "disabledReason"
+       FROM "pushDevices"
+       WHERE "pushDeviceId" = ANY($1::uuid[])
+       ORDER BY "pushDeviceId"`,
+      [[lowDeviceId, highDeviceId]],
+    );
+    expect(devices.rows).toEqual([
+      {
+        pushDeviceId: lowDeviceId,
+        userId: SECOND_USER.userId,
+        installationId: `retired-installation:${lowDeviceId}`,
+        expoPushToken: `retired-token:${lowDeviceId}`,
+        disabledAt: expect.any(Date),
+        disabledReason: "DEVICE_TRANSFERRED",
+      },
+      {
+        pushDeviceId: highDeviceId,
+        userId: FIXTURE.userId,
+        installationId,
+        expoPushToken: transferredToken,
+        disabledAt: null,
+        disabledReason: null,
+      },
+    ]);
   });
 
   it("serializes preference disable after in-flight creation and suppresses later delivery", async () => {

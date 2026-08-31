@@ -153,7 +153,7 @@ export class NotificationRepository {
       .where(
         or(eq(pushDevices.installationId, input.installationId), eq(pushDevices.expoPushToken, input.expoPushToken)),
       )
-      .orderBy(pushDevices.pushDeviceId)
+      .orderBy(pushDevices.userId, pushDevices.pushDeviceId)
       .for("update");
     const tokenDevice = devices.find(({ expoPushToken }) => expoPushToken === input.expoPushToken);
     if (tokenDevice?.disabledReason === "DEVICE_NOT_REGISTERED") return false;
