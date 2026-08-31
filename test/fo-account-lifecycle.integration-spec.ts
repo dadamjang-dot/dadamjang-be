@@ -131,6 +131,22 @@ const startUserBlocker = async (pool: Pool) => {
   }
 };
 
+const startAdvisoryBlocker = async (pool: Pool, value: string, seed: number) => {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query("SET LOCAL lock_timeout = '2s'; SET LOCAL statement_timeout = '30s'");
+    await client.query(`SELECT pg_advisory_xact_lock(hashtextextended($1, $2))`, [value, seed]);
+    const pid = (await client.query<{ pid: number }>(`SELECT pg_backend_pid() AS pid`)).rows[0]?.pid;
+    if (!pid) throw new Error("Failed to identify advisory blocker");
+    return { client, pid };
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    client.release();
+    throw error;
+  }
+};
+
 const blockedBy = async (pool: Pool, blockerPid: number) => {
   const result = await pool.query<{ count: number }>(
     `WITH RECURSIVE blocked(pid) AS (
@@ -349,8 +365,12 @@ describe("FO account lifecycle", () => {
 
     expect(recovered.body.errors).toBeUndefined();
     expect(recovered.body.data.reactivateFoAccount).toMatchObject({ role: "USER" });
-    expect(cookieValue(recovered, "access_token")).toBe(recovered.body.data.reactivateFoAccount.accessToken);
-    expect(cookieValue(recovered, "refresh_token")).toBe(recovered.body.data.reactivateFoAccount.refreshToken);
+    const accessToken = recovered.body.data.reactivateFoAccount.accessToken as string;
+    const refreshToken = recovered.body.data.reactivateFoAccount.refreshToken as string;
+    expect(accessToken).toMatch(/^[^.\s]+\.[^.\s]+\.[^.\s]+$/);
+    expect(refreshToken).toMatch(/^[^.\s]+\.[^.\s]+\.[^.\s]+$/);
+    expect(cookieValue(recovered, "access_token")).toBe(accessToken);
+    expect(cookieValue(recovered, "refresh_token")).toBe(refreshToken);
     const state = await pool.query<{
       deactivatedAt: Date | null;
       scheduledAnonymizationAt: Date | null;
@@ -370,6 +390,99 @@ describe("FO account lifecycle", () => {
       sessions: 1,
     });
     expect((await reactivate(app, token, deviceId)).body.data).toBeNull();
+  });
+
+  it("stamps a recovery token after a later deactivation commits to an older Kakao transaction", async () => {
+    const ownerDevice = "timestamp-race-owner";
+    const kakaoDevice = "timestamp-race-kakao";
+    const flowId = "d0000000-0000-4000-8000-000000000032";
+    const callbackToken = "timestamp-race-callback";
+    const signedIn = await signin(app, ownerDevice);
+    await pool.query(
+      `INSERT INTO "authIdentity" ("userId", "provider", "providerUserId") VALUES ($1, 'kakao', 'timestamp-race')`,
+      [FIXTURE.userId],
+    );
+    await pool.query(
+      `INSERT INTO "kakaoLoginFlows"
+        ("flowId", "deviceIdHash", "providerUserId", "email", "emailVerified", "userId", "status", "callbackTokenHash", "expiresAt", "callbackAt")
+       VALUES ($1, $2, 'timestamp-race', 'integration@example.test', true, $3, 'EXISTING_USER', $4, now() + interval '10 minutes', now())`,
+      [flowId, hashToken(kakaoDevice), FIXTURE.userId, hashToken(callbackToken)],
+    );
+    const blocker = await startAdvisoryBlocker(pool, hashToken(kakaoDevice), 0);
+    const kakaoRequest = completeKakaoLogin(app, flowId, callbackToken, kakaoDevice).then((response) => response);
+    let released = false;
+
+    try {
+      await waitFor(async () => (await blockedBy(pool, blocker.pid)) === 1);
+      const deactivationResponse = await deactivate(app, signedIn.body.data.signin.accessToken as string, ownerDevice);
+      expect(deactivationResponse.body.errors).toBeUndefined();
+      await releaseBlocker(blocker.client);
+      released = true;
+      const kakaoResponse = await kakaoRequest;
+      expect(kakaoResponse.body.errors).toBeUndefined();
+      expect(kakaoResponse.body.data.completeKakaoLogin).toMatchObject({
+        status: "REACTIVATION_REQUIRED",
+        tokenPayload: null,
+        reactivationToken: expect.any(String),
+      });
+      const token = kakaoResponse.body.data.completeKakaoLogin.reactivationToken as string;
+      const timestamps = await pool.query<{ currentCycle: boolean; tenMinutes: boolean }>(
+        `SELECT token."createdAt" >= users."deactivatedAt" AS "currentCycle",
+          token."expiresAt" = token."createdAt" + interval '10 minutes' AS "tenMinutes"
+         FROM "accountReactivationTokens" token
+         INNER JOIN "users" users ON users."userId" = token."userId"
+         WHERE token."tokenHash" = $1`,
+        [hashToken(token)],
+      );
+      expect(timestamps.rows[0]).toEqual({ currentCycle: true, tenMinutes: true });
+      const recovered = await reactivate(app, token, kakaoDevice);
+      expect(recovered.body.errors).toBeUndefined();
+      expect(recovered.body.data.reactivateFoAccount.accessToken).toMatch(/^[^.\s]+\.[^.\s]+\.[^.\s]+$/);
+      expect(recovered.body.data.reactivateFoAccount.refreshToken).toMatch(/^[^.\s]+\.[^.\s]+\.[^.\s]+$/);
+    } finally {
+      if (!released) {
+        await rollbackBlocker(blocker.client);
+        await Promise.allSettled([kakaoRequest]);
+      }
+    }
+  });
+
+  it("rejects a used recovery token while the account remains deactivated", async () => {
+    const deviceId = "used-reactivation-device";
+    const signedIn = await signin(app, deviceId);
+    await deactivate(app, signedIn.body.data.signin.accessToken, deviceId);
+    const required = await signinFo(app, deviceId);
+    const token = required.body.data.signinFo.reactivationToken as string;
+    const usedAt = (
+      await pool.query<{ usedAt: Date }>(
+        `UPDATE "accountReactivationTokens"
+         SET "usedAt" = clock_timestamp()
+         WHERE "tokenHash" = $1
+         RETURNING "usedAt"`,
+        [hashToken(token)],
+      )
+    ).rows[0]?.usedAt;
+    if (!usedAt) throw new Error("Failed to mark recovery token used");
+
+    const response = await reactivate(app, token, deviceId);
+
+    expect(response.body.data).toBeNull();
+    expect(response.body.errors[0].extensions.code).toBe("UNAUTHENTICATED");
+    expect(cookies(response)).toBeUndefined();
+    const state = await pool.query<{
+      deactivated: boolean;
+      deadlinePresent: boolean;
+      sessions: number;
+      usedAt: Date;
+    }>(
+      `SELECT "deactivatedAt" IS NOT NULL AS deactivated,
+        "scheduledAnonymizationAt" IS NOT NULL AS "deadlinePresent",
+        (SELECT count(*)::int FROM "refreshToken" WHERE "userId" = $1) AS sessions,
+        (SELECT "usedAt" FROM "accountReactivationTokens" WHERE "tokenHash" = $2) AS "usedAt"
+       FROM "users" WHERE "userId" = $1`,
+      [FIXTURE.userId, hashToken(token)],
+    );
+    expect(state.rows[0]).toEqual({ deactivated: true, deadlinePresent: true, sessions: 0, usedAt });
   });
 
   it("allows only one concurrent reactivation with the same token", async () => {
@@ -399,8 +512,12 @@ describe("FO account lifecycle", () => {
       expect(rejected[0]?.body.errors[0].extensions.code).toBe("UNAUTHENTICATED");
       expect(cookies(rejected[0] as request.Response)).toBeUndefined();
       const winner = successful[0] as request.Response;
-      expect(cookieValue(winner, "access_token")).toBe(winner.body.data.reactivateFoAccount.accessToken);
-      expect(cookieValue(winner, "refresh_token")).toBe(winner.body.data.reactivateFoAccount.refreshToken);
+      const accessToken = winner.body.data.reactivateFoAccount.accessToken as string;
+      const refreshToken = winner.body.data.reactivateFoAccount.refreshToken as string;
+      expect(accessToken).toMatch(/^[^.\s]+\.[^.\s]+\.[^.\s]+$/);
+      expect(refreshToken).toMatch(/^[^.\s]+\.[^.\s]+\.[^.\s]+$/);
+      expect(cookieValue(winner, "access_token")).toBe(accessToken);
+      expect(cookieValue(winner, "refresh_token")).toBe(refreshToken);
       const state = await pool.query<{
         deactivatedAt: Date | null;
         refreshToken: string;
@@ -416,7 +533,7 @@ describe("FO account lifecycle", () => {
       );
       expect(state.rows[0]).toEqual({
         used: 1,
-        refreshToken: hashToken(winner.body.data.reactivateFoAccount.refreshToken),
+        refreshToken: hashToken(refreshToken),
         deactivatedAt: null,
         scheduledAnonymizationAt: null,
       });

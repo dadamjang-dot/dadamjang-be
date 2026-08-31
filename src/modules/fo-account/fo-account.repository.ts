@@ -53,7 +53,8 @@ export class FoAccountRepository {
       tokenHash,
       userId,
       deviceIdHash,
-      expiresAt: sql`transaction_timestamp() + interval '10 minutes'`,
+      createdAt: sql`statement_timestamp()`,
+      expiresAt: sql`statement_timestamp() + interval '10 minutes'`,
     });
 
   reactivate = <T>(tokenHash: string, deviceIdHash: string, issueTokens: IssueTokens<T>) =>
