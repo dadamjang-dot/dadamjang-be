@@ -6,12 +6,15 @@ import sharp from "sharp";
 import { createApp } from "src/app";
 import { hashToken } from "src/common/security/token-hash";
 import { FIXTURE } from "src/database/fixtures";
+import { NotificationService } from "src/modules/notification/notification.service";
 import { PartnerService } from "src/modules/partner/partner.service";
 import { resetTestFixtures, testPool } from "./support/database";
 
 const validImageKey = "products/10000000-0000-4000-8000-000000000001/90000000-0000-4000-8000-000000000001.png";
 const pendingImageKey =
   "pending/products/10000000-0000-4000-8000-000000000001/90000000-0000-4000-8000-000000000003.png";
+const publishedSkuId = "80000000-0000-4000-8000-000000000003";
+const wishUserIds = ["10000000-0000-4000-8000-000000000011", "10000000-0000-4000-8000-000000000012"] as const;
 let pngBytes: Buffer;
 
 const seedEmailProof = async (pool: Pool, verificationId: string, email: string, token: string) => {
@@ -79,7 +82,7 @@ describe("partner catalog GraphQL integration", () => {
       .send({ query, variables })
       .expect(200);
 
-  const signin = async () => {
+  const signin = async (portal: "FO" | "PARTNER" = "PARTNER") => {
     const response = await request(app.getHttpServer())
       .post("/graphql")
       .set("x-device-id", "partner-integration-device")
@@ -88,7 +91,7 @@ describe("partner catalog GraphQL integration", () => {
           signin(input: $input) { accessToken }
         }`,
         variables: {
-          input: { userid: FIXTURE.userid, password: FIXTURE.password, portal: "PARTNER" },
+          input: { userid: FIXTURE.userid, password: FIXTURE.password, portal },
         },
       })
       .expect(200);
@@ -110,6 +113,65 @@ describe("partner catalog GraphQL integration", () => {
       stock: 5 + index,
     })),
   });
+
+  const updatePublishedProductSkus = async (
+    accessToken: string,
+    productId: string,
+    skus: { skuId: string; price: number; stock: number }[],
+  ) =>
+    graphql(
+      accessToken,
+      `
+        mutation UpdatePublishedProductSkus($input: UpdatePublishedProductSkusInput!) {
+          updatePublishedProductSkus(input: $input) {
+            productId
+            title
+            description
+            status
+            approvalStatus
+            skus {
+              skuId
+              code
+              optionName
+              price
+              stock
+            }
+          }
+        }
+      `,
+      { input: { productId, skus } },
+    );
+
+  const seedPublishedSku = async (input: { isActive?: boolean; price?: number; stock?: number } = {}) => {
+    await pool.query(
+      `INSERT INTO "productSkus"
+        ("skuId", "productId", "code", "colorId", "sizeId", "optionName", "price", "stock", "position", "isActive")
+       VALUES ($1, $2, 'INTEGRATION-TEE-L', $3, $4, 'Black / L', $5, $6, 1, $7)`,
+      [
+        publishedSkuId,
+        FIXTURE.productId,
+        FIXTURE.colorId,
+        FIXTURE.sizeId,
+        input.price ?? 20000,
+        input.stock ?? 0,
+        input.isActive ?? true,
+      ],
+    );
+  };
+
+  const seedWishers = async () => {
+    await pool.query(
+      `INSERT INTO "users" ("userId", "userid", "email", "password", "role")
+       VALUES
+        ($1, 'wish-user-1', 'wish-user-1@example.test', 'unused', 'USER'),
+        ($2, 'wish-user-2', 'wish-user-2@example.test', 'unused', 'USER')`,
+      [...wishUserIds],
+    );
+    await pool.query(`INSERT INTO "wishes" ("userId", "productId") VALUES ($1, $3), ($2, $3)`, [
+      ...wishUserIds,
+      FIXTURE.productId,
+    ]);
+  };
 
   beforeAll(async () => {
     pngBytes = await sharp({
@@ -133,6 +195,253 @@ describe("partner catalog GraphQL integration", () => {
   afterAll(async () => {
     await app.close();
     await pool.end();
+  });
+
+  it("requires a Partner access token for published SKU updates", async () => {
+    const unauthenticated = await updatePublishedProductSkus("", FIXTURE.productId, [
+      { skuId: FIXTURE.skuId, price: 14000, stock: 5 },
+    ]);
+    expect(unauthenticated.body.errors[0].extensions.code).toBe("UNAUTHENTICATED");
+
+    await pool.query(`UPDATE "users" SET "role" = 'USER' WHERE "userId" = $1`, [FIXTURE.userId]);
+    const userAccessToken = await signin("FO");
+    const forbidden = await updatePublishedProductSkus(userAccessToken, FIXTURE.productId, [
+      { skuId: FIXTURE.skuId, price: 14000, stock: 5 },
+    ]);
+    expect(forbidden.body.errors[0].extensions.code).toBe("FORBIDDEN");
+  });
+
+  it("rejects invalid published SKU numbers before product lookup", async () => {
+    const service = app.get(PartnerService) as unknown as {
+      updatePublishedProductSkus: (
+        ownerUserId: string,
+        input: { productId: string; skus: { skuId: string; price: number; stock: number }[] },
+      ) => Promise<unknown>;
+    };
+    const invalid = [
+      { price: -1, stock: 0 },
+      { price: 1.5, stock: 0 },
+      { price: 0, stock: -1 },
+      { price: 0, stock: Number.NaN },
+    ];
+
+    for (const values of invalid)
+      await expect(
+        service.updatePublishedProductSkus("invalid-owner", {
+          productId: "invalid-product",
+          skus: [{ skuId: "invalid-sku", ...values }],
+        }),
+      ).rejects.toThrow("Invalid partner product input");
+  });
+
+  it("rejects non-published products and incomplete, duplicate, or foreign SKU sets", async () => {
+    const accessToken = await signin();
+    const invalidSkuSets = [
+      [],
+      [
+        { skuId: FIXTURE.skuId, price: 14000, stock: 5 },
+        { skuId: FIXTURE.skuId, price: 13000, stock: 4 },
+      ],
+      [{ skuId: FIXTURE.secondSkuId, price: 14000, stock: 5 }],
+      [{ skuId: FIXTURE.skuId, price: -1, stock: 5 }],
+      [{ skuId: FIXTURE.skuId, price: 14000, stock: -1 }],
+    ];
+
+    for (const skus of invalidSkuSets) {
+      const response = await updatePublishedProductSkus(accessToken, FIXTURE.productId, skus);
+      expect(response.body.errors[0].extensions.code).toBe("BAD_USER_INPUT");
+    }
+
+    await pool.query(`UPDATE "products" SET "approvalStatus" = 'REJECTED' WHERE "productId" = $1`, [FIXTURE.productId]);
+    const rejected = await updatePublishedProductSkus(accessToken, FIXTURE.productId, [
+      { skuId: FIXTURE.skuId, price: 14000, stock: 5 },
+    ]);
+    expect(rejected.body.errors[0].extensions.code).toBe("BAD_USER_INPUT");
+
+    await pool.query(`UPDATE "products" SET "status" = 'DRAFT', "approvalStatus" = 'APPROVED' WHERE "productId" = $1`, [
+      FIXTURE.productId,
+    ]);
+    const draft = await updatePublishedProductSkus(accessToken, FIXTURE.productId, [
+      { skuId: FIXTURE.skuId, price: 14000, stock: 5 },
+    ]);
+    expect(draft.body.errors[0].extensions.code).toBe("BAD_USER_INPUT");
+
+    const sku = await pool.query<{ price: number; stock: number }>(
+      `SELECT "price", "stock" FROM "productSkus" WHERE "skuId" = $1`,
+      [FIXTURE.skuId],
+    );
+    expect(sku.rows).toEqual([{ price: 15000, stock: 5 }]);
+  });
+
+  it("updates published SKU inventory in place and creates both wish boundaries", async () => {
+    await pool.query(`UPDATE "productSkus" SET "stock" = 0 WHERE "skuId" = $1`, [FIXTURE.skuId]);
+    await seedPublishedSku({ isActive: false, price: 1, stock: 50 });
+    await seedWishers();
+    const accessToken = await signin();
+    const beforeProduct = await pool.query(
+      `SELECT "productId", "partnerId", "brandId", "categoryId", "title", "description", "imageKeys", "imageUrls",
+              "status", "approvalStatus", "rejectionReason", "isOnSale", "isExpressDelivery", "publishedAt", "createdAt", "updatedAt"
+       FROM "products" WHERE "productId" = $1`,
+      [FIXTURE.productId],
+    );
+    const beforeSkus = await pool.query<{
+      skuId: string;
+      productId: string;
+      colorId: string | null;
+      sizeId: string | null;
+      code: string;
+      optionName: string;
+      position: number;
+      isActive: boolean;
+      createdAt: Date;
+    }>(
+      `SELECT "skuId", "productId", "colorId", "sizeId", "code", "optionName", "position", "isActive", "createdAt"
+       FROM "productSkus" WHERE "productId" = $1 ORDER BY "position", "skuId"`,
+      [FIXTURE.productId],
+    );
+
+    const response = await updatePublishedProductSkus(accessToken, FIXTURE.productId, [
+      { skuId: publishedSkuId, price: 0, stock: 100 },
+      { skuId: FIXTURE.skuId, price: 9000, stock: 2 },
+    ]);
+
+    expect(response.body.errors).toBeUndefined();
+    expect(response.body.data.updatePublishedProductSkus.skus.map(({ skuId }: { skuId: string }) => skuId)).toEqual([
+      FIXTURE.skuId,
+      publishedSkuId,
+    ]);
+    const afterProduct = await pool.query(
+      `SELECT "productId", "partnerId", "brandId", "categoryId", "title", "description", "imageKeys", "imageUrls",
+              "status", "approvalStatus", "rejectionReason", "isOnSale", "isExpressDelivery", "publishedAt", "createdAt", "updatedAt"
+       FROM "products" WHERE "productId" = $1`,
+      [FIXTURE.productId],
+    );
+    const afterSkus = await pool.query<{
+      skuId: string;
+      productId: string;
+      colorId: string | null;
+      sizeId: string | null;
+      code: string;
+      optionName: string;
+      price: number;
+      stock: number;
+      position: number;
+      isActive: boolean;
+      createdAt: Date;
+      updatedAt: Date;
+    }>(
+      `SELECT "skuId", "productId", "colorId", "sizeId", "code", "optionName", "price", "stock", "position",
+              "isActive", "createdAt", "updatedAt"
+       FROM "productSkus" WHERE "productId" = $1 ORDER BY "position", "skuId"`,
+      [FIXTURE.productId],
+    );
+    expect(afterProduct.rows).toEqual(beforeProduct.rows);
+    expect(afterSkus.rows.map(({ price: _price, stock: _stock, updatedAt: _updatedAt, ...sku }) => sku)).toEqual(
+      beforeSkus.rows,
+    );
+    expect(afterSkus.rows.map(({ skuId, price, stock }) => ({ skuId, price, stock }))).toEqual([
+      { skuId: FIXTURE.skuId, price: 9000, stock: 2 },
+      { skuId: publishedSkuId, price: 0, stock: 100 },
+    ]);
+    expect(new Set(afterSkus.rows.map(({ updatedAt }) => updatedAt.toISOString())).size).toBe(1);
+    const notifications = await pool.query<{ userId: string; type: string }>(
+      `SELECT "userId", "type" FROM "notifications" WHERE "entityId" = $1 ORDER BY "userId", "type"`,
+      [FIXTURE.productId],
+    );
+    expect(notifications.rows).toEqual(
+      wishUserIds.flatMap((userId) => [
+        { userId, type: "WISH_PRICE_DROP" },
+        { userId, type: "WISH_RESTOCK" },
+      ]),
+    );
+  });
+
+  it("does not notify for equal or increased minimum prices and other stock transitions", async () => {
+    await seedWishers();
+    const accessToken = await signin();
+    const updates = [
+      { skuId: FIXTURE.skuId, price: 15000, stock: 6 },
+      { skuId: FIXTURE.skuId, price: 16000, stock: 0 },
+      { skuId: FIXTURE.skuId, price: 16000, stock: 0 },
+    ];
+    for (const sku of updates) {
+      const response = await updatePublishedProductSkus(accessToken, FIXTURE.productId, [sku]);
+      expect(response.body.errors).toBeUndefined();
+    }
+    const notifications = await pool.query(`SELECT 1 FROM "notifications" WHERE "entityId" = $1`, [FIXTURE.productId]);
+    expect(notifications.rowCount).toBe(0);
+  });
+
+  it("deduplicates concurrent and retried identical published SKU saves", async () => {
+    await pool.query(`UPDATE "productSkus" SET "stock" = 0 WHERE "skuId" = $1`, [FIXTURE.skuId]);
+    await seedWishers();
+    const accessToken = await signin();
+    const skus = [{ skuId: FIXTURE.skuId, price: 9000, stock: 2 }];
+
+    const concurrent = await Promise.all([
+      updatePublishedProductSkus(accessToken, FIXTURE.productId, skus),
+      updatePublishedProductSkus(accessToken, FIXTURE.productId, skus),
+    ]);
+    for (const response of concurrent) expect(response.body.errors).toBeUndefined();
+    const retried = await updatePublishedProductSkus(accessToken, FIXTURE.productId, skus);
+    expect(retried.body.errors).toBeUndefined();
+
+    const notifications = await pool.query<{ count: number; type: string; userId: string }>(
+      `SELECT count(*)::int AS "count", "type", "userId"
+       FROM "notifications" WHERE "entityId" = $1 GROUP BY "type", "userId" ORDER BY "userId", "type"`,
+      [FIXTURE.productId],
+    );
+    expect(notifications.rows).toEqual(
+      wishUserIds.flatMap((userId) => [
+        { count: 1, type: "WISH_PRICE_DROP", userId },
+        { count: 1, type: "WISH_RESTOCK", userId },
+      ]),
+    );
+  });
+
+  it("rolls SKU and notification writes back together", async () => {
+    await pool.query(`UPDATE "productSkus" SET "stock" = 0 WHERE "skuId" = $1`, [FIXTURE.skuId]);
+    await seedWishers();
+    const beforeSku = await pool.query(`SELECT "price", "stock", "updatedAt" FROM "productSkus" WHERE "skuId" = $1`, [
+      FIXTURE.skuId,
+    ]);
+    const beforeSnapshot = await pool.query(
+      `SELECT "revision", "basePrice", "finalPrice", "recordedAt", "verifiedAt"
+       FROM "productPriceEvidenceSnapshots" WHERE "productId" = $1`,
+      [FIXTURE.productId],
+    );
+    const notificationService = app.get(NotificationService);
+    const createWishPriceDrop = notificationService.createWishPriceDrop;
+    jest.spyOn(notificationService, "createWishPriceDrop").mockImplementation(async (tx, input) => {
+      await createWishPriceDrop(tx, input);
+      throw new Error("forced notification failure");
+    });
+    const service = app.get(PartnerService) as unknown as {
+      updatePublishedProductSkus: (
+        ownerUserId: string,
+        input: { productId: string; skus: { skuId: string; price: number; stock: number }[] },
+      ) => Promise<unknown>;
+    };
+
+    await expect(
+      service.updatePublishedProductSkus(FIXTURE.userId, {
+        productId: FIXTURE.productId,
+        skus: [{ skuId: FIXTURE.skuId, price: 9000, stock: 2 }],
+      }),
+    ).rejects.toThrow("forced notification failure");
+
+    const afterSku = await pool.query(`SELECT "price", "stock", "updatedAt" FROM "productSkus" WHERE "skuId" = $1`, [
+      FIXTURE.skuId,
+    ]);
+    const afterSnapshot = await pool.query(
+      `SELECT "revision", "basePrice", "finalPrice", "recordedAt", "verifiedAt"
+       FROM "productPriceEvidenceSnapshots" WHERE "productId" = $1`,
+      [FIXTURE.productId],
+    );
+    const notifications = await pool.query(`SELECT 1 FROM "notifications" WHERE "entityId" = $1`, [FIXTURE.productId]);
+    expect(afterSku.rows).toEqual(beforeSku.rows);
+    expect(afterSnapshot.rows).toEqual(beforeSnapshot.rows);
+    expect(notifications.rowCount).toBe(0);
   });
 
   it("rolls back the email proof when a partner application cannot be stored", async () => {
@@ -453,8 +762,8 @@ describe("partner catalog GraphQL integration", () => {
     );
     await pool.query(
       `INSERT INTO "products"
-        ("productId", "partnerId", "brandId", "categoryId", "title", "description", "imageKeys", "imageUrls")
-       VALUES ($1, $2, $3, $4, 'Other product', 'Other description', '{}', '[]')`,
+        ("productId", "partnerId", "brandId", "categoryId", "title", "description", "imageKeys", "imageUrls", "status", "approvalStatus")
+       VALUES ($1, $2, $3, $4, 'Other product', 'Other description', '{}', '[]', 'PUBLISHED', 'APPROVED')`,
       [otherProductId, otherPartnerId, otherBrandId, FIXTURE.categoryId],
     );
     await pool.query(
@@ -545,10 +854,14 @@ describe("partner catalog GraphQL integration", () => {
       `,
       { productId: otherProductId },
     );
+    const publishedSkuUpdate = await updatePublishedProductSkus(accessToken, otherProductId, [
+      { skuId: otherSkuId, price: 900, stock: 2 },
+    ]);
     expect(detail.body.errors[0].extensions.code).toBe("NOT_FOUND");
     expect(update.body.errors[0].extensions.code).toBe("BAD_USER_INPUT");
     expect(submit.body.errors[0].extensions.code).toBe("BAD_USER_INPUT");
     expect(publish.body.errors[0].extensions.code).toBe("BAD_USER_INPUT");
+    expect(publishedSkuUpdate.body.errors[0].extensions.code).toBe("BAD_USER_INPUT");
   });
 
   it("keeps state unchanged when submitted image objects are missing", async () => {

@@ -15,6 +15,7 @@ import {
   PartnerProductInput,
   PartnerProductType,
   PartnerType,
+  UpdatePublishedProductSkusInput,
 } from "./partner.types";
 
 const currentUserId = (context: { req?: { user?: { userId?: string } } }) => {
@@ -72,6 +73,14 @@ export class PartnerResolver {
     @Context() context: { req?: { user?: { userId?: string } } },
   ) {
     return this.partnerService.updateDraft(currentUserId(context), productId, input);
+  }
+  @Mutation(() => PartnerProductType)
+  @Roles(UserRole.Partner)
+  updatePublishedProductSkus(
+    @Args("input") input: UpdatePublishedProductSkusInput,
+    @Context() context: { req?: { user?: { userId?: string } } },
+  ) {
+    return this.partnerService.updatePublishedProductSkus(currentUserId(context), input);
   }
   @Mutation(() => PartnerProductType)
   @Roles(UserRole.Partner)
