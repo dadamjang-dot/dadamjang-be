@@ -25,6 +25,8 @@ const SECOND_USER = {
   email: "notification-partner@example.test",
 } as const;
 
+const PUSH_WORKER_NOW = new Date("2026-08-31T12:00:00.000Z");
+
 const signin = async (app: INestApplication, deviceId: string, userid: string = FIXTURE.userid) => {
   const response = await request(app.getHttpServer())
     .post("/graphql")
@@ -345,7 +347,7 @@ const seedPushDelivery = async (
       pushDeviceId,
       input?.status ?? "PENDING",
       input?.attemptCount ?? 0,
-      input?.availableAt ?? null,
+      input?.availableAt ?? PUSH_WORKER_NOW,
       input?.claimToken ?? null,
       input?.claimedAt ?? null,
       input?.expoTicketId ?? null,
@@ -1408,12 +1410,12 @@ describe("FO notification GraphQL integration", () => {
          FROM generate_series(1, 100) AS value
          RETURNING "notificationId"
        )
-       INSERT INTO "pushOutbox" ("notificationId", "pushDeviceId")
-       SELECT "notificationId", $2 FROM inserted`,
-      [FIXTURE.userId, pushDeviceId],
+       INSERT INTO "pushOutbox" ("notificationId", "pushDeviceId", "availableAt")
+       SELECT "notificationId", $2, $3 FROM inserted`,
+      [FIXTURE.userId, pushDeviceId, PUSH_WORKER_NOW],
     );
     const provider = recordingPushSender();
-    const now = new Date("2026-08-31T12:00:00.000Z");
+    const now = PUSH_WORKER_NOW;
 
     await Promise.all([
       pushWorker(notificationRepository, provider.sender).runOnce(now),
@@ -1437,7 +1439,7 @@ describe("FO notification GraphQL integration", () => {
     const validDeviceId = await seedPushDevice(pool, FIXTURE.userId, validKey);
     const invalid = await seedPushDelivery(pool, invalidDeviceId, "push-worker-partial-logout");
     const valid = await seedPushDelivery(pool, validDeviceId, "push-worker-partial-valid");
-    const now = new Date("2026-08-31T12:00:00.000Z");
+    const now = PUSH_WORKER_NOW;
     let release: (() => void) | undefined;
     let started: (() => void) | undefined;
     const providerRelease = new Promise<void>((resolve) => {
@@ -1496,7 +1498,7 @@ describe("FO notification GraphQL integration", () => {
     const validDeviceId = await seedPushDevice(pool, FIXTURE.userId, "worker-renew-valid");
     const invalid = await seedPushDelivery(pool, invalidDeviceId, "push-worker-renew-logout");
     const valid = await seedPushDelivery(pool, validDeviceId, "push-worker-renew-valid");
-    const now = new Date("2026-08-31T12:00:00.000Z");
+    const now = PUSH_WORKER_NOW;
     const claims = await notificationRepository.claimPushSendBatch(now, 100);
     const renewedAt = new Date(now.getTime() + 10_000);
     await db.transaction((tx) =>
@@ -1533,7 +1535,7 @@ describe("FO notification GraphQL integration", () => {
     const invalidKey = "worker-receipt-logout";
     const invalidDeviceId = await seedPushDevice(pool, FIXTURE.userId, invalidKey);
     const validDeviceId = await seedPushDevice(pool, FIXTURE.userId, "worker-receipt-valid");
-    const now = new Date("2026-08-31T12:00:00.000Z");
+    const now = PUSH_WORKER_NOW;
     const invalidTicketId = "partial-owned-invalid-ticket";
     const validTicketId = "partial-owned-valid-ticket";
     const invalid = await seedPushDelivery(pool, invalidDeviceId, "push-worker-receipt-logout", {
@@ -1589,7 +1591,7 @@ describe("FO notification GraphQL integration", () => {
       const validDeviceId = await seedPushDevice(pool, FIXTURE.userId, `worker-${method}-valid`);
       const invalid = await seedPushDelivery(pool, invalidDeviceId, `push-${method}-logout`);
       const valid = await seedPushDelivery(pool, validDeviceId, `push-${method}-valid`);
-      const now = new Date("2026-08-31T12:00:00.000Z");
+      const now = PUSH_WORKER_NOW;
       const claims = await notificationRepository.claimPushSendBatch(now, 100);
       const providerError = new Error("provider unavailable");
       await db.transaction((tx) =>
@@ -1642,7 +1644,7 @@ describe("FO notification GraphQL integration", () => {
     const highBlocker = await startPushDeviceBlocker(pool, highDeviceId);
     const lowBlocker = await startPushDeviceBlocker(pool, lowDeviceId);
     const provider = recordingPushSender();
-    const workerRun = pushWorker(notificationRepository, provider.sender).runOnce(new Date("2026-08-31T12:00:00.000Z"));
+    const workerRun = pushWorker(notificationRepository, provider.sender).runOnce(PUSH_WORKER_NOW);
     let transfer: Promise<unknown> | undefined;
     let highReleased = false;
     let lowReleased = false;
@@ -1683,7 +1685,7 @@ describe("FO notification GraphQL integration", () => {
 
   it("recovers a thirty-second stale claim and ignores settlement from its old token", async () => {
     const pushDeviceId = await seedPushDevice(pool, FIXTURE.userId, "worker-stale");
-    const now = new Date("2026-08-31T12:00:00.000Z");
+    const now = PUSH_WORKER_NOW;
     const oldClaimToken = randomUUID();
     const delivery = await seedPushDelivery(pool, pushDeviceId, "push-worker-stale", {
       status: "PROCESSING",
@@ -1729,7 +1731,7 @@ describe("FO notification GraphQL integration", () => {
     const delivery = await seedPushDelivery(pool, pushDeviceId, "push-worker-disabled");
     const provider = recordingPushSender();
 
-    await pushWorker(notificationRepository, provider.sender).runOnce(new Date("2026-08-31T12:00:00.000Z"));
+    await pushWorker(notificationRepository, provider.sender).runOnce(PUSH_WORKER_NOW);
 
     const state = await pool.query<{ status: string; lastError: string | null }>(
       `SELECT status, "lastError" FROM "pushOutbox" WHERE "pushOutboxId" = $1`,
@@ -1744,7 +1746,7 @@ describe("FO notification GraphQL integration", () => {
     const invalidDeviceId = await seedPushDevice(pool, FIXTURE.userId, "worker-receipt-invalid");
     const valid = await seedPushDelivery(pool, validDeviceId, "push-worker-receipt-valid");
     const invalid = await seedPushDelivery(pool, invalidDeviceId, "push-worker-receipt-invalid");
-    const now = new Date("2026-08-31T12:00:00.000Z");
+    const now = PUSH_WORKER_NOW;
     const provider = recordingPushSender({
       receipts: async (ticketIds) =>
         Object.fromEntries(
@@ -1800,7 +1802,7 @@ describe("FO notification GraphQL integration", () => {
     const invalidDeviceId = await seedPushDevice(pool, FIXTURE.userId, "worker-partial-invalid");
     const missingDeviceId = await seedPushDevice(pool, FIXTURE.userId, "worker-partial-missing");
     const exhaustedDeviceId = await seedPushDevice(pool, FIXTURE.userId, "worker-partial-exhausted");
-    const now = new Date("2026-08-31T12:00:00.000Z");
+    const now = PUSH_WORKER_NOW;
     const normal = await seedPushDelivery(pool, normalDeviceId, "push-worker-partial-normal", {
       status: "TICKETED",
       expoTicketId: "partial-normal-ticket",
@@ -1916,7 +1918,7 @@ describe("FO notification GraphQL integration", () => {
 
   it("backs off MessageRateExceeded receipts into bounded message resends", async () => {
     const pushDeviceId = await seedPushDevice(pool, FIXTURE.userId, "worker-rate-limit");
-    const now = new Date("2026-08-31T12:00:00.000Z");
+    const now = PUSH_WORKER_NOW;
     const delivery = await seedPushDelivery(pool, pushDeviceId, "push-worker-rate-limit", {
       status: "TICKETED",
       expoTicketId: "rate-limit-ticket",
@@ -1991,7 +1993,7 @@ describe("FO notification GraphQL integration", () => {
         })),
     });
 
-    await pushWorker(notificationRepository, provider.sender).runOnce(new Date("2026-08-31T12:00:00.000Z"));
+    await pushWorker(notificationRepository, provider.sender).runOnce(PUSH_WORKER_NOW);
 
     const states = await pool.query<{ status: string }>(
       `SELECT status FROM "pushOutbox" WHERE "pushOutboxId" = ANY($1::uuid[]) ORDER BY "pushOutboxId"`,
@@ -2014,7 +2016,7 @@ describe("FO notification GraphQL integration", () => {
       },
     });
     const worker = pushWorker(notificationRepository, provider.sender);
-    let attemptAt = new Date("2026-08-31T12:00:00.000Z");
+    let attemptAt = PUSH_WORKER_NOW;
 
     for (let attempt = 1; attempt <= 8; attempt += 1) {
       await worker.runOnce(attemptAt);
@@ -2030,7 +2032,7 @@ describe("FO notification GraphQL integration", () => {
 
   it("preserves a fresh eighth Push claim while terminally failing exhausted and stale claims", async () => {
     const pushDeviceId = await seedPushDevice(pool, FIXTURE.userId, "worker-eighth-claim");
-    const now = new Date("2026-08-31T12:00:00.000Z");
+    const now = PUSH_WORKER_NOW;
     const claimToken = randomUUID();
     const fresh = await seedPushDelivery(pool, pushDeviceId, "push-worker-eighth-fresh", {
       status: "PROCESSING",
@@ -2094,7 +2096,7 @@ describe("FO notification GraphQL integration", () => {
 
   it("purges only Push terminal rows retained for seven days", async () => {
     const pushDeviceId = await seedPushDevice(pool, FIXTURE.userId, "worker-retention");
-    const now = new Date("2026-08-31T12:00:00.000Z");
+    const now = PUSH_WORKER_NOW;
     const expired = await seedPushDelivery(pool, pushDeviceId, "push-worker-retention-expired", {
       status: "FAILED",
       updatedAt: new Date(now.getTime() - 8 * 24 * 60 * 60_000),
