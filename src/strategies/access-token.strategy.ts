@@ -5,11 +5,15 @@ import type { Request } from "express";
 import { ExtractJwt, Strategy, type StrategyOptions } from "passport-jwt";
 import { CustomUnauthorizedException } from "src/common/errors/custom-exceptions";
 import { AuthErrorMessage } from "src/modules/auth/auth.error";
+import { AuthRepository } from "src/modules/auth/auth.repository";
 import { AuthRequest, isAccessJwtPayload, JWT_ACCESS_AUDIENCE, JWT_ISSUER } from "src/modules/auth/auth.types";
 
 @Injectable()
 export class JwtAccessTokenStrategy extends PassportStrategy(Strategy, "access_token") {
-  constructor(configService: ConfigService) {
+  constructor(
+    configService: ConfigService,
+    private readonly authRepository: AuthRepository,
+  ) {
     super({
       jwtFromRequest: ExtractJwt.fromExtractors([
         (request: Request) => {
@@ -28,8 +32,11 @@ export class JwtAccessTokenStrategy extends PassportStrategy(Strategy, "access_t
     } satisfies StrategyOptions);
   }
 
-  validate = (req: AuthRequest, payload: unknown) => {
+  validate = async (req: AuthRequest, payload: unknown) => {
     if (!isAccessJwtPayload(payload)) throw new CustomUnauthorizedException(AuthErrorMessage.AuthRequired);
+    const user = await this.authRepository.findUser(payload.userId);
+    if (!user || user.deactivatedAt || user.anonymizedAt)
+      throw new CustomUnauthorizedException(AuthErrorMessage.AuthRequired);
     req.user = payload;
     return payload;
   };

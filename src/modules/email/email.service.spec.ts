@@ -198,4 +198,16 @@ describe("EmailService", () => {
     expect(hasValidRecoveryToken).toHaveBeenCalledWith("unknown-token");
     expect(repository.resetPasswordWithToken).not.toHaveBeenCalled();
   });
+
+  it("rejects a stale recovery proof for a passwordless account", async () => {
+    const repository = {
+      hasValidRecoveryToken: jest.fn().mockResolvedValue(true),
+      resetPasswordWithToken: jest.fn().mockResolvedValue(false),
+    } as unknown as EmailRepository;
+    const service = new EmailService(repository, config, allow());
+
+    await expect(service.resetPassword("stale-token", "new-password")).rejects.toBeInstanceOf(
+      CustomUnauthorizedException,
+    );
+  });
 });

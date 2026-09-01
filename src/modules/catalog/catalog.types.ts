@@ -164,54 +164,6 @@ export class ProductPriceSummaryConnectionType {
   totalCount!: number;
 }
 
-@ObjectType()
-export class ProductPriceHistoryItemType {
-  @Field()
-  label!: string;
-  @Field(() => Int)
-  price!: number;
-  @Field()
-  recordedAt!: Date;
-}
-
-@ObjectType()
-export class ProductCouponConditionType {
-  @Field()
-  title!: string;
-  @Field(() => Int)
-  discountAmount!: number;
-  @Field()
-  condition!: string;
-}
-
-@ObjectType()
-export class ProductShippingPolicyType {
-  @Field()
-  title!: string;
-  @Field(() => Int)
-  shippingFee!: number;
-  @Field()
-  condition!: string;
-}
-
-@ObjectType()
-export class ProductPriceEvidenceType {
-  @Field()
-  productId!: string;
-  @Field()
-  priceRevision!: string;
-  @Field(() => [ProductPriceHistoryItemType])
-  priceHistory!: ProductPriceHistoryItemType[];
-  @Field(() => [ProductCouponConditionType])
-  couponConditions!: ProductCouponConditionType[];
-  @Field(() => ProductShippingPolicyType, { nullable: true })
-  shippingPolicy!: ProductShippingPolicyType | null;
-  @Field()
-  offerSource!: string;
-  @Field()
-  calculatedAt!: Date;
-}
-
 @InputType()
 export class ProductFilterInput {
   @Field(() => String, { nullable: true })

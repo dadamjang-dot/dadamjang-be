@@ -29,9 +29,74 @@ const createService = (rows: readonly unknown[]) => {
     { select: jest.fn().mockReturnValue(query) } as never,
     {} as never,
     { getOrThrow: jest.fn().mockReturnValue("cursor-secret") } as never,
+    {} as never,
   );
   return { query, service };
 };
+
+const hydrationQuery = (rows: readonly unknown[]) => {
+  const result = Promise.resolve(rows);
+  const chain = {
+    from: jest.fn(),
+    groupBy: jest.fn(),
+    innerJoin: jest.fn(),
+    leftJoin: jest.fn(),
+    limit: jest.fn(),
+    orderBy: jest.fn(),
+    then: result.then.bind(result),
+    where: jest.fn(),
+  };
+  chain.from.mockReturnValue(chain);
+  chain.groupBy.mockReturnValue(chain);
+  chain.innerJoin.mockReturnValue(chain);
+  chain.leftJoin.mockReturnValue(chain);
+  chain.limit.mockResolvedValue(rows);
+  chain.orderBy.mockReturnValue(chain);
+  chain.where.mockReturnValue(chain);
+  return chain;
+};
+
+describe("StylePostsService author hydration", () => {
+  it("masks the author label for an anonymized account", async () => {
+    const stylePostId = "10000000-0000-4000-8000-000000000010";
+    const authorId = "10000000-0000-4000-8000-000000000011";
+    const now = new Date("2026-08-31T00:00:00Z");
+    const select = jest
+      .fn()
+      .mockReturnValueOnce(
+        hydrationQuery([
+          {
+            stylePostId,
+            authorId,
+            title: "Style",
+            content: "Style",
+            imageUrls: [],
+            category: "CLOTHING",
+            hashtags: [],
+            brandTagIds: [],
+            imageKeys: [],
+            idempotencyKey: null,
+            isPartner: false,
+            createdAt: now,
+            updatedAt: now,
+          },
+        ]),
+      )
+      .mockReturnValueOnce(hydrationQuery([{ userId: authorId, userid: "deleted-user", anonymizedAt: now }]))
+      .mockReturnValueOnce(hydrationQuery([]))
+      .mockReturnValueOnce(hydrationQuery([]));
+    const service = new StylePostsService(
+      { select } as never,
+      { getStylePostImageUrl: jest.fn() } as never,
+      { getOrThrow: jest.fn().mockReturnValue("cursor-secret") } as never,
+      {} as never,
+    );
+
+    const post = await service.get(stylePostId);
+
+    expect(post.author).toEqual({ userId: authorId, userid: "탈퇴한 사용자" });
+  });
+});
 
 describe("StylePostsService purchased products", () => {
   it("limits purchased product history to the 100 newest products", async () => {
@@ -91,6 +156,7 @@ describe("StylePostsService ranking budget", () => {
       { select, transaction } as never,
       {} as never,
       { getOrThrow: jest.fn().mockReturnValue("cursor-secret") } as never,
+      {} as never,
     );
 
     await expect(service.list()).resolves.toEqual({ nodes: [], hasNextPage: false, nextCursor: null });

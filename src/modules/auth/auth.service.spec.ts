@@ -1,5 +1,6 @@
 import * as bcrypt from "bcrypt";
 import { AdmissionLimiter, type RequestOrigin } from "src/modules/admission/admission-limiter";
+import { hashToken } from "src/common/security/token-hash";
 import { AuthErrorMessage } from "./auth.error";
 import { AuthService } from "./auth.service";
 import { AuthPortal } from "./auth.types";
@@ -19,6 +20,9 @@ const user = {
   role: "USER",
   createdAt: new Date(),
   updatedAt: new Date(),
+  deactivatedAt: null,
+  scheduledAnonymizationAt: null,
+  anonymizedAt: null,
 };
 
 const createService = (repository: object, emailService: object = {}) =>
@@ -31,6 +35,14 @@ const createService = (repository: object, emailService: object = {}) =>
       assertAllowed: jest.fn().mockResolvedValue(undefined),
     } as never,
   );
+
+const activeSessionRepository = <T extends object>(repository: T, currentUser = user) => ({
+  ...repository,
+  withActiveUserSession: jest.fn(
+    async (_userId: string, action: (lockedUser: typeof user, store: object) => Promise<unknown>, store?: object) =>
+      action(currentUser, store ?? repository),
+  ),
+});
 
 const createAdmissionService = (repository: object, emailService: object, admissionLimiter: object) => {
   const Service = AuthService as unknown as new (
@@ -61,6 +73,10 @@ describe("AuthService", () => {
           acquired: true,
           value: await action(undefined),
         }),
+      ),
+      withActiveUserSession: jest.fn(
+        async (_userId: string, action: (lockedUser: typeof user, store: undefined) => Promise<unknown>) =>
+          action({ ...user, role: "ADMIN" }, undefined),
       ),
       findRefreshToken: jest.fn().mockResolvedValue(undefined),
       saveRefreshToken: jest.fn().mockResolvedValue(true),
@@ -157,6 +173,10 @@ describe("AuthService", () => {
             value: await action(undefined),
           }),
         ),
+        withActiveUserSession: jest.fn(
+          async (_userId: string, action: (lockedUser: typeof user, store: undefined) => Promise<unknown>) =>
+            action({ ...user, password }, undefined),
+        ),
       },
       {
         normalizeUserid: (value: string) => value,
@@ -170,20 +190,147 @@ describe("AuthService", () => {
     ).rejects.toThrow(AuthErrorMessage.AuthRequired);
   });
 
-  it("rejects expired and invalid refresh tokens", async () => {
-    const expired = createService({
-      findRefreshToken: jest.fn().mockResolvedValue({ refreshToken: "hash", refreshTokenExp: new Date(0) }),
-      hasRecentRotation: jest.fn().mockResolvedValue(false),
+  it("rejects an old password after the locked user row has a new password", async () => {
+    const oldPassword = await bcrypt.hash("old-password", 4);
+    const newPassword = await bcrypt.hash("new-password", 4);
+    const currentUser = { ...user, password: newPassword };
+    const store = {};
+    const repository = {
+      signinStartedAt: jest.fn().mockResolvedValue(new Date()),
+      findByUserid: jest.fn().mockResolvedValue({ ...user, password: oldPassword }),
+      withSigninLock: jest.fn(
+        async (_userId: string, _deviceId: string, action: (store: object) => Promise<unknown>) => ({
+          acquired: true,
+          value: await action(store),
+        }),
+      ),
+      withActiveUserSession: jest.fn(
+        async (_userId: string, action: (lockedUser: typeof currentUser, store: object) => Promise<unknown>) =>
+          action(currentUser, store),
+      ),
+      findRefreshToken: jest.fn().mockResolvedValue(undefined),
+      saveRefreshToken: jest.fn().mockResolvedValue(true),
+    };
+    const jwtService = {
+      signAsync: jest.fn().mockResolvedValueOnce("access-token").mockResolvedValueOnce("refresh-token"),
+      decode: jest.fn().mockReturnValue({ exp: Math.floor(Date.now() / 1000) + 3600 }),
+    };
+    const service = new AuthService(
+      repository as never,
+      jwtService as never,
+      { getOrThrow: jest.fn((name: string) => (name.endsWith("EXP") ? "1h" : "secret")) } as never,
+      { normalizeUserid: (value: string) => value } as never,
+      { assertAllowed: jest.fn().mockResolvedValue(undefined) } as never,
+    );
+
+    await expect(
+      service.signin({ userid: user.userid, password: "old-password", portal: AuthPortal.FO }, "device", {
+        ip: "127.0.0.1",
+      }),
+    ).rejects.toThrow(AuthErrorMessage.AuthRequired);
+    expect(jwtService.signAsync).not.toHaveBeenCalled();
+    expect(repository.saveRefreshToken).not.toHaveBeenCalled();
+  });
+
+  it("validates the portal against the role on the locked user row", async () => {
+    const password = await bcrypt.hash("password", 4);
+    const store = {};
+    const repository = {
+      signinStartedAt: jest.fn().mockResolvedValue(new Date()),
+      findByUserid: jest.fn().mockResolvedValue({ ...user, password, role: "USER" }),
+      withSigninLock: jest.fn(
+        async (_userId: string, _deviceId: string, action: (transaction: object) => Promise<unknown>) => ({
+          acquired: true,
+          value: await action(store),
+        }),
+      ),
+      withActiveUserSession: jest.fn(
+        async (_userId: string, action: (lockedUser: typeof user, transaction: object) => Promise<unknown>) =>
+          action({ ...user, password, role: "ADMIN" }, store),
+      ),
+    };
+    const service = createService(repository, { normalizeUserid: (value: string) => value });
+    service.issueTokensForUser = jest.fn().mockResolvedValue({}) as never;
+
+    await expect(
+      service.signin({ userid: user.userid, password: "password", portal: AuthPortal.FO }, "device", {
+        ip: "127.0.0.1",
+      }),
+    ).rejects.toThrow(AuthErrorMessage.AuthRequired);
+    expect(service.issueTokensForUser).not.toHaveBeenCalled();
+  });
+
+  it("uses the dummy password comparison for a passwordless account", async () => {
+    const compare = jest.mocked(bcrypt.compare).mockResolvedValue(false as never);
+    const service = createService(
+      {
+        signinStartedAt: jest.fn().mockResolvedValue(new Date()),
+        findByUserid: jest.fn().mockResolvedValue({ ...user, password: null }),
+      },
+      { normalizeUserid: (value: string) => value },
+    );
+
+    try {
+      await expect(
+        service.signin({ userid: "user", password: "password", portal: AuthPortal.FO }, "device", {
+          ip: "unknown",
+        }),
+      ).rejects.toThrow(AuthErrorMessage.AuthRequired);
+      expect(compare).toHaveBeenCalledWith("password", expect.stringMatching(/^\$2b\$/));
+    } finally {
+      compare.mockImplementation(actualCompare);
+    }
+  });
+
+  it("reports whether the viewer has a password", async () => {
+    const service = createService({
+      findViewer: jest
+        .fn()
+        .mockResolvedValueOnce({ ...user, hasPassword: true })
+        .mockResolvedValueOnce({ ...user, password: null, hasPassword: false }),
     });
+
+    await expect(service.getViewer(user.userId)).resolves.toMatchObject({ hasPassword: true });
+    await expect(service.getViewer(user.userId)).resolves.toMatchObject({ hasPassword: false });
+  });
+
+  it("rejects expired and invalid refresh tokens", async () => {
+    const expired = createService(
+      activeSessionRepository({
+        findRefreshToken: jest.fn().mockResolvedValue({ refreshToken: "hash", refreshTokenExp: new Date(0) }),
+        hasRecentRotation: jest.fn().mockResolvedValue(false),
+      }),
+    );
     await expect(expired.refresh("user-1", "device", "token")).rejects.toThrow(AuthErrorMessage.AuthRequired);
     const hash = await bcrypt.hash("different-token", 4);
-    const invalid = createService({
-      findRefreshToken: jest
-        .fn()
-        .mockResolvedValue({ refreshToken: hash, refreshTokenExp: new Date(Date.now() + 60_000) }),
-      hasRecentRotation: jest.fn().mockResolvedValue(false),
-    });
+    const invalid = createService(
+      activeSessionRepository({
+        findRefreshToken: jest
+          .fn()
+          .mockResolvedValue({ refreshToken: hash, refreshTokenExp: new Date(Date.now() + 60_000) }),
+        hasRecentRotation: jest.fn().mockResolvedValue(false),
+      }),
+    );
     await expect(invalid.refresh("user-1", "device", "token")).rejects.toThrow(AuthErrorMessage.AuthRequired);
+  });
+
+  it("rejects refresh after the account is deactivated", async () => {
+    const rotateRefreshToken = jest.fn();
+    const service = new AuthService(
+      {
+        withActiveUserSession: jest.fn().mockRejectedValue(new Error(AuthErrorMessage.AuthRequired)),
+        rotateRefreshToken,
+      } as never,
+      { signAsync: jest.fn(), decode: jest.fn() } as never,
+      {} as never,
+      {} as never,
+      {} as never,
+    );
+
+    await expect(service.refresh(user.userId, "device", "refresh-token")).rejects.toThrow(
+      AuthErrorMessage.AuthRequired,
+    );
+    expect(rotateRefreshToken).not.toHaveBeenCalled();
   });
 
   it("deletes the current device refresh token on logout", async () => {
@@ -201,10 +348,10 @@ describe("AuthService", () => {
   });
 
   it("issues distinct access tokens and persists them with compare-and-swap", async () => {
-    const repository = {
+    const repository = activeSessionRepository({
       findRefreshToken: jest.fn().mockResolvedValue(undefined),
       saveRefreshToken: jest.fn().mockResolvedValue(true),
-    };
+    });
     const jwtService = {
       signAsync: jest.fn(async (payload: object) => Buffer.from(JSON.stringify(payload)).toString("base64url")),
       decode: jest.fn().mockReturnValue({ exp: Math.floor(Date.now() / 1000) + 3600 }),
@@ -232,15 +379,15 @@ describe("AuthService", () => {
     expect(repository.saveRefreshToken.mock.calls[0]?.[0]).not.toHaveProperty("previousRefreshToken");
     expect(repository.saveRefreshToken).toHaveBeenCalledWith(
       expect.objectContaining({ deviceId: "device" }),
-      undefined,
+      expect.any(Object),
     );
   });
 
   it("issues HS256 access and refresh tokens with distinct typed claims", async () => {
-    const repository = {
+    const repository = activeSessionRepository({
       findRefreshToken: jest.fn().mockResolvedValue(undefined),
       saveRefreshToken: jest.fn().mockResolvedValue(true),
-    };
+    });
     const jwtService = {
       signAsync: jest.fn().mockResolvedValueOnce("access-token").mockResolvedValueOnce("refresh-token"),
       decode: jest.fn().mockReturnValue({ exp: Math.floor(Date.now() / 1000) + 3600 }),
@@ -286,5 +433,77 @@ describe("AuthService", () => {
         audience: "dadamjang-refresh",
       },
     );
+  });
+
+  it("reloads the user inside the session transaction before signing tokens", async () => {
+    const currentUser = { ...user, role: "ADMIN" };
+    const repository = activeSessionRepository(
+      {
+        findRefreshToken: jest.fn().mockResolvedValue(undefined),
+        saveRefreshToken: jest.fn().mockResolvedValue(true),
+      },
+      currentUser,
+    );
+    const jwtService = {
+      signAsync: jest.fn().mockResolvedValueOnce("access-token").mockResolvedValueOnce("refresh-token"),
+      decode: jest.fn().mockReturnValue({ exp: Math.floor(Date.now() / 1000) + 3600 }),
+    };
+    const service = new AuthService(
+      repository as never,
+      jwtService as never,
+      { getOrThrow: jest.fn((name: string) => (name.endsWith("EXP") ? "1h" : "secret")) } as never,
+      {} as never,
+      {} as never,
+    );
+
+    await expect(service.issueTokensForUser(user, "device-1")).resolves.toMatchObject({ role: "ADMIN" });
+    expect(repository.withActiveUserSession).toHaveBeenCalledWith(user.userId, expect.any(Function), undefined);
+    expect(jwtService.signAsync).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ role: "ADMIN" }),
+      expect.anything(),
+    );
+  });
+
+  it("performs refresh lookup, token creation, and rotation in one active-user transaction", async () => {
+    const store = {};
+    const order: string[] = [];
+    const repository = {
+      withActiveUserSession: jest.fn(async (_userId: string, action: (current: typeof user, tx: object) => unknown) => {
+        order.push("lock-user");
+        return action(user, store);
+      }),
+      findRefreshToken: jest.fn(async () => {
+        order.push("find-refresh");
+        return {
+          refreshToken: hashToken("refresh-token"),
+          refreshTokenExp: new Date(Date.now() + 60_000),
+        };
+      }),
+      rotateRefreshToken: jest.fn(async () => {
+        order.push("rotate-refresh");
+        return "rotated";
+      }),
+    };
+    const jwtService = {
+      signAsync: jest.fn(async () => {
+        order.push("sign-token");
+        return "signed-token";
+      }),
+      decode: jest.fn().mockReturnValue({ exp: Math.floor(Date.now() / 1000) + 3600 }),
+    };
+    const service = new AuthService(
+      repository as never,
+      jwtService as never,
+      { getOrThrow: jest.fn((name: string) => (name.endsWith("EXP") ? "1h" : "secret")) } as never,
+      {} as never,
+      {} as never,
+    );
+
+    await service.refresh(user.userId, "device-1", "refresh-token");
+
+    expect(order).toEqual(["lock-user", "find-refresh", "sign-token", "sign-token", "rotate-refresh"]);
+    expect(repository.findRefreshToken).toHaveBeenCalledWith(user.userId, "device-1", store);
+    expect(repository.rotateRefreshToken).toHaveBeenCalledWith(expect.any(Object), store);
   });
 });

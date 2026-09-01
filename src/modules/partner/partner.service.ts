@@ -13,16 +13,19 @@ import {
   productSkus,
   products,
   sizes,
+  wishes,
 } from "src/modules/database/schema";
 import { EmailService } from "src/modules/email/email.service";
 import { MediaService } from "src/modules/media/media.service";
 import { hasValidProductSkus } from "src/modules/catalog/catalog.types";
+import { NotificationService } from "src/modules/notification/notification.service";
 import { PartnerErrorMessage } from "./partner.error";
 import {
   ApplyPartnerInput,
   PartnerProductFilterInput,
   PartnerProductInput,
   PartnerProductState,
+  UpdatePublishedProductSkusInput,
 } from "./partner.types";
 
 type Cursor = { updatedAt: string; productId: string };
@@ -43,6 +46,7 @@ export class PartnerService {
     @Inject(DRIZZLE) private readonly db: Database,
     private readonly emailService: EmailService,
     private readonly mediaService: MediaService,
+    private readonly notificationService: NotificationService,
   ) {}
 
   apply = async (ownerUserId: string, input: ApplyPartnerInput) => {
@@ -250,6 +254,89 @@ export class PartnerService {
       await this.mediaService.replaceImageReferences(tx, "PRODUCT", productId, imageKeys);
     });
     return this.getProduct(ownerUserId, productId);
+  };
+
+  updatePublishedProductSkus = async (ownerUserId: string, input: UpdatePublishedProductSkusInput) => {
+    if (
+      input.skus.some(
+        ({ price, stock }) => !Number.isInteger(price) || price < 0 || !Number.isInteger(stock) || stock < 0,
+      )
+    )
+      throw new CustomBadRequestException(PartnerErrorMessage.InvalidProductInput);
+    const partner = await this.approvedPartner(ownerUserId);
+    await this.db.transaction(async (tx) => {
+      const [product] = await tx
+        .select({
+          productId: products.productId,
+          skuUpdatedAt: sql<Date>`transaction_timestamp()`.mapWith(products.updatedAt),
+        })
+        .from(products)
+        .where(
+          and(
+            eq(products.productId, input.productId),
+            eq(products.partnerId, partner.partnerId),
+            eq(products.brandId, partner.brandId),
+            eq(products.status, "PUBLISHED"),
+            eq(products.approvalStatus, "APPROVED"),
+          ),
+        )
+        .limit(1)
+        .for("update");
+      if (!product) throw new CustomBadRequestException(PartnerErrorMessage.InvalidTransition);
+      const currentSkus = await tx
+        .select()
+        .from(productSkus)
+        .where(eq(productSkus.productId, product.productId))
+        .orderBy(asc(productSkus.skuId))
+        .for("update");
+      const nextById = new Map(input.skus.map((sku) => [sku.skuId, sku]));
+      if (
+        input.skus.length !== currentSkus.length ||
+        nextById.size !== currentSkus.length ||
+        currentSkus.some(({ skuId }) => !nextById.has(skuId))
+      )
+        throw new CustomBadRequestException(PartnerErrorMessage.InvalidProductInput);
+      const currentActiveSkus = currentSkus.filter(({ isActive }) => isActive);
+      const currentMinimumPrice = currentActiveSkus.length
+        ? Math.min(...currentActiveSkus.map(({ price }) => price))
+        : null;
+      const currentTotalStock = currentActiveSkus.reduce((total, { stock }) => total + stock, 0);
+      const nextSkus = currentSkus.map((sku) => ({ ...sku, ...requireResult(nextById.get(sku.skuId)) }));
+      for (const sku of nextSkus)
+        await tx
+          .update(productSkus)
+          .set({ price: sku.price, stock: sku.stock, updatedAt: product.skuUpdatedAt })
+          .where(eq(productSkus.skuId, sku.skuId));
+      const nextActiveSkus = nextSkus.filter(({ isActive }) => isActive);
+      const nextMinimumPrice = nextActiveSkus.length ? Math.min(...nextActiveSkus.map(({ price }) => price)) : null;
+      const nextTotalStock = nextActiveSkus.reduce((total, { stock }) => total + stock, 0);
+      const hasPriceDrop =
+        currentMinimumPrice !== null && nextMinimumPrice !== null && nextMinimumPrice < currentMinimumPrice;
+      const hasRestock = currentTotalStock === 0 && nextTotalStock > 0;
+      const wishers =
+        hasPriceDrop || hasRestock
+          ? await tx
+              .select({ userId: wishes.userId })
+              .from(wishes)
+              .where(eq(wishes.productId, product.productId))
+              .orderBy(wishes.userId)
+          : [];
+      const userIds = wishers.map(({ userId }) => userId);
+      if (hasPriceDrop)
+        await this.notificationService.createWishPriceDrop(tx, {
+          userIds,
+          productId: product.productId,
+          skuUpdatedAt: product.skuUpdatedAt,
+          newPrice: nextMinimumPrice,
+        });
+      if (hasRestock)
+        await this.notificationService.createWishRestock(tx, {
+          userIds,
+          productId: product.productId,
+          skuUpdatedAt: product.skuUpdatedAt,
+        });
+    });
+    return this.getProduct(ownerUserId, input.productId);
   };
 
   submit = async (ownerUserId: string, productId: string) =>

@@ -115,6 +115,50 @@ describe("durable email delivery outbox integration", () => {
     expect(proofs.rows[0]?.count).toBe(1);
   });
 
+  it("suppresses password reset links for passwordless accounts without sending mail", async () => {
+    const sendLink = jest.spyOn(sender, "sendLink").mockResolvedValue(undefined);
+    await pool.query(`UPDATE "users" SET "password" = NULL WHERE "email" = 'integration@example.test'`);
+    const requested = await request(app.getHttpServer())
+      .post("/graphql")
+      .set("x-device-id", "passwordless-reset-device")
+      .send({
+        query: `mutation RequestPasswordReset($input: RequestPasswordResetInput!) {
+          requestPasswordReset(input: $input) { ok }
+        }`,
+        variables: { input: { email: "integration@example.test" } },
+      });
+
+    expect(requested.body).toEqual({ data: { requestPasswordReset: { ok: true } } });
+    await worker.runOnce(new Date(Date.now() + 1_000));
+
+    expect(sendLink).not.toHaveBeenCalled();
+    const rows = await pool.query<{ kind: string; status: string }>(
+      `SELECT "kind", "status" FROM "emailDeliveryOutbox"`,
+    );
+    expect(rows.rows).toEqual([{ kind: "PASSWORD_RESET_LINK", status: "SUPPRESSED" }]);
+  });
+
+  it("delivers password reset links when the stored password is empty but non-null", async () => {
+    const sendLink = jest.spyOn(sender, "sendLink").mockResolvedValue(undefined);
+    await pool.query(`UPDATE "users" SET "password" = '' WHERE "email" = 'integration@example.test'`);
+    const requested = await request(app.getHttpServer())
+      .post("/graphql")
+      .set("x-device-id", "empty-password-reset-device")
+      .send({
+        query: `mutation RequestPasswordReset($input: RequestPasswordResetInput!) {
+          requestPasswordReset(input: $input) { ok }
+        }`,
+        variables: { input: { email: "integration@example.test" } },
+      });
+
+    expect(requested.body).toEqual({ data: { requestPasswordReset: { ok: true } } });
+    await worker.runOnce(new Date(Date.now() + 1_000));
+
+    expect(sendLink).toHaveBeenCalledTimes(1);
+    const rows = await pool.query<{ status: string }>(`SELECT "status" FROM "emailDeliveryOutbox"`);
+    expect(rows.rows).toEqual([{ status: "SENT" }]);
+  });
+
   it("retries an ambiguous signup send with the same proof, payload, and provider idempotency key", async () => {
     const sendCode = jest
       .spyOn(sender, "sendCode")

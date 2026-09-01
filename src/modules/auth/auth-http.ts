@@ -17,3 +17,8 @@ export const setTokenCookies = (res: Response, tokenData: TokenPayload) => {
   res.cookie("access_token", tokenData.accessToken, authCookieOptions);
   res.cookie("refresh_token", tokenData.refreshToken, authCookieOptions);
 };
+
+export const clearTokenCookies = (res: Response) => {
+  res.clearCookie("access_token", authCookieOptions);
+  res.clearCookie("refresh_token", authCookieOptions);
+};

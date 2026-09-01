@@ -158,6 +158,18 @@ describe("catalog PostgreSQL integration", () => {
     expect(response.body.data.productPriceSummary.priceRevision).not.toContain(":");
   });
 
+  it("does not expose the removed product price evidence query", async () => {
+    const response = await request(app.getHttpServer())
+      .post("/graphql")
+      .send({ query: `{ __type(name: "Query") { fields { name } } }` })
+      .expect(200);
+
+    expect(response.body.errors).toBeUndefined();
+    expect(response.body.data.__type.fields.map(({ name }: { name: string }) => name)).not.toContain(
+      "productPriceEvidence",
+    );
+  });
+
   it("reads list summaries and price snapshots from one repeatable-read transaction", async () => {
     const initialSnapshot = requireResult(
       (
@@ -235,10 +247,6 @@ describe("catalog PostgreSQL integration", () => {
         .expect(200),
       request(app.getHttpServer())
         .post("/graphql")
-        .send({ query: `{ productPriceEvidence(productId: "${FIXTURE.productId}") { priceRevision } }` })
-        .expect(200),
-      request(app.getHttpServer())
-        .post("/graphql")
         .send({
           query: `{ productPriceSummaries(filter: { query: "Integration Sale Tee" }) { nodes { priceRevision } } }`,
         })
@@ -302,7 +310,7 @@ describe("catalog PostgreSQL integration", () => {
     expect(summary.body.data.productPriceSummary.priceRevision).toBe(snapshot.revision);
   });
 
-  it("serves persisted evidence fields without rebuilding them from current SKUs", async () => {
+  it("serves persisted price summaries without rebuilding them from current SKUs", async () => {
     const revision = "90000000-0000-4000-8000-000000000099";
     const recordedAt = "2026-08-20T01:02:03.000Z";
     const verifiedAt = "2026-08-20T01:03:00.000Z";
@@ -321,19 +329,13 @@ describe("catalog PostgreSQL integration", () => {
     const response = await request(app.getHttpServer())
       .post("/graphql")
       .send({
-        query: `query Evidence($productId: String!, $priceRevision: String) {
+        query: `query PriceSummaries($productId: String!) {
           productPriceSummary(productId: $productId) { basePrice finalPrice priceRevision }
           productPriceSummaries(filter: { query: "Integration Sale Tee" }) {
             nodes { productId basePrice finalPrice priceRevision }
           }
-          productPriceEvidence(productId: $productId, priceRevision: $priceRevision) {
-            productId priceRevision offerSource calculatedAt
-            priceHistory { label price recordedAt }
-            couponConditions { title discountAmount condition }
-            shippingPolicy { title shippingFee condition }
-          }
         }`,
-        variables: { productId: FIXTURE.productId, priceRevision: revision },
+        variables: { productId: FIXTURE.productId },
       })
       .expect(200);
 
@@ -346,18 +348,6 @@ describe("catalog PostgreSQL integration", () => {
     expect(response.body.data.productPriceSummaries.nodes).toEqual([
       { productId: FIXTURE.productId, basePrice: 1250, finalPrice: 1250, priceRevision: revision },
     ]);
-    expect(response.body.data.productPriceEvidence).toEqual({
-      productId: FIXTURE.productId,
-      priceRevision: revision,
-      offerSource: "catalog_sku_price_snapshot",
-      calculatedAt: verifiedAt,
-      priceHistory: [
-        { label: "옵션 최고가", price: 2500, recordedAt },
-        { label: "옵션 최저가", price: 1250, recordedAt },
-      ],
-      couponConditions: [],
-      shippingPolicy: null,
-    });
   });
 
   it("does not rewrite price evidence for stock-only or equivalent price updates", async () => {
@@ -450,7 +440,7 @@ describe("catalog PostgreSQL integration", () => {
     expect(snapshot.recordedAt.getTime()).toBeGreaterThanOrEqual(requireResult(snapshotReleaseTime).getTime());
   });
 
-  it("removes the snapshot and reports unavailable evidence when no active SKU remains", async () => {
+  it("removes the snapshot and reports an unavailable summary when no active SKU remains", async () => {
     await pool.query(`UPDATE "productSkus" SET "isActive" = false WHERE "productId" = $1`, [FIXTURE.productId]);
 
     const snapshot = await pool.query(`SELECT 1 FROM "productPriceEvidenceSnapshots" WHERE "productId" = $1`, [
@@ -458,7 +448,7 @@ describe("catalog PostgreSQL integration", () => {
     ]);
     const response = await request(app.getHttpServer())
       .post("/graphql")
-      .send({ query: `{ productPriceEvidence(productId: "${FIXTURE.productId}") { priceRevision } }` })
+      .send({ query: `{ productPriceSummary(productId: "${FIXTURE.productId}") { priceRevision } }` })
       .expect(200);
 
     expect(snapshot.rowCount).toBe(0);

@@ -23,6 +23,7 @@ describe("PartnerService", () => {
       { select: jest.fn().mockReturnValue(partnerQuery("PENDING")) } as never,
       { createDraft: jest.fn() } as never,
       {} as never,
+      {} as never,
     );
     await expect(service.createDraft("user-1", validProductInput)).rejects.toThrow(
       PartnerErrorMessage.ApprovalRequiredForProduct,
@@ -34,6 +35,7 @@ describe("PartnerService", () => {
       { select: jest.fn().mockReturnValue(partnerQuery("REJECTED")) } as never,
       { publishProduct: jest.fn() } as never,
       {} as never,
+      {} as never,
     );
     await expect(service.publishProduct("user-1", "product-1")).rejects.toThrow(
       PartnerErrorMessage.ApprovalRequiredForPublishing,
@@ -42,7 +44,7 @@ describe("PartnerService", () => {
 
   it("rejects 101 SKUs before partner or catalog lookup", async () => {
     const select = jest.fn().mockReturnValue(partnerQuery("PENDING"));
-    const service = new PartnerService({ select } as never, {} as never, {} as never);
+    const service = new PartnerService({ select } as never, {} as never, {} as never, {} as never);
     const input: PartnerProductInput = {
       categoryId: "category-1",
       title: "Product",

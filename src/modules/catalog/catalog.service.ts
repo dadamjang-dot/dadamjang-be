@@ -1,10 +1,6 @@
 import { Inject, Injectable } from "@nestjs/common";
 import { SQL, and, asc, desc, eq, getTableColumns, gte, ilike, inArray, lte, or, sql } from "drizzle-orm";
-import {
-  CustomBadRequestException,
-  CustomConflictException,
-  CustomNotFoundException,
-} from "src/common/errors/custom-exceptions";
+import { CustomBadRequestException, CustomNotFoundException } from "src/common/errors/custom-exceptions";
 import { requireResult } from "src/common/invariants/require-result";
 import { Database, DRIZZLE } from "src/modules/database/database.module";
 import {
@@ -26,7 +22,6 @@ import {
   CreateProductDraftInput,
   hasValidProductSkus,
   ProductFilterInput,
-  ProductPriceEvidenceType,
   ProductPriceSummaryType,
   ProductSort,
   ProductType,
@@ -211,24 +206,6 @@ export class CatalogService {
     });
   };
 
-  getProductPriceEvidence = async (productId: string, priceRevision?: string): Promise<ProductPriceEvidenceType> => {
-    const product = await this.getProduct(productId);
-    this.requireActiveSku(product);
-    const snapshot = (await this.getPriceSnapshotsByProductIds([productId])).get(productId);
-    if (!snapshot) throw new CustomNotFoundException(CatalogErrorMessage.PriceEvidenceUnavailable);
-    if (priceRevision && priceRevision !== snapshot.revision)
-      throw new CustomConflictException(CatalogErrorMessage.PriceRevisionChanged);
-    return {
-      productId: snapshot.productId,
-      priceRevision: snapshot.revision,
-      priceHistory: this.priceEvidenceItems(snapshot.basePrice, snapshot.finalPrice, snapshot.recordedAt),
-      couponConditions: [],
-      shippingPolicy: null,
-      offerSource: snapshot.source,
-      calculatedAt: snapshot.verifiedAt,
-    };
-  };
-
   private getPriceSnapshotsByProductIds = async (productIds: string[], db: CatalogDatabase = this.db) => {
     if (productIds.length === 0) return new Map<string, ProductPriceEvidenceSnapshot>();
     const rows = await db
@@ -237,14 +214,6 @@ export class CatalogService {
       .where(inArray(productPriceEvidenceSnapshots.productId, productIds));
     return new Map(rows.map((snapshot) => [snapshot.productId, snapshot]));
   };
-
-  private priceEvidenceItems = (basePrice: number, finalPrice: number, recordedAt: Date) =>
-    basePrice === finalPrice
-      ? [{ label: "현재 판매가", price: finalPrice, recordedAt }]
-      : [
-          { label: "옵션 최고가", price: basePrice, recordedAt },
-          { label: "옵션 최저가", price: finalPrice, recordedAt },
-        ];
 
   private listCatalogProducts = async (filter: ProductFilterInput, includePriceSnapshots = false) => {
     const first = Math.min(Math.max(filter.first ?? 20, 1), MAX_PAGE_SIZE);

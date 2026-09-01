@@ -46,43 +46,53 @@ export class AuthService {
     );
     const signinStartedAt = await this.repository.signinStartedAt();
     const user = await this.repository.findByUserid(userid);
-    if (!user) {
+    if (!user || user.password === null) {
       await bcrypt.compare(input.password, invalidPasswordHash);
       throw new CustomUnauthorizedException(AuthErrorMessage.AuthRequired);
     }
     return this.withSigninLock(user.userId, deviceId, async (store) => {
-      if (!(await bcrypt.compare(input.password, user.password)))
-        throw new CustomUnauthorizedException(AuthErrorMessage.AuthRequired);
-      this.assertPortalRole((user as User & { role?: UserRoleValue }).role ?? UserRole.User, input.portal);
-      return this.issueTokensForUser(user, deviceId, store, signinStartedAt);
+      return this.repository.withActiveUserSession(
+        user.userId,
+        async (currentUser, transaction) => {
+          const passwordHash = currentUser.password ?? invalidPasswordHash;
+          if (currentUser.password === null || !(await bcrypt.compare(input.password, passwordHash)))
+            throw new CustomUnauthorizedException(AuthErrorMessage.AuthRequired);
+          this.assertPortalRole((currentUser as User & { role?: UserRoleValue }).role ?? UserRole.User, input.portal);
+          return this.issueTokensForUser(currentUser, deviceId, transaction, signinStartedAt);
+        },
+        store,
+      );
     });
   };
   refresh = async (userId: string, deviceId: string, refreshToken: string) => {
-    const rotationKey = hashToken(`${deviceId}\0${refreshToken}`);
-    const saved = await this.repository.findRefreshToken(userId, deviceId);
-    if (
-      !saved ||
-      saved.refreshTokenExp.getTime() <= Date.now() ||
-      !(await matchesRefreshToken(refreshToken, saved.refreshToken))
-    ) {
-      if (await this.repository.hasRecentRotation(userId, deviceId, rotationKey))
-        throw new CustomConflictException(AuthErrorMessage.SessionChanged);
-      throw new CustomUnauthorizedException(AuthErrorMessage.AuthRequired);
-    }
-    const user = await this.repository.findUser(userId);
-    if (!user) throw new CustomUnauthorizedException(AuthErrorMessage.AuthRequired);
-    const tokens = await this.createTokensForUser(user, deviceId);
-    const rotation = await this.repository.rotateRefreshToken({
-      userId,
-      deviceId,
-      previousRefreshToken: saved.refreshToken,
-      rotationKey,
-      refreshToken: tokens.refreshTokenHash,
-      refreshTokenExp: tokens.refreshTokenExp,
+    return this.repository.withActiveUserSession(userId, async (user, store) => {
+      const rotationKey = hashToken(`${deviceId}\0${refreshToken}`);
+      const saved = await this.repository.findRefreshToken(userId, deviceId, store);
+      if (
+        !saved ||
+        saved.refreshTokenExp.getTime() <= Date.now() ||
+        !(await matchesRefreshToken(refreshToken, saved.refreshToken))
+      ) {
+        if (await this.repository.hasRecentRotation(userId, deviceId, rotationKey, store))
+          throw new CustomConflictException(AuthErrorMessage.SessionChanged);
+        throw new CustomUnauthorizedException(AuthErrorMessage.AuthRequired);
+      }
+      const tokens = await this.createTokensForUser(user, deviceId);
+      const rotation = await this.repository.rotateRefreshToken(
+        {
+          userId,
+          deviceId,
+          previousRefreshToken: saved.refreshToken,
+          rotationKey,
+          refreshToken: tokens.refreshTokenHash,
+          refreshTokenExp: tokens.refreshTokenExp,
+        },
+        store,
+      );
+      if (rotation === "concurrent") throw new CustomConflictException(AuthErrorMessage.SessionChanged);
+      if (rotation === "invalid") throw new CustomUnauthorizedException(AuthErrorMessage.AuthRequired);
+      return tokens.payload;
     });
-    if (rotation === "concurrent") throw new CustomConflictException(AuthErrorMessage.SessionChanged);
-    if (rotation === "invalid") throw new CustomUnauthorizedException(AuthErrorMessage.AuthRequired);
-    return tokens.payload;
   };
   logout = async (userId: string, deviceId: string, refreshToken: string) => {
     const saved = await this.repository.findRefreshToken(userId, deviceId);
@@ -95,7 +105,7 @@ export class AuthService {
       throw new CustomUnauthorizedException(AuthErrorMessage.AuthRequired);
     return true;
   };
-  getViewer = async (userId: string) => this.repository.findUser(userId);
+  getViewer = async (userId: string) => this.repository.findViewer(userId);
   withSigninLock = async <T>(userId: string, deviceId: string, action: (store: RefreshTokenStore) => Promise<T>) => {
     const result = await this.repository.withSigninLock(userId, deviceId, action);
     if (!result.acquired) throw new CustomConflictException(AuthErrorMessage.SessionChanged);
@@ -103,21 +113,27 @@ export class AuthService {
   };
   signinStartedAt = () => this.repository.signinStartedAt();
   issueTokensForUser = async (user: User, deviceId: string, store?: RefreshTokenStore, signinStartedAt?: Date) => {
-    const previous = await this.repository.findRefreshToken(user.userId, deviceId, store);
-    const tokens = await this.createTokensForUser(user, deviceId);
-    const saved = await this.repository.saveRefreshToken(
-      {
-        userId: user.userId,
-        deviceId,
-        ...(previous === undefined ? {} : { previousRefreshToken: previous.refreshToken }),
-        ...(signinStartedAt === undefined ? {} : { signinStartedAt }),
-        refreshToken: tokens.refreshTokenHash,
-        refreshTokenExp: tokens.refreshTokenExp,
+    return this.repository.withActiveUserSession(
+      user.userId,
+      async (currentUser, transaction) => {
+        const previous = await this.repository.findRefreshToken(user.userId, deviceId, transaction);
+        const tokens = await this.createTokensForUser(currentUser, deviceId);
+        const saved = await this.repository.saveRefreshToken(
+          {
+            userId: user.userId,
+            deviceId,
+            ...(previous === undefined ? {} : { previousRefreshToken: previous.refreshToken }),
+            ...(signinStartedAt === undefined ? {} : { signinStartedAt }),
+            refreshToken: tokens.refreshTokenHash,
+            refreshTokenExp: tokens.refreshTokenExp,
+          },
+          transaction,
+        );
+        if (!saved) throw new CustomConflictException(AuthErrorMessage.SessionChanged);
+        return tokens.payload;
       },
       store,
     );
-    if (!saved) throw new CustomConflictException(AuthErrorMessage.SessionChanged);
-    return tokens.payload;
   };
   private createTokensForUser = async (user: User, deviceId: string) => {
     const role = (user as User & { role?: UserRoleValue }).role ?? UserRole.User;

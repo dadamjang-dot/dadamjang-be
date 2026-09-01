@@ -1,4 +1,4 @@
-import { Field, InputType, Int, ObjectType, registerEnumType } from "@nestjs/graphql";
+import { Field, ID, InputType, Int, ObjectType, registerEnumType } from "@nestjs/graphql";
 import { BrandType, ProductSkuInput, ProductType } from "src/modules/catalog/catalog.types";
 
 @InputType()
@@ -27,6 +27,19 @@ export class PartnerProductInput {
   @Field(() => [ProductSkuInput]) skus!: ProductSkuInput[];
   @Field(() => Boolean, { nullable: true }) isOnSale?: boolean;
   @Field(() => Boolean, { nullable: true }) isExpressDelivery?: boolean;
+}
+
+@InputType()
+export class UpdatePublishedProductSkuInput {
+  @Field(() => ID) skuId!: string;
+  @Field(() => Int) price!: number;
+  @Field(() => Int) stock!: number;
+}
+
+@InputType()
+export class UpdatePublishedProductSkusInput {
+  @Field(() => ID) productId!: string;
+  @Field(() => [UpdatePublishedProductSkuInput]) skus!: UpdatePublishedProductSkuInput[];
 }
 
 @InputType()

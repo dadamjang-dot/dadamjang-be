@@ -3,7 +3,13 @@ import { and, asc, desc, eq, gt, inArray, isNull, lt, lte, or, sql } from "drizz
 import { randomUUID } from "crypto";
 import { requireResult } from "src/common/invariants/require-result";
 import { hashToken } from "src/common/security/token-hash";
-import { Database, type DatabaseExecutor, DRIZZLE } from "src/modules/database/database.module";
+import {
+  Database,
+  type DatabaseExecutor,
+  type DatabaseTransaction,
+  DRIZZLE,
+} from "src/modules/database/database.module";
+import { lockEmailDelivery } from "./email-delivery-lock";
 import {
   adminInvites,
   emailDeliveryOutbox,
@@ -179,23 +185,28 @@ export class EmailRepository {
       proofId?: string;
       requestIpHash?: string;
     }>,
-    executor: DatabaseExecutor = this.db,
-  ) =>
-    requireResult(
-      (
-        await executor
-          .insert(emailDeliveryOutbox)
-          .values({
-            email: input.email,
-            expiresAt: input.expiresAt,
-            kind: input.kind,
-            ...(input.payloadCiphertext ? { payloadCiphertext: input.payloadCiphertext } : {}),
-            ...(input.proofId ? { proofId: input.proofId } : {}),
-            ...(input.requestIpHash ? { requestIpHash: input.requestIpHash } : {}),
-          })
-          .returning()
-      )[0],
-    );
+    transaction?: DatabaseTransaction,
+  ) => {
+    const enqueue = async (tx: DatabaseTransaction) => {
+      await lockEmailDelivery(tx, input.email);
+      return requireResult(
+        (
+          await tx
+            .insert(emailDeliveryOutbox)
+            .values({
+              email: input.email,
+              expiresAt: input.expiresAt,
+              kind: input.kind,
+              ...(input.payloadCiphertext ? { payloadCiphertext: input.payloadCiphertext } : {}),
+              ...(input.proofId ? { proofId: input.proofId } : {}),
+              ...(input.requestIpHash ? { requestIpHash: input.requestIpHash } : {}),
+            })
+            .returning()
+        )[0],
+      );
+    };
+    return transaction ? enqueue(transaction) : this.db.transaction(enqueue);
+  };
 
   claimDelivery = async (now = new Date()) =>
     this.db.transaction(async (tx) => {
@@ -271,7 +282,7 @@ export class EmailRepository {
         delivery.kind === EmailDeliveryKind.SignupCode
           ? { email: delivery.email }
           : await tx.query.users.findFirst({ where: eq(users.email, delivery.email) });
-      if (!user) {
+      if (!user || ("password" in user && user.password === null)) {
         await tx
           .update(emailDeliveryOutbox)
           .set({ ...redactedDelivery, claimToken: null, claimedAt: null, status: "SUPPRESSED", updatedAt: now })
@@ -513,7 +524,7 @@ export class EmailRepository {
       const userId = linkProof?.userId ?? emailProof?.userId;
       if (!userId) return false;
       const [user] = await tx.select().from(users).where(eq(users.userId, userId)).for("update");
-      if (!user) return false;
+      if (!user || user.password === null) return false;
       const now = new Date();
       const [consumedProof] = linkProof
         ? await tx

@@ -20,13 +20,12 @@
 - `productPriceSummaries(filter)`: 상품 목록/검색용 경량 가격 요약 connection입니다.
 - `comparisonPriceSummaries`: 비교함용 경량 가격 요약 목록입니다.
 - `productPriceSummary(productId)`: 상품 상세용 경량 가격 요약입니다.
-- `productPriceEvidence(productId, priceRevision)`: 현재 옵션 최고/최저가 snapshot과 원천·확인 시각을 별도 조회하는 lazy query입니다.
 
-목록/비교 query는 상세 가격 근거를 포함하지 않습니다. 가격 변경 처리 시 전체 상품 목록 invalidate 대신 `productId + priceRevision` 기준 evidence/offer key만 갱신하는 것을 기본 전략으로 둡니다.
+가격 변경 처리 시 전체 상품 목록 invalidate 대신 `productId + priceRevision` 기준 가격 요약 key만 갱신하는 것을 기본 전략으로 둡니다.
 
-`productPriceEvidenceSnapshots`는 게시 상품의 최신 snapshot 한 건만 유지하며 기간별 가격 이력은 저장하지 않습니다. 모든 가격 요약과 evidence는 저장된 snapshot을 필수로 사용하며, snapshot이 없으면 unavailable을 반환하고 현재 SKU로 revision이나 근거를 합성하지 않습니다. 쿠폰은 빈 목록, 배송 정책은 `null`로 반환합니다. 실제 쿠폰·배송 원천이 생기기 전에는 값을 추정하지 않습니다.
+`productPriceEvidenceSnapshots`는 게시 상품의 최신 snapshot 한 건만 유지하며 기간별 가격 이력은 저장하지 않습니다. 모든 가격 요약은 저장된 snapshot을 필수로 사용하며, snapshot이 없으면 unavailable을 반환하고 현재 SKU로 revision을 합성하지 않습니다.
 
-실제 비교가 원천이 생기기 전까지 공개 가격 요약의 `basePrice`와 `finalPrice`는 모두 활성 옵션 최저가입니다. 옵션 최고가는 할인 전 가격으로 해석하지 않고 evidence의 옵션 범위에만 표시합니다. 활성 SKU가 없는 게시 상품은 catalog 목록과 `totalCount`에서 제외되며 상세 가격 조회는 unavailable로 처리합니다.
+실제 비교가 원천이 생기기 전까지 공개 가격 요약의 `basePrice`와 `finalPrice`는 모두 활성 옵션 최저가입니다. 활성 SKU가 없는 게시 상품은 catalog 목록과 `totalCount`에서 제외되며 상세 가격 조회는 unavailable로 처리합니다.
 
 최신 가격 snapshot은 게시 상품의 가격 관련 SKU row write마다 해당 상품의 활성 SKU를 다시 집계합니다. SKU 100개 상한에서는 허용하는 비용이며 statement-level 집계나 비동기 갱신으로 확장하지 않은 현재 write-scalability 상한입니다.
 

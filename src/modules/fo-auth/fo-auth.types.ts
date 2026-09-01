@@ -72,6 +72,32 @@ export class SignupFoInput {
   consents!: ConsentAcceptanceInput[];
 }
 
+export const FoSigninStatus = {
+  SignedIn: "SIGNED_IN",
+  ReactivationRequired: "REACTIVATION_REQUIRED",
+} as const;
+
+export type FoSigninStatusValue = (typeof FoSigninStatus)[keyof typeof FoSigninStatus];
+
+const FoSigninStatusGraphQl = {
+  SIGNED_IN: FoSigninStatus.SignedIn,
+  REACTIVATION_REQUIRED: FoSigninStatus.ReactivationRequired,
+} as const;
+
+registerEnumType(FoSigninStatusGraphQl, { name: "FoSigninStatus" });
+
+@ObjectType()
+export class FoSigninResult {
+  @Field(() => FoSigninStatusGraphQl)
+  status!: FoSigninStatusValue;
+
+  @Field(() => TokenPayload, { nullable: true })
+  tokenPayload?: TokenPayload;
+
+  @Field({ nullable: true })
+  reactivationToken?: string;
+}
+
 @ObjectType()
 export class FindFoEmailPayload {
   @Field()
@@ -93,6 +119,7 @@ export class MarketingConsentPayload {
 export const KakaoLoginStatus = {
   SIGNED_IN: "SIGNED_IN",
   SIGNUP_REQUIRED: "SIGNUP_REQUIRED",
+  REACTIVATION_REQUIRED: "REACTIVATION_REQUIRED",
 } as const;
 
 export type KakaoLoginStatusValue = (typeof KakaoLoginStatus)[keyof typeof KakaoLoginStatus];
@@ -136,6 +163,9 @@ export class KakaoLoginResult {
 
   @Field()
   emailVerificationRequired!: boolean;
+
+  @Field({ nullable: true })
+  reactivationToken?: string;
 }
 
 @InputType()

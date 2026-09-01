@@ -18,6 +18,7 @@ import {
 } from "src/modules/database/schema";
 import { MediaService } from "src/modules/media/media.service";
 import { IMAGE_SUMMARY_WIDTH } from "src/modules/media/media.constant";
+import { NotificationService } from "src/modules/notification/notification.service";
 import { MAX_PAGE_SIZE } from "./style-posts.constant";
 import { StylePostErrorMessage } from "./style-posts.error";
 import {
@@ -146,6 +147,7 @@ export class StylePostsService {
     @Inject(DRIZZLE) private readonly db: Database,
     private readonly mediaService: MediaService,
     configService: ConfigService,
+    private readonly notificationService: NotificationService,
   ) {
     this.cursorSecret = configService.getOrThrow<string>("JWT_ACCESS_TOKEN_SECRET");
   }
@@ -446,13 +448,23 @@ export class StylePostsService {
     await this.db.transaction(async (tx) => {
       await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${`${stylePostId}:${userId}`}, 5))`);
       const [post] = await tx
-        .select({ stylePostId: stylePosts.stylePostId })
+        .select({ authorUserId: stylePosts.authorId })
         .from(stylePosts)
         .where(eq(stylePosts.stylePostId, stylePostId))
         .limit(1);
       if (!post) throw new CustomNotFoundException(StylePostErrorMessage.NotFound);
       if (liked) {
-        await tx.insert(stylePostLikes).values({ stylePostId, userId }).onConflictDoNothing();
+        const [insertedLike] = await tx
+          .insert(stylePostLikes)
+          .values({ stylePostId, userId })
+          .onConflictDoNothing()
+          .returning({ stylePostLikeId: stylePostLikes.stylePostLikeId });
+        if (insertedLike && post.authorUserId !== userId)
+          await this.notificationService.createStyleLike(tx, {
+            actorUserId: userId,
+            authorUserId: post.authorUserId,
+            stylePostId,
+          });
         return;
       }
       await tx
@@ -511,7 +523,7 @@ export class StylePostsService {
     const brandIds = unique(rows.flatMap((row) => row.brandTagIds ?? []));
     const [authors, productLinks, likeCounts, likedRows, brandRows] = await Promise.all([
       this.db
-        .select({ userId: users.userId, userid: users.userid })
+        .select({ userId: users.userId, userid: users.userid, anonymizedAt: users.anonymizedAt })
         .from(users)
         .where(inArray(users.userId, authorIds)),
       this.db
@@ -553,7 +565,12 @@ export class StylePostsService {
             .where(inArray(brands.brandId, brandIds))
         : Promise.resolve([] as { brandId: string; name: string }[]),
     ]);
-    const authorById = new Map(authors.map((author) => [author.userId, author]));
+    const authorById = new Map(
+      authors.map(({ userId, userid, anonymizedAt }) => [
+        userId,
+        { userId, userid: anonymizedAt ? "탈퇴한 사용자" : userid },
+      ]),
+    );
     const productsByPost = new Map<string, StylePostProductType[]>();
     for (const product of productLinks) {
       const list = productsByPost.get(product.stylePostId) ?? [];

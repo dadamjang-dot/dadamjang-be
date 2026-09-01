@@ -21,10 +21,24 @@ describe("KakaoFlowRepository", () => {
     const returning = jest.fn().mockResolvedValue([flow]);
     const where = jest.fn().mockReturnValue({ returning });
     const set = jest.fn().mockReturnValue({ where });
+    const select = jest
+      .fn()
+      .mockReturnValueOnce({
+        from: jest.fn().mockReturnValue({
+          where: jest.fn().mockReturnValue({ limit: jest.fn().mockResolvedValue([flow]) }),
+        }),
+      })
+      .mockReturnValueOnce({
+        from: jest.fn().mockReturnValue({
+          where: jest.fn().mockReturnValue({
+            limit: jest.fn().mockReturnValue({ for: jest.fn().mockResolvedValue([user]) }),
+          }),
+        }),
+      });
     const tx = {
       execute: jest.fn().mockResolvedValue(undefined),
+      select,
       update: jest.fn().mockReturnValue({ set }),
-      query: { users: { findFirst: jest.fn().mockResolvedValue(user) } },
     };
     const transaction = jest.fn(async (callback: (value: typeof tx) => unknown) => callback(tx));
     const issueTokens = jest.fn().mockRejectedValue(new Error("session write failed"));
