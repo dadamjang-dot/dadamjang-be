@@ -5,7 +5,6 @@ import {
   CatalogFilterOptionsType,
   ProductConnectionType,
   ProductFilterInput,
-  ProductPriceEvidenceType,
   ProductPriceSummaryConnectionType,
   ProductPriceSummaryType,
   ProductType,
@@ -46,13 +45,5 @@ export class CatalogResolver {
   @Query(() => ProductType)
   product(@Args("productId") productId: string) {
     return this.catalogService.getProduct(productId);
-  }
-
-  @Query(() => ProductPriceEvidenceType)
-  productPriceEvidence(
-    @Args("productId") productId: string,
-    @Args("priceRevision", { nullable: true }) priceRevision?: string,
-  ) {
-    return this.catalogService.getProductPriceEvidence(productId, priceRevision);
   }
 }

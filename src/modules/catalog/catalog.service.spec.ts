@@ -452,79 +452,7 @@ describe("catalog SKU boundaries", () => {
   });
 });
 
-describe("catalog price evidence", () => {
-  it("returns the stored price evidence snapshot instead of rebuilding it from the current product", async () => {
-    const recordedAt = new Date("2026-08-20T01:02:03Z");
-    const calculatedAt = new Date("2026-08-20T01:03:00Z");
-    const snapshotQuery = metadataQuery([
-      {
-        productId: "product-a",
-        revision: "90000000-0000-4000-8000-000000000004",
-        source: "catalog_sku_price_snapshot",
-        basePrice: 2500,
-        finalPrice: 1250,
-        recordedAt,
-        verifiedAt: calculatedAt,
-      },
-    ]);
-    const service = new CatalogService({ select: jest.fn().mockReturnValue(snapshotQuery) } as never, {} as never);
-    jest.spyOn(service, "getProduct").mockResolvedValue({
-      productId: "product-a",
-      title: "A",
-      imageKeys: [],
-      imageUrls: [],
-      isOnSale: true,
-      isExpressDelivery: false,
-      skus: [{ price: 999 }],
-      createdAt: new Date("2026-08-29T00:00:00Z"),
-    } as never);
-
-    await expect(service.getProductPriceEvidence("product-a")).resolves.toEqual({
-      productId: "product-a",
-      priceRevision: "90000000-0000-4000-8000-000000000004",
-      priceHistory: [
-        { label: "옵션 최고가", price: 2500, recordedAt },
-        { label: "옵션 최저가", price: 1250, recordedAt },
-      ],
-      couponConditions: [],
-      shippingPolicy: null,
-      offerSource: "catalog_sku_price_snapshot",
-      calculatedAt,
-    });
-  });
-
-  it("rejects price evidence when the persisted snapshot is missing", async () => {
-    const service = createCatalogService();
-    jest.spyOn(service, "getProduct").mockResolvedValue({
-      productId: "product-a",
-      title: "A",
-      imageKeys: [],
-      imageUrls: [],
-      isOnSale: false,
-      isExpressDelivery: false,
-      skus: [{ price: 3000 }, { price: 1000 }],
-      createdAt: new Date("2026-08-29T00:00:00Z"),
-    } as never);
-
-    await expect(service.getProductPriceEvidence("product-a")).rejects.toThrow("Product price evidence unavailable");
-  });
-
-  it("rejects price evidence when no active SKU is available", async () => {
-    const service = createCatalogService();
-    jest.spyOn(service, "getProduct").mockResolvedValue({
-      productId: "product-a",
-      title: "A",
-      imageKeys: [],
-      imageUrls: [],
-      isOnSale: false,
-      isExpressDelivery: false,
-      skus: [],
-      createdAt: new Date("2026-08-29T00:00:00Z"),
-    } as never);
-
-    await expect(service.getProductPriceEvidence("product-a")).rejects.toThrow("Product price evidence unavailable");
-  });
-
+describe("catalog price summaries", () => {
   it("rejects a singular price summary when no active SKU is available", async () => {
     const service = createCatalogService();
     jest.spyOn(service, "getProduct").mockResolvedValue({
@@ -555,40 +483,5 @@ describe("catalog price evidence", () => {
     } as never);
 
     await expect(service.getProductPriceSummary("product-a")).rejects.toThrow("Product price evidence unavailable");
-  });
-
-  it("rejects evidence for a stale price revision", async () => {
-    const service = new CatalogService(
-      {
-        select: jest.fn().mockReturnValue(
-          metadataQuery([
-            {
-              productId: "product-a",
-              revision: "90000000-0000-4000-8000-000000000005",
-              source: "catalog_sku_price_snapshot",
-              basePrice: 1000,
-              finalPrice: 1000,
-              recordedAt: new Date("2026-08-30T00:00:00Z"),
-              verifiedAt: new Date("2026-08-30T00:00:00Z"),
-            },
-          ]),
-        ),
-      } as never,
-      {} as never,
-    );
-    jest.spyOn(service, "getProduct").mockResolvedValue({
-      productId: "product-a",
-      title: "A",
-      imageKeys: [],
-      imageUrls: [],
-      isOnSale: true,
-      isExpressDelivery: false,
-      skus: [{ price: 1000 }],
-      createdAt: new Date("2026-08-29T00:00:00Z"),
-    } as never);
-
-    await expect(service.getProductPriceEvidence("product-a", "stale-revision")).rejects.toThrow(
-      "Product price has changed",
-    );
   });
 });
