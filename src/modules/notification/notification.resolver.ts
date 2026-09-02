@@ -65,9 +65,4 @@ export class NotificationResolver {
   registerFoPushDevice(@Context("req") req: AuthRequest, @Args("input") input: RegisterFoPushDeviceInput) {
     return this.service.registerDevice(req.user.userId, deviceIdFromRequest(req), input);
   }
-
-  @Mutation(() => Boolean)
-  unregisterFoPushDevice(@Context("req") req: AuthRequest) {
-    return this.service.unregisterDevice(req.user.userId, deviceIdFromRequest(req));
-  }
 }

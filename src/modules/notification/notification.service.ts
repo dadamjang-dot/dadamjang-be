@@ -199,9 +199,4 @@ export class NotificationService {
       return this.repository.transferDevice(tx, { ...input, expoPushToken, userId, installationId });
     });
   };
-
-  unregisterDevice = async (userId: string, installationId: string): Promise<boolean> => {
-    await this.db.transaction((tx) => this.repository.disableInstallation(tx, userId, installationId, "UNREGISTERED"));
-    return true;
-  };
 }

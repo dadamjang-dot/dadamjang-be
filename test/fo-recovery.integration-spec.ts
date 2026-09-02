@@ -17,6 +17,24 @@ const resetPassword = (app: INestApplication, token: string, password: string) =
       variables: { input: { token, password } },
     });
 
+const seedPasswordResetProof = async (
+  pool: Pool,
+  token: string,
+  verificationId: string,
+  expiresAt = new Date(Date.now() + 10 * 60_000),
+) => {
+  await pool.query(
+    `INSERT INTO "emailVerification" ("id", "email", "purpose", "codeHash", "expiresAt", "verifiedAt")
+     VALUES ($1, 'integration@example.test', 'PASSWORD_RESET', 'verified-proof', $2, now())`,
+    [verificationId, expiresAt.toISOString()],
+  );
+  await pool.query(
+    `INSERT INTO "emailVerificationToken" ("tokenHash", "email", "purpose", "verificationId", "expiresAt")
+     VALUES ($1, 'integration@example.test', 'PASSWORD_RESET', $2, $3)`,
+    [hashToken(token), verificationId, expiresAt.toISOString()],
+  );
+};
+
 const installResetRaceDelay = async (pool: Pool) => {
   await pool.query(`
     CREATE OR REPLACE FUNCTION delay_reset_proof_use() RETURNS trigger AS $$
@@ -29,11 +47,6 @@ const installResetRaceDelay = async (pool: Pool) => {
     $$ LANGUAGE plpgsql
   `);
   await pool.query(`
-    CREATE TRIGGER delay_link_reset_proof_use
-    BEFORE UPDATE OF "usedAt" ON "passwordResetToken"
-    FOR EACH ROW EXECUTE FUNCTION delay_reset_proof_use()
-  `);
-  await pool.query(`
     CREATE TRIGGER delay_email_reset_proof_use
     BEFORE UPDATE OF "usedAt" ON "emailVerificationToken"
     FOR EACH ROW EXECUTE FUNCTION delay_reset_proof_use()
@@ -41,30 +54,13 @@ const installResetRaceDelay = async (pool: Pool) => {
 };
 
 const removeResetRaceDelay = async (pool: Pool) => {
-  await pool.query(`DROP TRIGGER IF EXISTS delay_link_reset_proof_use ON "passwordResetToken"`);
   await pool.query(`DROP TRIGGER IF EXISTS delay_email_reset_proof_use ON "emailVerificationToken"`);
   await pool.query(`DROP FUNCTION IF EXISTS delay_reset_proof_use()`);
 };
 
 const seedResetRace = async (pool: Pool) => {
-  await pool.query(
-    `INSERT INTO "passwordResetToken" ("tokenHash", "userId", "expiresAt")
-     VALUES ($1, $3, now() + interval '10 minutes'), ($2, $3, now() + interval '10 minutes')`,
-    [hashToken("race-link-a"), hashToken("race-link-b"), FIXTURE.userId],
-  );
-  await pool.query(
-    `INSERT INTO "emailVerification" ("id", "email", "purpose", "codeHash", "expiresAt", "verifiedAt")
-     VALUES
-       ('e0000000-0000-4000-8000-000000000010', 'integration@example.test', 'PASSWORD_RESET', 'hash-a', now() + interval '10 minutes', now()),
-       ('e0000000-0000-4000-8000-000000000011', 'integration@example.test', 'PASSWORD_RESET', 'hash-b', now() + interval '10 minutes', now())`,
-  );
-  await pool.query(
-    `INSERT INTO "emailVerificationToken" ("tokenHash", "email", "purpose", "verificationId", "expiresAt")
-     VALUES
-       ($1, 'integration@example.test', 'PASSWORD_RESET', 'e0000000-0000-4000-8000-000000000010', now() + interval '10 minutes'),
-       ($2, 'integration@example.test', 'PASSWORD_RESET', 'e0000000-0000-4000-8000-000000000011', now() + interval '10 minutes')`,
-    [hashToken("race-email-a"), hashToken("race-email-b")],
-  );
+  await seedPasswordResetProof(pool, "race-email-a", "e0000000-0000-4000-8000-000000000010");
+  await seedPasswordResetProof(pool, "race-email-b", "e0000000-0000-4000-8000-000000000011");
   await pool.query(
     `INSERT INTO "refreshToken" ("userId", "deviceId", "refreshToken", "refreshTokenExp")
      VALUES ($1, 'race-device', 'race-session', now() + interval '1 day')`,
@@ -152,11 +148,7 @@ describe("FO account recovery GraphQL integration", () => {
 
   it("does not let a stale recovery proof add a password to a passwordless account", async () => {
     await pool.query(`UPDATE "users" SET "password" = NULL WHERE "userId" = $1`, [FIXTURE.userId]);
-    await pool.query(
-      `INSERT INTO "passwordResetToken" ("tokenHash", "userId", "expiresAt")
-       VALUES ($1, $2, now() + interval '10 minutes')`,
-      [hashToken("stale-passwordless-proof"), FIXTURE.userId],
-    );
+    await seedPasswordResetProof(pool, "stale-passwordless-proof", "e0000000-0000-4000-8000-000000000101");
 
     const response = await resetPassword(app, "stale-passwordless-proof", "AddedPassword123!");
 
@@ -164,7 +156,7 @@ describe("FO account recovery GraphQL integration", () => {
     const state = await pool.query<{ password: string | null; usedAt: Date | null }>(
       `SELECT u."password", p."usedAt"
        FROM "users" u
-       JOIN "passwordResetToken" p ON p."userId" = u."userId"
+       JOIN "emailVerificationToken" p ON p."email" = u."email"
        WHERE u."userId" = $1 AND p."tokenHash" = $2`,
       [FIXTURE.userId, hashToken("stale-passwordless-proof")],
     );
@@ -173,11 +165,7 @@ describe("FO account recovery GraphQL integration", () => {
 
   it("resets an empty but non-null legacy password", async () => {
     await pool.query(`UPDATE "users" SET "password" = '' WHERE "userId" = $1`, [FIXTURE.userId]);
-    await pool.query(
-      `INSERT INTO "passwordResetToken" ("tokenHash", "userId", "expiresAt")
-       VALUES ($1, $2, now() + interval '10 minutes')`,
-      [hashToken("empty-password-proof"), FIXTURE.userId],
-    );
+    await seedPasswordResetProof(pool, "empty-password-proof", "e0000000-0000-4000-8000-000000000102");
 
     const response = await resetPassword(app, "empty-password-proof", "ReplacedPassword123!");
 
@@ -185,7 +173,7 @@ describe("FO account recovery GraphQL integration", () => {
     const state = await pool.query<{ password: string; usedAt: Date | null }>(
       `SELECT u."password", p."usedAt"
        FROM "users" u
-       JOIN "passwordResetToken" p ON p."userId" = u."userId"
+       JOIN "emailVerificationToken" p ON p."email" = u."email"
        WHERE u."userId" = $1 AND p."tokenHash" = $2`,
       [FIXTURE.userId, hashToken("empty-password-proof")],
     );
@@ -194,28 +182,19 @@ describe("FO account recovery GraphQL integration", () => {
   });
 
   it("revokes every sibling password-recovery proof", async () => {
-    const verificationId = "e0000000-0000-4000-8000-000000000001";
+    const primaryVerificationId = "e0000000-0000-4000-8000-000000000001";
     const activeCodeId = "e0000000-0000-4000-8000-000000000002";
+    const siblingVerificationId = "e0000000-0000-4000-8000-000000000003";
     const activeCodeHash = await bcrypt.hash(
       "integration@example.test:654321:PASSWORD_RESET:integration-email-pepper",
       4,
     );
-    await pool.query(
-      `INSERT INTO "passwordResetToken" ("tokenHash", "userId", "expiresAt")
-       VALUES ($1, $3, now() + interval '10 minutes'), ($2, $3, now() + interval '10 minutes')`,
-      [hashToken("primary-reset-proof"), hashToken("sibling-link-proof"), FIXTURE.userId],
-    );
+    await seedPasswordResetProof(pool, "primary-reset-proof", primaryVerificationId);
+    await seedPasswordResetProof(pool, "sibling-code-proof", siblingVerificationId);
     await pool.query(
       `INSERT INTO "emailVerification" ("id", "email", "purpose", "codeHash", "expiresAt", "verifiedAt", "createdAt")
-       VALUES
-         ($1, 'integration@example.test', 'PASSWORD_RESET', 'verified-hash', now() + interval '10 minutes', now(), now()),
-         ($2, 'integration@example.test', 'PASSWORD_RESET', $3, now() + interval '10 minutes', null, now() + interval '1 second')`,
-      [verificationId, activeCodeId, activeCodeHash],
-    );
-    await pool.query(
-      `INSERT INTO "emailVerificationToken" ("tokenHash", "email", "purpose", "verificationId", "expiresAt")
-       VALUES ($1, 'integration@example.test', 'PASSWORD_RESET', $2, now() + interval '10 minutes')`,
-      [hashToken("sibling-code-proof"), verificationId],
+       VALUES ($1, 'integration@example.test', 'PASSWORD_RESET', $2, now() + interval '10 minutes', null, now() + interval '1 second')`,
+      [activeCodeId, activeCodeHash],
     );
     await pool.query(
       `INSERT INTO "refreshToken" ("userId", "deviceId", "refreshToken", "refreshTokenExp")
@@ -226,21 +205,18 @@ describe("FO account recovery GraphQL integration", () => {
     const reset = await resetPassword(app, "primary-reset-proof", "PrimaryPassword123!");
     expect(reset.body.errors).toBeUndefined();
     const activeProofs = await pool.query<{
-      linkProofs: number;
       emailProofs: number;
       codes: number;
       refreshTokens: number;
     }>(
       `SELECT
-         (SELECT count(*)::int FROM "passwordResetToken" WHERE "userId" = $1 AND "usedAt" IS NULL AND "expiresAt" > now()) AS "linkProofs",
          (SELECT count(*)::int FROM "emailVerificationToken" WHERE "email" = 'integration@example.test' AND "purpose" = 'PASSWORD_RESET' AND "usedAt" IS NULL AND "expiresAt" > now()) AS "emailProofs",
          (SELECT count(*)::int FROM "emailVerification" WHERE "email" = 'integration@example.test' AND "purpose" = 'PASSWORD_RESET' AND "verifiedAt" IS NULL AND "expiresAt" > now()) AS "codes",
          (SELECT count(*)::int FROM "refreshToken" WHERE "userId" = $1) AS "refreshTokens"`,
       [FIXTURE.userId],
     );
-    expect(activeProofs.rows[0]).toEqual({ linkProofs: 0, emailProofs: 0, codes: 0, refreshTokens: 0 });
+    expect(activeProofs.rows[0]).toEqual({ emailProofs: 0, codes: 0, refreshTokens: 0 });
 
-    const siblingLink = await resetPassword(app, "sibling-link-proof", "SiblingLinkPassword123!");
     const siblingCode = await resetPassword(app, "sibling-code-proof", "SiblingCodePassword123!");
     const staleCode = await request(app.getHttpServer())
       .post("/graphql")
@@ -248,7 +224,6 @@ describe("FO account recovery GraphQL integration", () => {
         query: `mutation VerifyPasswordResetCode($input: VerifyEmailCodeInput!) { verifyPasswordResetCode(input: $input) { emailVerificationToken } }`,
         variables: { input: { email: "integration@example.test", code: "654321" } },
       });
-    expect(siblingLink.body.errors[0].message).toBe("비밀번호 재설정 인증이 유효하지 않습니다.");
     expect(siblingCode.body.errors[0].message).toBe("비밀번호 재설정 인증이 유효하지 않습니다.");
     expect(staleCode.body.errors).toBeDefined();
     const password = await pool.query<{ password: string }>(`SELECT "password" FROM "users" WHERE "userId" = $1`, [
@@ -257,67 +232,59 @@ describe("FO account recovery GraphQL integration", () => {
     await expect(bcrypt.compare("PrimaryPassword123!", requireResult(password.rows[0]).password)).resolves.toBe(true);
   });
 
-  it.each([
-    { caseName: "link-link", tokens: ["race-link-a", "race-link-b"] },
-    { caseName: "link-email", tokens: ["race-link-a", "race-email-a"] },
-    { caseName: "email-email", tokens: ["race-email-a", "race-email-b"] },
-  ] as const)(
-    "serializes $caseName password resets for one account",
-    async ({ tokens }) => {
-      await seedResetRace(pool);
-      const passwords = ["ConcurrentPasswordA123!", "ConcurrentPasswordB123!"] as const;
-      let responses: Awaited<ReturnType<typeof resetPassword>>[];
+  it("serializes concurrent email password resets for one account", async () => {
+    await seedResetRace(pool);
+    const tokens = ["race-email-a", "race-email-b"] as const;
+    const passwords = ["ConcurrentPasswordA123!", "ConcurrentPasswordB123!"] as const;
+    let responses: Awaited<ReturnType<typeof resetPassword>>[];
 
-      try {
-        await installResetRaceDelay(pool);
-        responses = await Promise.all(
-          tokens.map((token, index) => resetPassword(app, token, requireResult(passwords[index]))),
-        );
-      } finally {
-        await removeResetRaceDelay(pool);
-      }
+    try {
+      await installResetRaceDelay(pool);
+      responses = await Promise.all(
+        tokens.map((token, index) => resetPassword(app, token, requireResult(passwords[index]))),
+      );
+    } finally {
+      await removeResetRaceDelay(pool);
+    }
 
-      const successIndexes = responses
-        .map((response, index) => (response.body.data?.resetPassword?.ok === true ? index : -1))
-        .filter((index) => index >= 0);
-      const failures = responses.filter((response) => response.body.errors !== undefined);
-      expect(successIndexes).toHaveLength(1);
-      expect(failures).toHaveLength(1);
-      expect(requireResult(failures[0]).body.errors).toEqual([
-        expect.objectContaining({
-          message: EmailErrorMessage.InvalidRecoveryToken,
-          extensions: expect.objectContaining({ code: "UNAUTHENTICATED" }),
-        }),
-      ]);
+    const successIndexes = responses
+      .map((response, index) => (response.body.data?.resetPassword?.ok === true ? index : -1))
+      .filter((index) => index >= 0);
+    const failures = responses.filter((response) => response.body.errors !== undefined);
+    expect(successIndexes).toHaveLength(1);
+    expect(failures).toHaveLength(1);
+    expect(requireResult(failures[0]).body.errors).toEqual([
+      expect.objectContaining({
+        message: EmailErrorMessage.InvalidRecoveryToken,
+        extensions: expect.objectContaining({ code: "UNAUTHENTICATED" }),
+      }),
+    ]);
 
-      const state = await pool.query<{
-        password: string;
-        linkProofs: number;
-        emailProofs: number;
-        refreshTokens: number;
-      }>(
-        `SELECT
+    const state = await pool.query<{
+      password: string;
+      emailProofs: number;
+      refreshTokens: number;
+    }>(
+      `SELECT
            u."password",
-           (SELECT count(*)::int FROM "passwordResetToken" WHERE "userId" = u."userId" AND "usedAt" IS NULL) AS "linkProofs",
            (SELECT count(*)::int FROM "emailVerificationToken" WHERE "email" = u."email" AND "purpose" = 'PASSWORD_RESET' AND "usedAt" IS NULL) AS "emailProofs",
            (SELECT count(*)::int FROM "refreshToken" WHERE "userId" = u."userId") AS "refreshTokens"
          FROM "users" u
          WHERE u."userId" = $1`,
-        [FIXTURE.userId],
-      );
-      const stateRow = requireResult(state.rows[0]);
-      const winningPassword = requireResult(passwords[requireResult(successIndexes[0])]);
-      expect(stateRow).toEqual(expect.objectContaining({ linkProofs: 0, emailProofs: 0, refreshTokens: 0 }));
-      await expect(bcrypt.compare(winningPassword, stateRow.password)).resolves.toBe(true);
-    },
-    15_000,
-  );
+      [FIXTURE.userId],
+    );
+    const stateRow = requireResult(state.rows[0]);
+    const winningPassword = requireResult(passwords[requireResult(successIndexes[0])]);
+    expect(stateRow).toEqual(expect.objectContaining({ emailProofs: 0, refreshTokens: 0 }));
+    await expect(bcrypt.compare(winningPassword, stateRow.password)).resolves.toBe(true);
+  }, 15_000);
 
   it("rejects a recovery proof that expires while waiting for the account lock", async () => {
-    await pool.query(
-      `INSERT INTO "passwordResetToken" ("tokenHash", "userId", "expiresAt")
-         VALUES ($1, $2, now() + interval '1 second')`,
-      [hashToken("expiring-lock-proof"), FIXTURE.userId],
+    await seedPasswordResetProof(
+      pool,
+      "expiring-lock-proof",
+      "e0000000-0000-4000-8000-000000000103",
+      new Date(Date.now() + 1_000),
     );
     await pool.query(
       `INSERT INTO "refreshToken" ("userId", "deviceId", "refreshToken", "refreshTokenExp")
@@ -373,7 +340,7 @@ describe("FO account recovery GraphQL integration", () => {
            p."usedAt" AS "proofUsedAt",
            (SELECT count(*)::int FROM "refreshToken" WHERE "userId" = u."userId") AS "refreshTokens"
          FROM "users" u
-         JOIN "passwordResetToken" p ON p."userId" = u."userId"
+         JOIN "emailVerificationToken" p ON p."email" = u."email"
          WHERE u."userId" = $1 AND p."tokenHash" = $2`,
       [FIXTURE.userId, hashToken("expiring-lock-proof")],
     );
@@ -387,11 +354,7 @@ describe("FO account recovery GraphQL integration", () => {
   }, 10_000);
 
   it("rolls back proof consumption when the password change fails", async () => {
-    await pool.query(
-      `INSERT INTO "passwordResetToken" ("tokenHash", "userId", "expiresAt")
-       VALUES ($1, $2, now() + interval '10 minutes')`,
-      [hashToken("rollback-reset-proof"), FIXTURE.userId],
-    );
+    await seedPasswordResetProof(pool, "rollback-reset-proof", "e0000000-0000-4000-8000-000000000104");
     await pool.query(
       `CREATE FUNCTION reject_password_change() RETURNS trigger AS $$
        BEGIN
@@ -501,21 +464,6 @@ describe("FO account recovery GraphQL integration", () => {
       ],
       data: null,
     });
-  });
-
-  it("returns the same password reset link response for known and unknown emails", async () => {
-    const mutation = `mutation RequestPasswordReset($input: RequestPasswordResetInput!) { requestPasswordReset(input: $input) { ok } }`;
-    const known = await request(app.getHttpServer())
-      .post("/graphql")
-      .set("x-device-id", "known-link-device")
-      .send({ query: mutation, variables: { input: { email: "integration@example.test" } } });
-    const unknown = await request(app.getHttpServer())
-      .post("/graphql")
-      .set("x-device-id", "unknown-link-device")
-      .send({ query: mutation, variables: { input: { email: "unknown@example.test" } } });
-
-    expect(known.body).toEqual({ data: { requestPasswordReset: { ok: true } } });
-    expect(unknown.body).toEqual({ data: { requestPasswordReset: { ok: true } } });
   });
 
   it("binds identity completion to the starting device and permits completion once", async () => {

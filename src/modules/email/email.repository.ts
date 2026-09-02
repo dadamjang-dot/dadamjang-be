@@ -15,7 +15,6 @@ import {
   emailDeliveryOutbox,
   emailVerificationTokens,
   emailVerifications,
-  passwordResetTokens,
   refreshTokens,
   users,
   type EmailVerification,
@@ -41,10 +40,9 @@ const redactedDelivery = {
 } as const;
 
 type DeliveryPreparation = Readonly<{
-  codeHash?: string;
+  codeHash: string;
   payloadCiphertext: string;
   proofExpiresAt: Date;
-  token?: string;
 }>;
 
 @Injectable()
@@ -148,29 +146,15 @@ export class EmailRepository {
         .returning()
     )[0];
   hasValidRecoveryToken = async (token: string) => {
-    const tokenHash = hashToken(token);
-    const now = new Date();
-    const [linkProof] = await this.db
-      .select({ tokenHash: passwordResetTokens.tokenHash })
-      .from(passwordResetTokens)
-      .where(
-        and(
-          eq(passwordResetTokens.tokenHash, tokenHash),
-          isNull(passwordResetTokens.usedAt),
-          gt(passwordResetTokens.expiresAt, now),
-        ),
-      )
-      .limit(1);
-    if (linkProof) return true;
     const [emailProof] = await this.db
       .select({ tokenHash: emailVerificationTokens.tokenHash })
       .from(emailVerificationTokens)
       .where(
         and(
-          eq(emailVerificationTokens.tokenHash, tokenHash),
+          eq(emailVerificationTokens.tokenHash, hashToken(token)),
           eq(emailVerificationTokens.purpose, "PASSWORD_RESET"),
           isNull(emailVerificationTokens.usedAt),
-          gt(emailVerificationTokens.expiresAt, now),
+          gt(emailVerificationTokens.expiresAt, new Date()),
         ),
       )
       .limit(1);
@@ -289,34 +273,21 @@ export class EmailRepository {
           .where(eq(emailDeliveryOutbox.id, delivery.id));
         return undefined;
       }
-      let proofId: string;
-      if (delivery.kind === EmailDeliveryKind.PasswordResetLink) {
-        const token = requireResult(preparation.token);
-        const tokenHash = hashToken(token);
-        await tx.insert(passwordResetTokens).values({
-          tokenHash,
-          userId: requireResult("userId" in user ? user.userId : undefined),
-          expiresAt: preparation.proofExpiresAt,
-          requestIpHash: delivery.requestIpHash,
-        });
-        proofId = tokenHash;
-      } else {
-        const verification = requireResult(
-          (
-            await tx
-              .insert(emailVerifications)
-              .values({
-                email: delivery.email,
-                purpose,
-                codeHash: requireResult(preparation.codeHash),
-                expiresAt: preparation.proofExpiresAt,
-                requestIpHash: delivery.requestIpHash,
-              })
-              .returning({ id: emailVerifications.id })
-          )[0],
-        );
-        proofId = verification.id;
-      }
+      const verification = requireResult(
+        (
+          await tx
+            .insert(emailVerifications)
+            .values({
+              email: delivery.email,
+              purpose,
+              codeHash: preparation.codeHash,
+              expiresAt: preparation.proofExpiresAt,
+              requestIpHash: delivery.requestIpHash,
+            })
+            .returning({ id: emailVerifications.id })
+        )[0],
+      );
+      const proofId = verification.id;
       const prepared = requireResult(
         (
           await tx
@@ -356,20 +327,6 @@ export class EmailRepository {
         )
         .limit(1);
       return !!invite;
-    }
-    if (delivery.kind === EmailDeliveryKind.PasswordResetLink) {
-      const [token] = await this.db
-        .select({ tokenHash: passwordResetTokens.tokenHash })
-        .from(passwordResetTokens)
-        .where(
-          and(
-            eq(passwordResetTokens.tokenHash, delivery.proofId),
-            isNull(passwordResetTokens.usedAt),
-            gt(passwordResetTokens.expiresAt, now),
-          ),
-        )
-        .limit(1);
-      return !!token;
     }
     const purpose = delivery.kind === EmailDeliveryKind.SignupCode ? "SIGNUP" : "PASSWORD_RESET";
     const [verification] = await this.db
@@ -495,69 +452,38 @@ export class EmailRepository {
     this.db.transaction(async (tx) => {
       const lookupAt = new Date();
       const tokenHash = hashToken(token);
-      const [linkProof] = await tx
-        .select({ userId: passwordResetTokens.userId })
-        .from(passwordResetTokens)
+      const [emailProof] = await tx
+        .select({ userId: users.userId })
+        .from(emailVerificationTokens)
+        .innerJoin(users, eq(users.email, emailVerificationTokens.email))
         .where(
           and(
-            eq(passwordResetTokens.tokenHash, tokenHash),
-            isNull(passwordResetTokens.usedAt),
-            gt(passwordResetTokens.expiresAt, lookupAt),
+            eq(emailVerificationTokens.tokenHash, tokenHash),
+            eq(emailVerificationTokens.purpose, "PASSWORD_RESET"),
+            isNull(emailVerificationTokens.usedAt),
+            gt(emailVerificationTokens.expiresAt, lookupAt),
           ),
         )
         .limit(1);
-      const [emailProof] = linkProof
-        ? []
-        : await tx
-            .select({ userId: users.userId })
-            .from(emailVerificationTokens)
-            .innerJoin(users, eq(users.email, emailVerificationTokens.email))
-            .where(
-              and(
-                eq(emailVerificationTokens.tokenHash, tokenHash),
-                eq(emailVerificationTokens.purpose, "PASSWORD_RESET"),
-                isNull(emailVerificationTokens.usedAt),
-                gt(emailVerificationTokens.expiresAt, lookupAt),
-              ),
-            )
-            .limit(1);
-      const userId = linkProof?.userId ?? emailProof?.userId;
-      if (!userId) return false;
-      const [user] = await tx.select().from(users).where(eq(users.userId, userId)).for("update");
+      if (!emailProof) return false;
+      const [user] = await tx.select().from(users).where(eq(users.userId, emailProof.userId)).for("update");
       if (!user || user.password === null) return false;
       const now = new Date();
-      const [consumedProof] = linkProof
-        ? await tx
-            .update(passwordResetTokens)
-            .set({ usedAt: now })
-            .where(
-              and(
-                eq(passwordResetTokens.tokenHash, tokenHash),
-                eq(passwordResetTokens.userId, user.userId),
-                isNull(passwordResetTokens.usedAt),
-                gt(passwordResetTokens.expiresAt, now),
-              ),
-            )
-            .returning({ tokenHash: passwordResetTokens.tokenHash })
-        : await tx
-            .update(emailVerificationTokens)
-            .set({ usedAt: now })
-            .where(
-              and(
-                eq(emailVerificationTokens.tokenHash, tokenHash),
-                eq(emailVerificationTokens.email, user.email),
-                eq(emailVerificationTokens.purpose, "PASSWORD_RESET"),
-                isNull(emailVerificationTokens.usedAt),
-                gt(emailVerificationTokens.expiresAt, now),
-              ),
-            )
-            .returning({ tokenHash: emailVerificationTokens.tokenHash });
+      const [consumedProof] = await tx
+        .update(emailVerificationTokens)
+        .set({ usedAt: now })
+        .where(
+          and(
+            eq(emailVerificationTokens.tokenHash, tokenHash),
+            eq(emailVerificationTokens.email, user.email),
+            eq(emailVerificationTokens.purpose, "PASSWORD_RESET"),
+            isNull(emailVerificationTokens.usedAt),
+            gt(emailVerificationTokens.expiresAt, now),
+          ),
+        )
+        .returning({ tokenHash: emailVerificationTokens.tokenHash });
       if (!consumedProof) return false;
       await tx.update(users).set({ password, updatedAt: now }).where(eq(users.userId, user.userId));
-      await tx
-        .update(passwordResetTokens)
-        .set({ usedAt: now })
-        .where(and(eq(passwordResetTokens.userId, user.userId), isNull(passwordResetTokens.usedAt)));
       await tx
         .update(emailVerificationTokens)
         .set({ usedAt: now })

@@ -6,7 +6,6 @@ import {
   EmailVerificationPayload,
   OkPayload,
   RequestEmailCodeInput,
-  RequestPasswordResetInput,
   ResetPasswordInput,
   VerifyEmailCodeInput,
 } from "./email.types";
@@ -37,12 +36,6 @@ export class EmailResolver {
     @Context("req") req: Request,
   ) {
     return this.emailService.verifyPasswordResetCode(input.email, input.code, requestOriginFromRequest(req));
-  }
-  @Mutation(() => OkPayload) requestPasswordReset(
-    @Args("input") input: RequestPasswordResetInput,
-    @Context("req") req: Request,
-  ) {
-    return this.emailService.requestPasswordReset(input.email, requestOriginFromRequest(req));
   }
   @Mutation(() => OkPayload) resetPassword(@Args("input") input: ResetPasswordInput, @Context("req") req: Request) {
     return this.emailService.resetPassword(input.token, input.password, requestOriginFromRequest(req));

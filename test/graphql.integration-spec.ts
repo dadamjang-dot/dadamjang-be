@@ -195,13 +195,44 @@ describe("PostgreSQL GraphQL integration", () => {
     });
   });
 
-  it("does not expose client-authored activity events", async () => {
-    const response = await request(app.getHttpServer()).post("/graphql").send({
-      query: `query MutationFields { __schema { mutationType { fields { name } } } }`,
-    });
-    const fieldNames = response.body.data.__schema.mutationType.fields.map((field: { name: string }) => field.name);
+  it("keeps intentional portfolio roots and omits legacy password-reset links", async () => {
+    const response = await request(app.getHttpServer())
+      .post("/graphql")
+      .send({
+        query: `query ApiFields {
+        __schema {
+          queryType { fields { name } }
+          mutationType { fields { name } }
+        }
+      }`,
+      });
+    const queryFields = response.body.data.__schema.queryType.fields.map((field: { name: string }) => field.name);
+    const mutationFields = response.body.data.__schema.mutationType.fields.map((field: { name: string }) => field.name);
 
-    expect(fieldNames).not.toContain("recordActivity");
+    expect(queryFields).toEqual(expect.arrayContaining(["comparison", "comparisonPriceSummaries", "myActivity"]));
+    expect(mutationFields).toEqual(
+      expect.arrayContaining(["addComparisonItem", "removeComparisonItem", "applyPartner", "updateMarketingConsent"]),
+    );
+    expect(mutationFields).not.toContain("requestPasswordReset");
+    expect(mutationFields).not.toContain("recordActivity");
+  });
+
+  it("does not expose duplicate media or push-device roots", async () => {
+    const response = await request(app.getHttpServer())
+      .post("/graphql")
+      .send({
+        query: `query ApiFields {
+      __schema {
+        queryType { fields { name } }
+        mutationType { fields { name } }
+      }
+    }`,
+      });
+    const queryFields = response.body.data.__schema.queryType.fields.map((field: { name: string }) => field.name);
+    const mutationFields = response.body.data.__schema.mutationType.fields.map((field: { name: string }) => field.name);
+
+    expect(queryFields).not.toContain("productImageUrl");
+    expect(mutationFields).not.toContain("unregisterFoPushDevice");
   });
 
   it("classifies malformed database identifiers as client input errors", async () => {

@@ -1,4 +1,4 @@
-import { ArgsType, Field, InputType, Int, ObjectType } from "@nestjs/graphql";
+import { Field, InputType, Int, ObjectType } from "@nestjs/graphql";
 
 @InputType()
 export class CreateProductImageUploadInput {
@@ -37,13 +37,4 @@ export class ProductImageUploadTarget {
 
   @Field(() => String, { nullable: true })
   imageUrl!: string | null;
-}
-
-@ArgsType()
-export class ProductImageUrlArgs {
-  @Field()
-  key!: string;
-
-  @Field(() => Int, { nullable: true })
-  width?: number;
 }

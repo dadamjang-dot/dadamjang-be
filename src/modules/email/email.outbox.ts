@@ -58,6 +58,14 @@ export class EmailDeliveryWorker implements OnModuleInit, OnApplicationShutdown 
     if (purged > 0) this.logger.log(`Purged ${purged} retained terminal email deliveries`);
     const claimed = await this.repository.claimDelivery(now);
     if (!claimed) return false;
+    if (
+      claimed.kind !== EmailDeliveryKind.SignupCode &&
+      claimed.kind !== EmailDeliveryKind.PasswordResetCode &&
+      claimed.kind !== EmailDeliveryKind.AdminInvite
+    ) {
+      await this.repository.suppressDelivery(claimed.id, claimed.claimToken, now);
+      return true;
+    }
     try {
       const prepared = await this.prepare(claimed, now);
       if (!prepared) return true;
@@ -98,44 +106,27 @@ export class EmailDeliveryWorker implements OnModuleInit, OnApplicationShutdown 
       claimed.kind === EmailDeliveryKind.SignupCode
         ? EmailVerificationPurpose.Signup
         : EmailVerificationPurpose.PasswordReset;
-    const secret =
-      claimed.kind === EmailDeliveryKind.PasswordResetLink
-        ? randomBytes(32).toString("base64url")
-        : String(randomInt(1_000_000)).padStart(6, "0");
+    const secret = String(randomInt(1_000_000)).padStart(6, "0");
     const pepper = this.configService.getOrThrow<string>("EMAIL_CODE_PEPPER");
     const payloadCiphertext = encryptEmailPayload(secret, pepper);
-    const proofExpiresAt = new Date(
-      now.getTime() + (claimed.kind === EmailDeliveryKind.PasswordResetLink ? 15 : 5) * 60_000,
-    );
-    const codeHash =
-      claimed.kind === EmailDeliveryKind.PasswordResetLink
-        ? undefined
-        : await bcrypt.hash(emailCodeSecret(claimed.email, secret, purpose, pepper), 10);
-    return this.repository.prepareDelivery(
-      claimed,
-      {
-        payloadCiphertext,
-        proofExpiresAt,
-        ...(codeHash ? { codeHash } : { token: secret }),
-      },
-      now,
-    );
+    const proofExpiresAt = new Date(now.getTime() + 5 * 60_000);
+    const codeHash = await bcrypt.hash(emailCodeSecret(claimed.email, secret, purpose, pepper), 10);
+    return this.repository.prepareDelivery(claimed, { codeHash, payloadCiphertext, proofExpiresAt }, now);
   };
 
   private send = async (id: string, kind: string, email: string, secret: string) => {
     const idempotencyKey = `email-delivery/${id}`;
     if (kind === EmailDeliveryKind.SignupCode || kind === EmailDeliveryKind.PasswordResetCode)
       return this.sender.sendCode(email, secret, idempotencyKey);
-    if (kind === EmailDeliveryKind.PasswordResetLink) {
-      const clientUrl = this.configService.getOrThrow<string>("CLIENT_URL").replace(/\/$/, "");
+    if (kind === EmailDeliveryKind.AdminInvite) {
+      const boUrl = this.configService.getOrThrow<string>("DADAMJANG_BO_URL").replace(/\/$/, "");
       return this.sender.sendLink(
         email,
-        "비밀번호 재설정",
-        `${clientUrl}/account-recovery/password#token=${secret}`,
+        "다담장 관리자 초대",
+        `${boUrl}/invite/accept#token=${secret}`,
         idempotencyKey,
       );
     }
-    const boUrl = this.configService.getOrThrow<string>("DADAMJANG_BO_URL").replace(/\/$/, "");
-    return this.sender.sendLink(email, "다담장 관리자 초대", `${boUrl}/invite/accept#token=${secret}`, idempotencyKey);
+    throw new Error("Unsupported email delivery kind");
   };
 }
