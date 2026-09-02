@@ -38,7 +38,7 @@
 
 ## Frontend 변경
 
-- BO GraphQL proxy의 public operation 목록에서 더 이상 존재하지 않는 `requestPasswordReset`을 제거한다.
+- BO GraphQL proxy의 public operation 목록에서 더 이상 존재하지 않는 `requestPasswordReset`을 제거하고, UI가 실제 호출하는 `requestPasswordResetCode`와 `verifyPasswordResetCode`를 등록한다.
 - 기존 비밀번호 인증코드, 이미지 표시·업로드, 알림 설정·로그아웃 흐름은 변경하지 않는다.
 
 ## 호환성과 오류 처리
@@ -54,7 +54,7 @@
 - 비밀번호 인증코드 발급·검증·재설정과 세션 폐기 integration test를 유지한다.
 - migration이 link outbox 데이터와 legacy token table을 제거하고 나머지 email kind를 보존하는지 검증한다.
 - 이미지 URL 생성의 내부 호출과 Push 로그아웃 해제를 기존 테스트로 검증한다.
-- Backend lint, build, unit, integration test와 BO lint, typecheck, unit test, build를 실행한다.
+- Backend lint, build, unit, integration test와 BO 공개 operation 분류, lint, typecheck, unit test, build를 실행한다.
 
 ## 범위 제외
 
