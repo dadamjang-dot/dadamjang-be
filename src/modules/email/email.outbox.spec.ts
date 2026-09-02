@@ -1,4 +1,7 @@
-import { decryptEmailPayload, encryptEmailPayload } from "./email.outbox";
+import type { ConfigService } from "@nestjs/config";
+import { decryptEmailPayload, EmailDeliveryWorker, encryptEmailPayload } from "./email.outbox";
+import type { EmailRepository } from "./email.repository";
+import type { EmailSender } from "./email.sender";
 
 describe("email outbox payload encryption", () => {
   it("round-trips a secret without storing it in plaintext", () => {
@@ -19,5 +22,54 @@ describe("email outbox payload encryption", () => {
       decryptEmailPayload(`${nonce}.${tampered.toString("base64url")}.${encrypted}`, "outbox-key-material"),
     ).toThrow();
     expect(() => decryptEmailPayload(ciphertext, "wrong-key-material")).toThrow();
+  });
+});
+
+describe("EmailDeliveryWorker", () => {
+  it("suppresses a claimed legacy password reset link before email dispatch", async () => {
+    const now = new Date("2026-09-03T00:00:00.000Z");
+    const repository = {
+      scrubTerminalDeliveries: jest.fn().mockResolvedValue(0),
+      purgeTerminalDeliveries: jest.fn().mockResolvedValue(0),
+      claimDelivery: jest.fn().mockResolvedValue({
+        id: "10000000-0000-4000-8000-000000000029",
+        kind: "PASSWORD_RESET_LINK",
+        email: "legacy-link@example.test",
+        requestIpHash: "a".repeat(64),
+        payloadCiphertext: null,
+        proofId: null,
+        status: "PROCESSING",
+        attemptCount: 1,
+        availableAt: now,
+        claimedAt: now,
+        claimToken: "20000000-0000-4000-8000-000000000029",
+        expiresAt: new Date("2026-09-03T00:10:00.000Z"),
+        sentAt: null,
+        lastError: "legacy-sensitive-error",
+        createdAt: now,
+        updatedAt: now,
+      }),
+      suppressDelivery: jest.fn().mockResolvedValue(undefined),
+      retryDelivery: jest.fn().mockResolvedValue(undefined),
+    } as unknown as EmailRepository;
+    const sender = {
+      sendCode: jest.fn(),
+      sendLink: jest.fn(),
+    } as unknown as EmailSender;
+    const worker = new EmailDeliveryWorker(
+      repository,
+      { getOrThrow: jest.fn().mockReturnValue("pepper") } as unknown as ConfigService,
+      sender,
+    );
+
+    await expect(worker.runOnce(now)).resolves.toBe(true);
+
+    expect(repository.suppressDelivery).toHaveBeenCalledWith(
+      "10000000-0000-4000-8000-000000000029",
+      "20000000-0000-4000-8000-000000000029",
+      now,
+    );
+    expect(sender.sendCode).not.toHaveBeenCalled();
+    expect(sender.sendLink).not.toHaveBeenCalled();
   });
 });

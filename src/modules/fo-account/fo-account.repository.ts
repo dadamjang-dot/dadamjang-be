@@ -24,7 +24,6 @@ import {
   kakaoLoginFlows,
   kakaoSignupTokens,
   orders,
-  passwordResetTokens,
   recentProductViews,
   refreshTokens,
   stylePostLikes,
@@ -114,18 +113,11 @@ export class FoAccountRepository {
           if (!user) return undefined;
           claimedUserId = user.userId;
           if (!(await tryLockEmailDelivery(tx, user.email))) return null;
-          const resetProofs = await tx
-            .select({ tokenHash: passwordResetTokens.tokenHash })
-            .from(passwordResetTokens)
-            .where(eq(passwordResetTokens.userId, user.userId));
           const verificationProofs = await tx
             .select({ id: emailVerifications.id })
             .from(emailVerifications)
             .where(eq(emailVerifications.email, user.email));
-          const proofIds = [
-            ...resetProofs.map(({ tokenHash }) => tokenHash),
-            ...verificationProofs.map(({ id }) => id),
-          ];
+          const proofIds = verificationProofs.map(({ id }) => id);
           const outboxCondition = or(
             eq(emailDeliveryOutbox.email, user.email),
             proofIds.length ? inArray(emailDeliveryOutbox.proofId, proofIds) : undefined,
@@ -145,18 +137,16 @@ export class FoAccountRepository {
             .where(eq(verifiedIdentities.userId, user.userId));
           const providerUserIds = kakaoIdentities.map(({ providerUserId }) => providerUserId);
           const ciHashes = identities.map(({ ciHash }) => ciHash);
-          const verificationIds = verificationProofs.map(({ id }) => id);
           await tx.delete(accountReactivationTokens).where(eq(accountReactivationTokens.userId, user.userId));
           await tx.delete(refreshTokens).where(eq(refreshTokens.userId, user.userId));
           await this.notificationRepository.deleteUserData(tx, user.userId);
           await tx.delete(emailDeliveryOutbox).where(outboxCondition);
-          await tx.delete(passwordResetTokens).where(eq(passwordResetTokens.userId, user.userId));
           await tx
             .delete(emailVerificationTokens)
             .where(
               or(
                 eq(emailVerificationTokens.email, user.email),
-                verificationIds.length ? inArray(emailVerificationTokens.verificationId, verificationIds) : undefined,
+                proofIds.length ? inArray(emailVerificationTokens.verificationId, proofIds) : undefined,
               ),
             );
           await tx.delete(emailVerifications).where(eq(emailVerifications.email, user.email));

@@ -293,17 +293,6 @@ export const emailVerificationTokens = pgTable("emailVerificationToken", {
   createdAt: timestamp("createdAt").defaultNow().notNull(),
 });
 
-export const passwordResetTokens = pgTable("passwordResetToken", {
-  tokenHash: text("tokenHash").primaryKey(),
-  userId: uuid("userId")
-    .notNull()
-    .references(() => users.userId),
-  expiresAt: timestamp("expiresAt").notNull(),
-  usedAt: timestamp("usedAt"),
-  requestIpHash: text("requestIpHash"),
-  createdAt: timestamp("createdAt").defaultNow().notNull(),
-});
-
 export const requestAdmissions = pgTable(
   "requestAdmission",
   {
@@ -348,7 +337,7 @@ export const emailDeliveryOutbox = pgTable(
   (table) => [
     check(
       "email_delivery_outbox_kind_check",
-      sql`${table.kind} IN ('SIGNUP_CODE', 'PASSWORD_RESET_CODE', 'PASSWORD_RESET_LINK', 'ADMIN_INVITE')`,
+      sql`${table.kind} IN ('SIGNUP_CODE', 'PASSWORD_RESET_CODE', 'ADMIN_INVITE')`,
     ),
     check(
       "email_delivery_outbox_status_check",
@@ -1041,7 +1030,6 @@ export type User = typeof users.$inferSelect;
 export type RefreshToken = typeof refreshTokens.$inferSelect;
 export type EmailVerification = typeof emailVerifications.$inferSelect;
 export type EmailVerificationToken = typeof emailVerificationTokens.$inferSelect;
-export type PasswordResetToken = typeof passwordResetTokens.$inferSelect;
 export type KakaoSignupToken = typeof kakaoSignupTokens.$inferSelect;
 export type Category = typeof categories.$inferSelect;
 export type Brand = typeof brands.$inferSelect;

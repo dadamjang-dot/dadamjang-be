@@ -8,6 +8,7 @@ import { migrate } from "src/database/migrate";
 import { testPool } from "./support/database";
 
 const DATABASE_NAME = "catalog_migration_safety_test";
+const PASSWORD_RESET_LINK_CLEANUP_MIGRATION = "0029_remove_password_reset_link.sql";
 const RETIRED_DEMO_MIGRATION = {
   name: "0005_catalog_demo_products.sql",
   checksum: "44d98c294ac8c2afa502f7bdb2c65411df7d4879dad39cd5b4fbc8cf9c94059f",
@@ -242,6 +243,59 @@ describe("database migration PostgreSQL integration", () => {
       { column_name: "userId", is_nullable: "NO", table_name: "refreshTokenRotationMarker" },
     ]);
     expect(refreshRotationForeignKey.rows).toEqual([{ delete_rule: "CASCADE" }]);
+  });
+
+  it("removes legacy password-link state and preserves active email delivery kinds", async () => {
+    let seededLegacyState = false;
+    await migrate({
+      pool: migrationPool,
+      beforeMigration: async (name, pool) => {
+        if (name !== PASSWORD_RESET_LINK_CLEANUP_MIGRATION) return;
+        seededLegacyState = true;
+        await pool.query(
+          `INSERT INTO "users" ("userId", "userid", "email", "password")
+           VALUES ('10000000-0000-4000-8000-000000000099', 'legacy-reset-user', 'legacy-reset@example.test', 'hash')`,
+        );
+        await pool.query(
+          `INSERT INTO "passwordResetToken" ("tokenHash", "userId", "expiresAt")
+           VALUES ('legacy-reset-token', '10000000-0000-4000-8000-000000000099', now() + interval '10 minutes')`,
+        );
+        await pool.query(
+          `INSERT INTO "emailDeliveryOutbox" ("kind", "email", "expiresAt") VALUES
+            ('PASSWORD_RESET_LINK', 'legacy-link@example.test', now() + interval '10 minutes'),
+            ('SIGNUP_CODE', 'signup@example.test', now() + interval '10 minutes'),
+            ('PASSWORD_RESET_CODE', 'reset-code@example.test', now() + interval '10 minutes'),
+            ('ADMIN_INVITE', 'invite@example.test', now() + interval '10 minutes')`,
+        );
+      },
+    });
+
+    expect(seededLegacyState).toBe(true);
+    const state = await migrationPool.query<{
+      kinds: string[];
+      legacyLinks: number;
+      passwordResetTable: string | null;
+    }>(
+      `SELECT
+         to_regclass('public."passwordResetToken"')::text AS "passwordResetTable",
+         count(*) FILTER (WHERE "kind" = 'PASSWORD_RESET_LINK')::int AS "legacyLinks",
+         array_agg("kind" ORDER BY "kind") AS "kinds"
+       FROM "emailDeliveryOutbox"`,
+    );
+    expect(state.rows[0]).toEqual({
+      kinds: ["ADMIN_INVITE", "PASSWORD_RESET_CODE", "SIGNUP_CODE"],
+      legacyLinks: 0,
+      passwordResetTable: null,
+    });
+    await expectConstraintError(
+      () =>
+        migrationPool.query(
+          `INSERT INTO "emailDeliveryOutbox" ("kind", "email", "expiresAt")
+           VALUES ('PASSWORD_RESET_LINK', 'rejected@example.test', now() + interval '10 minutes')`,
+        ),
+      "23514",
+      "email_delivery_outbox_kind_check",
+    );
   });
 
   it("migrates FO accounts to nullable passwords and enforces lifecycle invariants once", async () => {

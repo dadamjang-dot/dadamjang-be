@@ -115,48 +115,6 @@ describe("durable email delivery outbox integration", () => {
     expect(proofs.rows[0]?.count).toBe(1);
   });
 
-  it("suppresses and redacts legacy password reset link rows without reinterpreting or sending them", async () => {
-    const sendCode = jest.spyOn(sender, "sendCode").mockResolvedValue(undefined);
-    const sendLink = jest.spyOn(sender, "sendLink").mockResolvedValue(undefined);
-    await pool.query(`
-      INSERT INTO "emailDeliveryOutbox"
-        ("kind", "email", "requestIpHash", "status", "expiresAt", "lastError")
-      VALUES
-        ('PASSWORD_RESET_LINK', 'integration@example.test', repeat('a', 64), 'PENDING',
-         now() + interval '10 minutes', 'legacy-sensitive-error')
-    `);
-
-    await expect(worker.runOnce(new Date(Date.now() + 1_000))).resolves.toBe(true);
-
-    expect(sendCode).not.toHaveBeenCalled();
-    expect(sendLink).not.toHaveBeenCalled();
-    const state = await pool.query<{
-      email: string;
-      lastError: string | null;
-      payloadCiphertext: string | null;
-      proofCount: number;
-      proofId: string | null;
-      requestIpHash: string | null;
-      status: string;
-    }>(`
-      SELECT o."email", o."lastError", o."payloadCiphertext", o."proofId", o."requestIpHash", o."status",
-        (SELECT count(*)::int FROM "emailVerification" v
-          WHERE v."email" = 'integration@example.test' AND v."purpose" = 'PASSWORD_RESET') AS "proofCount"
-      FROM "emailDeliveryOutbox" o
-    `);
-    expect(state.rows).toEqual([
-      {
-        email: "redacted@invalid",
-        lastError: null,
-        payloadCiphertext: null,
-        proofCount: 0,
-        proofId: null,
-        requestIpHash: null,
-        status: "SUPPRESSED",
-      },
-    ]);
-  });
-
   it("suppresses password reset codes for passwordless accounts without sending mail", async () => {
     const sendCode = jest.spyOn(sender, "sendCode").mockResolvedValue(undefined);
     await pool.query(`UPDATE "users" SET "password" = NULL WHERE "email" = 'integration@example.test'`);

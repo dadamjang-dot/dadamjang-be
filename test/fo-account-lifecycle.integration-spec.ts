@@ -337,11 +337,6 @@ const seedAnonymizationFixture = async (pool: Pool) => {
       [fixture.pushOutboxId, fixture.notificationId, fixture.pushDeviceId],
     );
     await client.query(
-      `INSERT INTO "passwordResetToken" ("tokenHash", "userId", "expiresAt")
-       VALUES ('anonymization-reset', $1, now() + interval '10 minutes')`,
-      [fixture.userId],
-    );
-    await client.query(
       `INSERT INTO "emailVerification" (id, email, purpose, "codeHash", "expiresAt", "verifiedAt")
        VALUES ($1, $2, 'PASSWORD_RESET', 'anonymization-code', now() + interval '10 minutes', now())`,
       [fixture.verificationId, fixture.email],
@@ -1267,7 +1262,6 @@ describe("FO account lifecycle", () => {
         (SELECT count(*)::int FROM "accountReactivationTokens" WHERE "userId" = $1) AS "reactivationTokens",
         (SELECT count(*)::int FROM "refreshToken" WHERE "userId" = $1) AS "refreshTokens",
         (SELECT count(*)::int FROM "refreshTokenRotationMarker" WHERE "userId" = $1) AS "rotationMarkers",
-        (SELECT count(*)::int FROM "passwordResetToken" WHERE "userId" = $1) AS "passwordResetTokens",
         (SELECT count(*)::int FROM "emailVerificationToken" WHERE email = $2) AS "emailVerificationTokens",
         (SELECT count(*)::int FROM "emailVerification" WHERE email = $2) AS "emailVerifications",
         (SELECT count(*)::int FROM "emailDeliveryOutbox" WHERE email = $2) AS "emailOutbox",
@@ -1295,7 +1289,6 @@ describe("FO account lifecycle", () => {
       reactivationTokens: 0,
       refreshTokens: 0,
       rotationMarkers: 0,
-      passwordResetTokens: 0,
       emailVerificationTokens: 0,
       emailVerifications: 0,
       emailOutbox: 0,
