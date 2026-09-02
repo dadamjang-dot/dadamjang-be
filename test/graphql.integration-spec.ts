@@ -217,6 +217,24 @@ describe("PostgreSQL GraphQL integration", () => {
     expect(mutationFields).not.toContain("recordActivity");
   });
 
+  it("does not expose duplicate media or push-device roots", async () => {
+    const response = await request(app.getHttpServer())
+      .post("/graphql")
+      .send({
+        query: `query ApiFields {
+      __schema {
+        queryType { fields { name } }
+        mutationType { fields { name } }
+      }
+    }`,
+      });
+    const queryFields = response.body.data.__schema.queryType.fields.map((field: { name: string }) => field.name);
+    const mutationFields = response.body.data.__schema.mutationType.fields.map((field: { name: string }) => field.name);
+
+    expect(queryFields).not.toContain("productImageUrl");
+    expect(mutationFields).not.toContain("unregisterFoPushDevice");
+  });
+
   it("classifies malformed database identifiers as client input errors", async () => {
     const response = await request(app.getHttpServer())
       .post("/graphql")

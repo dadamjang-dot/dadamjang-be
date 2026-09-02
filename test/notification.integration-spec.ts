@@ -860,28 +860,6 @@ describe("FO notification GraphQL integration", () => {
     expect(active.rows[0]?.count).toBe(0);
   });
 
-  it("disables a device and terminally fails unsettled deliveries on unregister", async () => {
-    const deviceId = "notification-unregister-device";
-    const token = await signin(app, deviceId);
-    await registerDevice(app, token.accessToken, deviceId, "ExponentPushToken[notification-unregister]");
-    const device = await pool.query<{ pushDeviceId: string }>(
-      `SELECT "pushDeviceId" FROM "pushDevices" WHERE "installationId" = $1`,
-      [deviceId],
-    );
-    const pushDeviceId = device.rows[0]?.pushDeviceId as string;
-    await seedUnsettledDeliveries(pool, FIXTURE.userId, pushDeviceId);
-
-    const response = await authenticated(
-      app,
-      token.accessToken,
-      deviceId,
-      `mutation UnregisterFoPushDevice { unregisterFoPushDevice }`,
-    );
-
-    expect(response.body).toEqual({ data: { unregisterFoPushDevice: true } });
-    await expectDisabledDeliveries(pool, pushDeviceId);
-  });
-
   it("deletes the refresh session and disables its Push delivery state in one logout", async () => {
     const deviceId = "notification-logout-device";
     const token = await signin(app, deviceId);

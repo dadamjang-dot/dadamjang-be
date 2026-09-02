@@ -1,4 +1,4 @@
-import { Args, Context, Mutation, Query, Resolver } from "@nestjs/graphql";
+import { Args, Context, Mutation, Resolver } from "@nestjs/graphql";
 import { UseGuards } from "@nestjs/common";
 import { JwtAccessTokenGuard } from "src/guards/access-token.guard";
 import { RolesGuard } from "src/guards/roles.guard";
@@ -12,7 +12,6 @@ import {
   CreateProductImageUploadInput,
   CreateStylePostImageUploadInput,
   ProductImageUploadTarget,
-  ProductImageUrlArgs,
 } from "./media.types";
 import { MediaService } from "./media.service";
 
@@ -49,11 +48,5 @@ export class MediaResolver {
   ) {
     const { req, userId } = currentRequest(context);
     return this.mediaService.createStylePostUpload(userId, input, requestOriginFromRequest(req));
-  }
-
-  @Query(() => String)
-  @Roles(UserRole.Partner, UserRole.Admin)
-  async productImageUrl(@Args() args: ProductImageUrlArgs) {
-    return this.mediaService.getProductImageUrl(args.key, args.width);
   }
 }
