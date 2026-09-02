@@ -26,15 +26,15 @@ describe("email outbox payload encryption", () => {
 });
 
 describe("EmailDeliveryWorker", () => {
-  it("suppresses a claimed legacy password reset link before email dispatch", async () => {
+  it("suppresses a claimed unsupported delivery kind before email dispatch", async () => {
     const now = new Date("2026-09-03T00:00:00.000Z");
     const repository = {
       scrubTerminalDeliveries: jest.fn().mockResolvedValue(0),
       purgeTerminalDeliveries: jest.fn().mockResolvedValue(0),
       claimDelivery: jest.fn().mockResolvedValue({
-        id: "10000000-0000-4000-8000-000000000029",
-        kind: "PASSWORD_RESET_LINK",
-        email: "legacy-link@example.test",
+        id: "10000000-0000-4000-8000-000000000001",
+        kind: "UNSUPPORTED",
+        email: "unsupported@example.test",
         requestIpHash: "a".repeat(64),
         payloadCiphertext: null,
         proofId: null,
@@ -42,10 +42,10 @@ describe("EmailDeliveryWorker", () => {
         attemptCount: 1,
         availableAt: now,
         claimedAt: now,
-        claimToken: "20000000-0000-4000-8000-000000000029",
+        claimToken: "20000000-0000-4000-8000-000000000001",
         expiresAt: new Date("2026-09-03T00:10:00.000Z"),
         sentAt: null,
-        lastError: "legacy-sensitive-error",
+        lastError: "unsupported-email-kind",
         createdAt: now,
         updatedAt: now,
       }),
@@ -65,8 +65,8 @@ describe("EmailDeliveryWorker", () => {
     await expect(worker.runOnce(now)).resolves.toBe(true);
 
     expect(repository.suppressDelivery).toHaveBeenCalledWith(
-      "10000000-0000-4000-8000-000000000029",
-      "20000000-0000-4000-8000-000000000029",
+      "10000000-0000-4000-8000-000000000001",
+      "20000000-0000-4000-8000-000000000001",
       now,
     );
     expect(sender.sendCode).not.toHaveBeenCalled();
