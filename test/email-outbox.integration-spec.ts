@@ -115,46 +115,82 @@ describe("durable email delivery outbox integration", () => {
     expect(proofs.rows[0]?.count).toBe(1);
   });
 
-  it("suppresses password reset links for passwordless accounts without sending mail", async () => {
+  it("suppresses and redacts legacy password reset link rows without reinterpreting or sending them", async () => {
+    const sendCode = jest.spyOn(sender, "sendCode").mockResolvedValue(undefined);
     const sendLink = jest.spyOn(sender, "sendLink").mockResolvedValue(undefined);
-    await pool.query(`UPDATE "users" SET "password" = NULL WHERE "email" = 'integration@example.test'`);
-    const requested = await request(app.getHttpServer())
-      .post("/graphql")
-      .set("x-device-id", "passwordless-reset-device")
-      .send({
-        query: `mutation RequestPasswordReset($input: RequestPasswordResetInput!) {
-          requestPasswordReset(input: $input) { ok }
-        }`,
-        variables: { input: { email: "integration@example.test" } },
-      });
+    await pool.query(`
+      INSERT INTO "emailDeliveryOutbox"
+        ("kind", "email", "requestIpHash", "status", "expiresAt", "lastError")
+      VALUES
+        ('PASSWORD_RESET_LINK', 'integration@example.test', repeat('a', 64), 'PENDING',
+         now() + interval '10 minutes', 'legacy-sensitive-error')
+    `);
 
-    expect(requested.body).toEqual({ data: { requestPasswordReset: { ok: true } } });
+    await expect(worker.runOnce(new Date(Date.now() + 1_000))).resolves.toBe(true);
+
+    expect(sendCode).not.toHaveBeenCalled();
+    expect(sendLink).not.toHaveBeenCalled();
+    const state = await pool.query<{
+      email: string;
+      lastError: string | null;
+      payloadCiphertext: string | null;
+      proofCount: number;
+      proofId: string | null;
+      requestIpHash: string | null;
+      status: string;
+    }>(`
+      SELECT o."email", o."lastError", o."payloadCiphertext", o."proofId", o."requestIpHash", o."status",
+        (SELECT count(*)::int FROM "emailVerification" v
+          WHERE v."email" = 'integration@example.test' AND v."purpose" = 'PASSWORD_RESET') AS "proofCount"
+      FROM "emailDeliveryOutbox" o
+    `);
+    expect(state.rows).toEqual([
+      {
+        email: "redacted@invalid",
+        lastError: null,
+        payloadCiphertext: null,
+        proofCount: 0,
+        proofId: null,
+        requestIpHash: null,
+        status: "SUPPRESSED",
+      },
+    ]);
+  });
+
+  it("suppresses password reset codes for passwordless accounts without sending mail", async () => {
+    const sendCode = jest.spyOn(sender, "sendCode").mockResolvedValue(undefined);
+    await pool.query(`UPDATE "users" SET "password" = NULL WHERE "email" = 'integration@example.test'`);
+    const requested = await requestEmail(
+      app,
+      "requestPasswordResetCode",
+      "integration@example.test",
+      "passwordless-reset-device",
+    );
+
+    expect(requested.body).toEqual({ data: { requestPasswordResetCode: { ok: true } } });
     await worker.runOnce(new Date(Date.now() + 1_000));
 
-    expect(sendLink).not.toHaveBeenCalled();
+    expect(sendCode).not.toHaveBeenCalled();
     const rows = await pool.query<{ kind: string; status: string }>(
       `SELECT "kind", "status" FROM "emailDeliveryOutbox"`,
     );
-    expect(rows.rows).toEqual([{ kind: "PASSWORD_RESET_LINK", status: "SUPPRESSED" }]);
+    expect(rows.rows).toEqual([{ kind: "PASSWORD_RESET_CODE", status: "SUPPRESSED" }]);
   });
 
-  it("delivers password reset links when the stored password is empty but non-null", async () => {
-    const sendLink = jest.spyOn(sender, "sendLink").mockResolvedValue(undefined);
+  it("delivers password reset codes when the stored password is empty but non-null", async () => {
+    const sendCode = jest.spyOn(sender, "sendCode").mockResolvedValue(undefined);
     await pool.query(`UPDATE "users" SET "password" = '' WHERE "email" = 'integration@example.test'`);
-    const requested = await request(app.getHttpServer())
-      .post("/graphql")
-      .set("x-device-id", "empty-password-reset-device")
-      .send({
-        query: `mutation RequestPasswordReset($input: RequestPasswordResetInput!) {
-          requestPasswordReset(input: $input) { ok }
-        }`,
-        variables: { input: { email: "integration@example.test" } },
-      });
+    const requested = await requestEmail(
+      app,
+      "requestPasswordResetCode",
+      "integration@example.test",
+      "empty-password-reset-device",
+    );
 
-    expect(requested.body).toEqual({ data: { requestPasswordReset: { ok: true } } });
+    expect(requested.body).toEqual({ data: { requestPasswordResetCode: { ok: true } } });
     await worker.runOnce(new Date(Date.now() + 1_000));
 
-    expect(sendLink).toHaveBeenCalledTimes(1);
+    expect(sendCode).toHaveBeenCalledTimes(1);
     const rows = await pool.query<{ status: string }>(`SELECT "status" FROM "emailDeliveryOutbox"`);
     expect(rows.rows).toEqual([{ status: "SENT" }]);
   });
@@ -304,7 +340,7 @@ describe("durable email delivery outbox integration", () => {
        VALUES
         ('SIGNUP_CODE', 'sent-history@example.test', repeat('a', 64), 'sent-ciphertext', 'sent-proof', 'SENT', $1, $1, $2, 'sent-error', $2),
         ('PASSWORD_RESET_CODE', 'suppressed-history@example.test', repeat('b', 64), 'suppressed-ciphertext', 'suppressed-proof', 'SUPPRESSED', $1, $1, NULL, 'suppressed-error', $2),
-        ('PASSWORD_RESET_LINK', 'failed-history@example.test', repeat('c', 64), 'failed-ciphertext', 'failed-proof', 'FAILED', $1, $1, NULL, 'failed-error', $2),
+        ('PASSWORD_RESET_CODE', 'failed-history@example.test', repeat('c', 64), 'failed-ciphertext', 'failed-proof', 'FAILED', $1, $1, NULL, 'failed-error', $2),
         ('SIGNUP_CODE', 'pending-history@example.test', repeat('d', 64), 'pending-ciphertext', 'pending-proof', 'PENDING', $1, $1, NULL, 'pending-error', $2)`,
       [new Date("2026-08-30T12:00:00.000Z"), retainedAt],
     );
@@ -427,7 +463,7 @@ describe("durable email delivery outbox integration", () => {
     await pool.query(
       `INSERT INTO "emailDeliveryOutbox"
         ("kind", "email", "requestIpHash", "payloadCiphertext", "proofId", "status", "expiresAt", "lastError", "updatedAt")
-       SELECT 'PASSWORD_RESET_LINK', 'scrub-batch-' || value || '@example.test', repeat('a', 64),
+       SELECT 'PASSWORD_RESET_CODE', 'scrub-batch-' || value || '@example.test', repeat('a', 64),
          'ciphertext', 'proof-' || value, 'FAILED', $1::timestamptz + interval '1 day', 'sensitive error',
          $1::timestamptz - interval '1 day'
        FROM generate_series(1, 101) AS value`,
@@ -505,7 +541,7 @@ describe("durable email delivery outbox integration", () => {
     await pool.query(
       `INSERT INTO "emailDeliveryOutbox"
         ("kind", "email", "requestIpHash", "payloadCiphertext", "proofId", "status", "expiresAt", "lastError", "updatedAt")
-       SELECT 'PASSWORD_RESET_LINK', 'retained-' || value || '@example.test', repeat('a', 64),
+       SELECT 'PASSWORD_RESET_CODE', 'retained-' || value || '@example.test', repeat('a', 64),
          'ciphertext', 'proof-' || value, 'FAILED', $1::timestamptz - interval '8 days', 'sensitive error',
          $1::timestamptz - interval '8 days'
        FROM generate_series(1, 101) AS value`,

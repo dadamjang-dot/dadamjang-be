@@ -114,21 +114,6 @@ describe("EmailService", () => {
     expect(repository.enqueueDelivery).not.toHaveBeenCalled();
   });
 
-  it("rejects link admission before account lookup or delivery work", async () => {
-    const repository = {
-      enqueueDelivery: jest.fn(),
-    } as unknown as EmailRepository;
-    const admissionLimiter = {
-      assertAllowed: jest.fn().mockRejectedValue(new CustomTooManyRequestsException("요청 횟수를 초과했습니다.")),
-    } as unknown as AdmissionLimiter;
-    const service = new EmailService(repository, config, admissionLimiter);
-
-    await expect(service.requestPasswordReset("user@example.test", { ip: "127.0.0.1" })).rejects.toBeInstanceOf(
-      CustomTooManyRequestsException,
-    );
-    expect(repository.enqueueDelivery).not.toHaveBeenCalled();
-  });
-
   it("rejects code verification before proof lookup or bcrypt work", async () => {
     const repository = {
       latestVerification: jest.fn(),
@@ -172,15 +157,11 @@ describe("EmailService", () => {
       Promise.all([
         service.requestPasswordResetCode("user@example.test", { ip: "127.0.0.1" }),
         service.requestPasswordResetCode("unknown@example.test", { ip: "127.0.0.2" }),
-        service.requestPasswordReset("user@example.test", { ip: "127.0.0.3" }),
-        service.requestPasswordReset("unknown@example.test", { ip: "127.0.0.4" }),
       ]),
-    ).resolves.toEqual(Array.from({ length: 4 }, () => ({ ok: true })));
+    ).resolves.toEqual([{ ok: true }, { ok: true }]);
     expect(enqueueDelivery.mock.calls.map(([input]) => input.kind)).toEqual([
       "PASSWORD_RESET_CODE",
       "PASSWORD_RESET_CODE",
-      "PASSWORD_RESET_LINK",
-      "PASSWORD_RESET_LINK",
     ]);
   });
 

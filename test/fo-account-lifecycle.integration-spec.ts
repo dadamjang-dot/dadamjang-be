@@ -353,8 +353,8 @@ const seedAnonymizationFixture = async (pool: Pool) => {
     );
     await client.query(
       `INSERT INTO "emailDeliveryOutbox" (id, kind, email, "payloadCiphertext", "proofId", status, "expiresAt")
-       VALUES ($1, 'PASSWORD_RESET_LINK', $2, 'anonymization-ciphertext', 'anonymization-reset', 'PENDING', now() + interval '10 minutes')`,
-      [fixture.outboxId, fixture.email],
+       VALUES ($1, 'PASSWORD_RESET_CODE', $2, 'anonymization-ciphertext', $3, 'PENDING', now() + interval '10 minutes')`,
+      [fixture.outboxId, fixture.email, fixture.verificationId],
     );
     await client.query(`INSERT INTO "authIdentity" ("userId", provider, "providerUserId") VALUES ($1, 'kakao', $2)`, [
       fixture.userId,
@@ -1519,7 +1519,7 @@ describe("FO account lifecycle", () => {
     await pool.query(`INSERT INTO carts ("userId") VALUES ($1)`, [otherUserId]);
     await pool.query(
       `INSERT INTO "emailDeliveryOutbox" (kind, email, status, "expiresAt")
-       VALUES ('PASSWORD_RESET_LINK', 'unrelated@example.test', 'PENDING', now() + interval '10 minutes')`,
+       VALUES ('PASSWORD_RESET_CODE', 'unrelated@example.test', 'PENDING', now() + interval '10 minutes')`,
     );
 
     await foAccountRepository.anonymizeDueBatch(100);
@@ -1607,7 +1607,7 @@ describe("FO account lifecycle", () => {
     const enqueue = emailRepository.enqueueDelivery({
       email: fixture.email,
       expiresAt: new Date(Date.now() + 10 * 60_000),
-      kind: "PASSWORD_RESET_LINK",
+      kind: "PASSWORD_RESET_CODE",
     });
     let blockerReleased = false;
     let firstRun: Promise<string[]> | undefined;

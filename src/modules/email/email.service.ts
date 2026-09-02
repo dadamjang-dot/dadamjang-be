@@ -76,12 +76,6 @@ export class EmailService {
     if (!proof) throw new CustomUnauthorizedException(EmailErrorMessage.InvalidCode);
     return { emailVerificationToken: token };
   };
-  requestPasswordReset = async (email: string, origin: RequestOrigin) => {
-    const normalizedEmail = this.normalizeEmail(email);
-    await this.admitEmailDelivery(normalizedEmail, origin);
-    await this.queueDelivery(normalizedEmail, origin.ip, EmailDeliveryKind.PasswordResetLink, 20 * 60_000);
-    return { ok: true };
-  };
   resetPassword = async (token: string, password: string, origin: RequestOrigin = { ip: "unknown" }) => {
     this.assertPassword(password);
     await this.admissionLimiter.assertAllowed(
