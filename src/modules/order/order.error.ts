@@ -1,5 +1,9 @@
 export enum OrderErrorMessage {
   IdempotencyKeyRequired = "idempotencyKey is required",
+  IdempotencyKeyTooLong = "idempotencyKey must not exceed 120 characters",
+  ExpectedCartInvalid = "expectedCart is invalid",
+  CartSnapshotChanged = "Cart snapshot changed",
+  CheckoutAttemptMalformed = "Completed checkout attempt is missing its order",
   CheckoutProcessing = "Checkout already processing",
   CartEmpty = "Cart is empty",
   CartContainsUnavailableItem = "Cart contains an unavailable item",

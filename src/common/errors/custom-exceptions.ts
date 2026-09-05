@@ -44,7 +44,10 @@ export class CustomServiceUnavailableException extends HttpException {
 }
 
 export class CustomConflictException extends HttpException {
-  constructor(message: string) {
+  constructor(
+    message: string,
+    readonly graphQlCode?: string,
+  ) {
     super(message, HttpStatus.CONFLICT);
   }
 }

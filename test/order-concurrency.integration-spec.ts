@@ -60,7 +60,19 @@ const addCartItem = async (app: INestApplication, accessToken: string, skuId: st
   expect(response.body.errors).toBeUndefined();
 };
 
-const checkout = (app: INestApplication, accessToken: string, idempotencyKey: string) =>
+type ExpectedCartItem = {
+  cartItemId: string;
+  skuId: string;
+  quantity: number;
+  unitPrice: number;
+};
+
+const checkout = (
+  app: INestApplication,
+  accessToken: string,
+  idempotencyKey: string,
+  expectedCart?: ExpectedCartItem[],
+) =>
   request(app.getHttpServer())
     .post("/graphql")
     .set("Authorization", `Bearer ${accessToken}`)
@@ -68,7 +80,19 @@ const checkout = (app: INestApplication, accessToken: string, idempotencyKey: st
       query: `mutation Checkout($input: CheckoutCartInput!) {
         checkoutCart(input: $input) { orderId status paymentStatus }
       }`,
-      variables: { input: { idempotencyKey } },
+      variables: { input: { idempotencyKey, expectedCart } },
+    })
+    .then((response) => response);
+
+const checkoutAttempt = (app: INestApplication, accessToken: string, idempotencyKey: string) =>
+  request(app.getHttpServer())
+    .post("/graphql")
+    .set("Authorization", `Bearer ${accessToken}`)
+    .send({
+      query: `query CheckoutAttempt($idempotencyKey: String!) {
+        checkoutAttempt(idempotencyKey: $idempotencyKey) { status orderId }
+      }`,
+      variables: { idempotencyKey },
     })
     .then((response) => response);
 
@@ -127,13 +151,24 @@ describe("PostgreSQL checkout concurrency", () => {
   it("returns one order to concurrent requests with the same idempotency key", async () => {
     const accessToken = await signin(app);
     await addCartItem(app, accessToken);
+    const cart = await pool.query<{ cartItemId: string }>(`SELECT "cartItemId" FROM "cartItems" WHERE "skuId" = $1`, [
+      FIXTURE.skuId,
+    ]);
+    const expectedCart = [
+      {
+        cartItemId: requireResult(cart.rows[0]).cartItemId,
+        skuId: FIXTURE.skuId,
+        quantity: 1,
+        unitPrice: 15000,
+      },
+    ];
     const blocker = await startBlockingTransaction(pool, `LOCK TABLE "checkoutIdempotencyKeys" IN SHARE MODE`);
     const requests: ReturnType<typeof checkout>[] = [];
     let released = false;
     let lockError: unknown;
     try {
-      requests.push(checkout(app, accessToken, "concurrent-same-key"));
-      requests.push(checkout(app, accessToken, "concurrent-same-key"));
+      requests.push(checkout(app, accessToken, "concurrent-same-key", expectedCart));
+      requests.push(checkout(app, accessToken, "concurrent-same-key", expectedCart));
       await waitFor(async () => {
         const waiting = await pool.query<{ count: number }>(
           `SELECT count(*)::int AS count
@@ -170,6 +205,57 @@ describe("PostgreSQL checkout concurrency", () => {
       [FIXTURE.skuId],
     );
     expect(state.rows[0]).toEqual({ cart_items: 0, idempotency_keys: 1, orders: 1, stock: 5 });
+  });
+
+  it.each([1, 2, 3, 4, 5])("D4 keeps an in-flight checkout unobserved until commit run %i", async (run) => {
+    const accessToken = await signin(app);
+    await addCartItem(app, accessToken);
+    const idempotencyKey = `checkout-before-commit-${run}`;
+    const blocker = await startBlockingTransaction(pool, `LOCK TABLE "activityEvents" IN SHARE MODE`);
+    const requestPromise = checkout(app, accessToken, idempotencyKey);
+    let released = false;
+    let lockError: unknown;
+    let beforeCommit: Awaited<ReturnType<typeof checkoutAttempt>> | undefined;
+    try {
+      await waitFor(() => hasWaitingQuery(pool, "activityEvents"));
+      beforeCommit = await checkoutAttempt(app, accessToken, idempotencyKey);
+      await blocker.query("COMMIT");
+      released = true;
+    } catch (error) {
+      lockError = error;
+    } finally {
+      if (!released) await blocker.query("ROLLBACK").catch(() => undefined);
+      blocker.release();
+    }
+    if (lockError) {
+      await Promise.allSettled([requestPromise]);
+      throw lockError;
+    }
+
+    const beforeCommitResponse = requireResult(beforeCommit);
+    const checkoutResponse = await requestPromise;
+    expect(checkoutResponse.body.errors).toBeUndefined();
+    const orderId = checkoutResponse.body.data.checkoutCart.orderId as string;
+    const afterCommit = await checkoutAttempt(app, accessToken, idempotencyKey);
+    const state = await pool.query<{
+      activity_events: number;
+      cart_items: number;
+      idempotency_keys: number;
+      orders: number;
+    }>(
+      `SELECT
+          (SELECT count(*)::int FROM "activityEvents" WHERE "subjectId" = $1) AS activity_events,
+          (SELECT count(*)::int FROM "cartItems") AS cart_items,
+          (SELECT count(*)::int FROM "checkoutIdempotencyKeys") AS idempotency_keys,
+          (SELECT count(*)::int FROM "orders") AS orders`,
+      [orderId],
+    );
+
+    expect(beforeCommitResponse.body.errors).toBeUndefined();
+    expect(beforeCommitResponse.body.data.checkoutAttempt).toEqual({ status: "NOT_OBSERVED", orderId: null });
+    expect(afterCommit.body.errors).toBeUndefined();
+    expect(afterCommit.body.data.checkoutAttempt).toEqual({ status: "CONFIRMED", orderId });
+    expect(state.rows[0]).toEqual({ activity_events: 1, cart_items: 0, idempotency_keys: 1, orders: 1 });
   });
 
   it("allows only one checkout to consume a cart across different idempotency keys", async () => {

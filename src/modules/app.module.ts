@@ -81,7 +81,13 @@ export const validateConfig = (environment: Record<string, unknown>) => {
         if (originalError instanceof HttpException)
           return {
             ...formattedError,
-            extensions: { ...extensions, code: graphQlErrorCode(originalError.getStatus()) },
+            extensions: {
+              ...extensions,
+              code:
+                "graphQlCode" in originalError && typeof originalError.graphQlCode === "string"
+                  ? originalError.graphQlCode
+                  : graphQlErrorCode(originalError.getStatus()),
+            },
           };
         if (hasDatabaseErrorCode(originalError, "22P02"))
           return { message: "Invalid identifier", extensions: { ...extensions, code: "BAD_USER_INPUT" } };

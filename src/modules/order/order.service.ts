@@ -2,11 +2,17 @@ import { Inject, Injectable } from "@nestjs/common";
 import { and, desc, eq, inArray } from "drizzle-orm";
 import {
   CustomBadRequestException,
+  CustomConflictException,
   CustomNotFoundException,
   CustomUnauthorizedException,
 } from "src/common/errors/custom-exceptions";
 import { requireResult } from "src/common/invariants/require-result";
-import { assertCartItemCount, calculateCartTotal, MAX_CART_ITEMS } from "src/modules/cart/cart-invariants";
+import {
+  assertCartItemCount,
+  calculateCartTotal,
+  MAX_CART_ITEMS,
+  MAX_GRAPHQL_MONEY,
+} from "src/modules/cart/cart-invariants";
 import { OrderErrorMessage, getInsufficientStockMessage } from "./order.error";
 import { Database, DRIZZLE } from "src/modules/database/database.module";
 import {
@@ -21,22 +27,95 @@ import {
   users,
 } from "src/modules/database/schema";
 
-type CheckoutInput = { idempotencyKey?: string };
+type CheckoutInput = { idempotencyKey?: string; expectedCart?: unknown };
+type ExpectedCartItem = {
+  cartItemId: string;
+  skuId: string;
+  quantity: number;
+  unitPrice: number;
+};
+const MAX_IDEMPOTENCY_KEY_LENGTH = 120;
 const MAX_LEGACY_COLLECTION_SIZE = 100;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const orderNumber = () =>
   `DJ-${new Date().toISOString().slice(0, 10).replaceAll("-", "")}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
+
+const normalizeIdempotencyKey = (idempotencyKey: string | undefined) => {
+  const checkoutKey = idempotencyKey?.trim();
+  if (!checkoutKey) throw new CustomBadRequestException(OrderErrorMessage.IdempotencyKeyRequired);
+  if ([...checkoutKey].length > MAX_IDEMPOTENCY_KEY_LENGTH)
+    throw new CustomBadRequestException(OrderErrorMessage.IdempotencyKeyTooLong);
+  return checkoutKey;
+};
+
+const invalidExpectedCart = () => new CustomBadRequestException(OrderErrorMessage.ExpectedCartInvalid);
+const cartSnapshotChanged = () =>
+  new CustomConflictException(OrderErrorMessage.CartSnapshotChanged, "CART_SNAPSHOT_CHANGED");
+
+const validateExpectedCart = (expectedCart: unknown): ExpectedCartItem[] | undefined => {
+  if (expectedCart === undefined || expectedCart === null) return undefined;
+  if (!Array.isArray(expectedCart) || expectedCart.length < 1 || expectedCart.length > MAX_CART_ITEMS)
+    throw invalidExpectedCart();
+  const cartItemIds = new Set<string>();
+  const skuIds = new Set<string>();
+  const items: ExpectedCartItem[] = [];
+  for (const value of expectedCart) {
+    if (!value || typeof value !== "object") throw invalidExpectedCart();
+    const item = value as Record<string, unknown>;
+    const { cartItemId, skuId, quantity, unitPrice } = item;
+    if (
+      typeof cartItemId !== "string" ||
+      !UUID_PATTERN.test(cartItemId) ||
+      typeof skuId !== "string" ||
+      !UUID_PATTERN.test(skuId) ||
+      typeof quantity !== "number" ||
+      !Number.isInteger(quantity) ||
+      quantity < 1 ||
+      quantity > MAX_GRAPHQL_MONEY ||
+      typeof unitPrice !== "number" ||
+      !Number.isInteger(unitPrice) ||
+      unitPrice < 0 ||
+      unitPrice > MAX_GRAPHQL_MONEY
+    )
+      throw invalidExpectedCart();
+    const normalizedCartItemId = cartItemId.toLowerCase();
+    const normalizedSkuId = skuId.toLowerCase();
+    if (cartItemIds.has(normalizedCartItemId) || skuIds.has(normalizedSkuId)) throw invalidExpectedCart();
+    cartItemIds.add(normalizedCartItemId);
+    skuIds.add(normalizedSkuId);
+    items.push({ cartItemId: normalizedCartItemId, skuId: normalizedSkuId, quantity, unitPrice });
+  }
+  return items.sort((left, right) => left.cartItemId.localeCompare(right.cartItemId));
+};
 
 @Injectable()
 export class OrderService {
   constructor(@Inject(DRIZZLE) private readonly db: Database) {}
 
-  checkoutCart = async (userId: string, input: CheckoutInput) =>
-    this.db.transaction(async (tx) => {
-      if (!input.idempotencyKey?.trim()) throw new CustomBadRequestException(OrderErrorMessage.IdempotencyKeyRequired);
+  checkoutAttempt = async (userId: string, idempotencyKey: string) => {
+    const checkoutKey = normalizeIdempotencyKey(idempotencyKey);
+    const [attempt] = await this.db
+      .select({
+        status: checkoutIdempotencyKeys.status,
+        idempotencyOrderId: checkoutIdempotencyKeys.orderId,
+        orderId: orders.orderId,
+      })
+      .from(checkoutIdempotencyKeys)
+      .leftJoin(orders, and(eq(checkoutIdempotencyKeys.orderId, orders.orderId), eq(orders.userId, userId)))
+      .where(and(eq(checkoutIdempotencyKeys.userId, userId), eq(checkoutIdempotencyKeys.idempotencyKey, checkoutKey)))
+      .limit(1);
+    if (!attempt || attempt.status !== "COMPLETED") return { status: "NOT_OBSERVED" as const, orderId: null };
+    if (!attempt.idempotencyOrderId || !attempt.orderId) throw new Error(OrderErrorMessage.CheckoutAttemptMalformed);
+    return { status: "CONFIRMED" as const, orderId: attempt.orderId };
+  };
+
+  checkoutCart = async (userId: string, input: CheckoutInput) => {
+    const checkoutKey = normalizeIdempotencyKey(input.idempotencyKey);
+    const expectedCart = validateExpectedCart(input.expectedCart);
+    return this.db.transaction(async (tx) => {
       const [user] = await tx.select().from(users).where(eq(users.userId, userId)).limit(1).for("no key update");
       if (!user || user.deactivatedAt || user.anonymizedAt)
         throw new CustomUnauthorizedException(OrderErrorMessage.AuthenticationRequired);
-      const checkoutKey = input.idempotencyKey.trim();
       const [idempotencyRecord] = await tx
         .insert(checkoutIdempotencyKeys)
         .values({ userId, idempotencyKey: checkoutKey })
@@ -50,7 +129,9 @@ export class OrderService {
             and(eq(checkoutIdempotencyKeys.userId, userId), eq(checkoutIdempotencyKeys.idempotencyKey, checkoutKey)),
           )
           .limit(1);
-        if (!existingIdempotency?.orderId) throw new CustomBadRequestException(OrderErrorMessage.CheckoutProcessing);
+        if (!existingIdempotency || existingIdempotency.status !== "COMPLETED")
+          throw new CustomBadRequestException(OrderErrorMessage.CheckoutProcessing);
+        if (!existingIdempotency.orderId) throw new Error(OrderErrorMessage.CheckoutAttemptMalformed);
         await tx.insert(activityEvents).values({
           actorUserId: userId,
           eventType: "CHECKOUT_IDEMPOTENCY_REUSED",
@@ -62,7 +143,10 @@ export class OrderService {
       }
 
       const [cart] = await tx.select().from(carts).where(eq(carts.userId, userId)).limit(1).for("update");
-      if (!cart) throw new CustomBadRequestException(OrderErrorMessage.CartEmpty);
+      if (!cart) {
+        if (expectedCart) throw cartSnapshotChanged();
+        throw new CustomBadRequestException(OrderErrorMessage.CartEmpty);
+      }
       const rows = await tx
         .select()
         .from(cartItems)
@@ -71,6 +155,30 @@ export class OrderService {
         .where(eq(cartItems.cartId, cart.cartId))
         .limit(MAX_CART_ITEMS + 1);
       assertCartItemCount(rows.length);
+      if (expectedCart) {
+        const currentCart = rows
+          .map(({ cartItems: item, productSkus: sku }) => ({
+            cartItemId: item.cartItemId,
+            skuId: sku.skuId,
+            quantity: item.quantity,
+            unitPrice: sku.price,
+          }))
+          .sort((left, right) => left.cartItemId.localeCompare(right.cartItemId));
+        if (
+          currentCart.length !== expectedCart.length ||
+          expectedCart.some((item, index) => {
+            const currentItem = currentCart[index];
+            return (
+              !currentItem ||
+              currentItem.cartItemId !== item.cartItemId ||
+              currentItem.skuId !== item.skuId ||
+              currentItem.quantity !== item.quantity ||
+              currentItem.unitPrice !== item.unitPrice
+            );
+          })
+        )
+          throw cartSnapshotChanged();
+      }
       if (rows.length === 0) throw new CustomBadRequestException(OrderErrorMessage.CartEmpty);
       if (rows.some(({ productSkus: sku, products: product }) => !sku.isActive || product.status !== "PUBLISHED"))
         throw new CustomBadRequestException(OrderErrorMessage.CartContainsUnavailableItem);
@@ -108,6 +216,7 @@ export class OrderService {
         items: await tx.select().from(orderItems).where(eq(orderItems.orderId, order.orderId)),
       };
     });
+  };
 
   listOrders = async (userId: string) => {
     const userOrders = (

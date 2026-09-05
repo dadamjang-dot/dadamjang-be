@@ -1,6 +1,16 @@
 import { Field, InputType, Int, ObjectType } from "@nestjs/graphql";
 import type { OrderStatus, PaymentStatus } from "./order.constant";
 
+export type CheckoutAttemptStatus = "CONFIRMED" | "NOT_OBSERVED";
+
+@ObjectType()
+export class CheckoutAttemptType {
+  @Field(() => String)
+  status!: CheckoutAttemptStatus;
+  @Field(() => String, { nullable: true })
+  orderId!: string | null;
+}
+
 @ObjectType()
 export class OrderItemType {
   @Field()
@@ -40,7 +50,21 @@ export class OrderType {
 }
 
 @InputType()
+export class CheckoutExpectedCartItemInput {
+  @Field(() => String)
+  cartItemId!: string;
+  @Field(() => String)
+  skuId!: string;
+  @Field(() => Int)
+  quantity!: number;
+  @Field(() => Int)
+  unitPrice!: number;
+}
+
+@InputType()
 export class CheckoutCartInput {
   @Field(() => String)
   idempotencyKey!: string;
+  @Field(() => [CheckoutExpectedCartItemInput], { nullable: true })
+  expectedCart?: CheckoutExpectedCartItemInput[] | null;
 }

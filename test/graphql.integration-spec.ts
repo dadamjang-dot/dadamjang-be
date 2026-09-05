@@ -82,6 +82,20 @@ const waitForAdvisoryWaiters = async (pool: Pool, expected: number) => {
   throw new Error(`Timed out waiting for ${expected} advisory lock waiters`);
 };
 
+const checkoutState = async (pool: Pool) => {
+  const state = await pool.query<{ snapshot: Record<string, unknown> }>(
+    `SELECT jsonb_build_object(
+      'orders', (SELECT coalesce(jsonb_agg(to_jsonb(row) ORDER BY row."orderId"), '[]'::jsonb) FROM "orders" row),
+      'orderItems', (SELECT coalesce(jsonb_agg(to_jsonb(row) ORDER BY row."orderItemId"), '[]'::jsonb) FROM "orderItems" row),
+      'carts', (SELECT coalesce(jsonb_agg(to_jsonb(row) ORDER BY row."cartId"), '[]'::jsonb) FROM "carts" row),
+      'cartItems', (SELECT coalesce(jsonb_agg(to_jsonb(row) ORDER BY row."cartItemId"), '[]'::jsonb) FROM "cartItems" row),
+      'checkoutIdempotencyKeys', (SELECT coalesce(jsonb_agg(to_jsonb(row) ORDER BY row."checkoutIdempotencyKeyId"), '[]'::jsonb) FROM "checkoutIdempotencyKeys" row),
+      'activityEvents', (SELECT coalesce(jsonb_agg(to_jsonb(row) ORDER BY row."eventId"), '[]'::jsonb) FROM "activityEvents" row)
+    ) AS snapshot`,
+  );
+  return state.rows[0]?.snapshot;
+};
+
 describe("PostgreSQL GraphQL integration", () => {
   let app: INestApplication;
   let pool: Pool;
@@ -820,6 +834,109 @@ describe("PostgreSQL GraphQL integration", () => {
     expect(removed.body.data.removeWish).toBe(true);
   });
 
+  it("returns NOT_OBSERVED for missing, processing, and another user's checkout attempt without writes", async () => {
+    const agent = request.agent(app.getHttpServer());
+    const accessToken = await signin(agent);
+    const auth = { Authorization: `Bearer ${accessToken}` };
+    const otherUserId = "10000000-0000-4000-8000-000000000099";
+    const otherOrderId = "90000000-0000-4000-8000-000000000099";
+    await pool.query(
+      `INSERT INTO "users" ("userId", userid, email, role)
+       VALUES ($1, 'checkout-attempt-other', 'checkout-attempt-other@example.test', 'USER')`,
+      [otherUserId],
+    );
+    await pool.query(
+      `INSERT INTO "orders" ("orderId", "orderNumber", "userId", "totalAmount")
+       VALUES ($1, 'DJ-CHECKOUT-OTHER', $2, 15000)`,
+      [otherOrderId, otherUserId],
+    );
+    await pool.query(
+      `INSERT INTO "checkoutIdempotencyKeys" ("userId", "idempotencyKey", "orderId", status)
+       VALUES ($1, 'processing-attempt', NULL, 'PROCESSING'), ($2, 'foreign-attempt', $3, 'COMPLETED')`,
+      [FIXTURE.userId, otherUserId, otherOrderId],
+    );
+    const before = await checkoutState(pool);
+    const query = `query CheckoutAttempt($idempotencyKey: String!) {
+      checkoutAttempt(idempotencyKey: $idempotencyKey) { status orderId }
+    }`;
+
+    const responses = await Promise.all(
+      ["missing-attempt", "processing-attempt", "foreign-attempt"].map((idempotencyKey) =>
+        agent.post("/graphql").set(auth).send({ query, variables: { idempotencyKey } }),
+      ),
+    );
+
+    expect(responses.map(({ body }) => body.errors)).toEqual([undefined, undefined, undefined]);
+    expect(responses.map(({ body }) => body.data.checkoutAttempt)).toEqual([
+      { status: "NOT_OBSERVED", orderId: null },
+      { status: "NOT_OBSERVED", orderId: null },
+      { status: "NOT_OBSERVED", orderId: null },
+    ]);
+    await expect(checkoutState(pool)).resolves.toEqual(before);
+  });
+
+  it("returns the owned committed checkout attempt after trimming its key", async () => {
+    const agent = request.agent(app.getHttpServer());
+    const accessToken = await signin(agent);
+    const orderId = "90000000-0000-4000-8000-000000000098";
+    await pool.query(
+      `INSERT INTO "orders" ("orderId", "orderNumber", "userId", "totalAmount")
+       VALUES ($1, 'DJ-CHECKOUT-OWNED', $2, 15000)`,
+      [orderId, FIXTURE.userId],
+    );
+    await pool.query(
+      `INSERT INTO "checkoutIdempotencyKeys" ("userId", "idempotencyKey", "orderId", status)
+       VALUES ($1, 'owned-attempt', $2, 'COMPLETED')`,
+      [FIXTURE.userId, orderId],
+    );
+    const before = await checkoutState(pool);
+
+    const response = await agent.post("/graphql").set("Authorization", `Bearer ${accessToken}`).send({
+      query: `query { checkoutAttempt(idempotencyKey: "  owned-attempt  ") { status orderId } }`,
+    });
+
+    expect(response.body.errors).toBeUndefined();
+    expect(response.body.data.checkoutAttempt).toEqual({ status: "CONFIRMED", orderId });
+    await expect(checkoutState(pool)).resolves.toEqual(before);
+  });
+
+  it("reports malformed completed checkout attempt data as an internal error", async () => {
+    const agent = request.agent(app.getHttpServer());
+    const accessToken = await signin(agent);
+    await pool.query(
+      `INSERT INTO "checkoutIdempotencyKeys" ("userId", "idempotencyKey", "orderId", status)
+       VALUES ($1, 'malformed-attempt', NULL, 'COMPLETED')`,
+      [FIXTURE.userId],
+    );
+
+    const response = await agent
+      .post("/graphql")
+      .set("Authorization", `Bearer ${accessToken}`)
+      .send({ query: `query { checkoutAttempt(idempotencyKey: "malformed-attempt") { status orderId } }` });
+
+    expect(response.body.data).toBeNull();
+    expect(response.body.errors[0]).toMatchObject({
+      message: "Internal server error",
+      extensions: { code: "INTERNAL_SERVER_ERROR" },
+    });
+  });
+
+  it.each(["   ", "x".repeat(121)])("rejects invalid checkout attempt key %j", async (idempotencyKey) => {
+    const agent = request.agent(app.getHttpServer());
+    const accessToken = await signin(agent);
+    const response = await agent
+      .post("/graphql")
+      .set("Authorization", `Bearer ${accessToken}`)
+      .send({
+        query: `query CheckoutAttempt($idempotencyKey: String!) {
+          checkoutAttempt(idempotencyKey: $idempotencyKey) { status orderId }
+        }`,
+        variables: { idempotencyKey },
+      });
+
+    expect(response.body.errors[0].extensions.code).toBe("BAD_USER_INPUT");
+  });
+
   it("creates a payment-pending order idempotently without claiming approval", async () => {
     const agent = request.agent(app.getHttpServer());
     const accessToken = await signin(agent);
@@ -903,7 +1020,7 @@ describe("PostgreSQL GraphQL integration", () => {
       .send({ query: `{ __type(name: "CheckoutCartInput") { inputFields { name } } }` });
     expect(rejected.status).toBe(400);
     expect(rejected.body.data).toBeUndefined();
-    expect(schema.body.data.__type.inputFields).toEqual([{ name: "idempotencyKey" }]);
+    expect(schema.body.data.__type.inputFields).toEqual([{ name: "idempotencyKey" }, { name: "expectedCart" }]);
     const state = await pool.query<{ cart_items: number; orders: number; stock: number }>(
       `SELECT
         (SELECT count(*)::int FROM "cartItems") AS cart_items,
@@ -912,5 +1029,163 @@ describe("PostgreSQL GraphQL integration", () => {
       [FIXTURE.secondSkuId],
     );
     expect(state.rows[0]).toEqual({ cart_items: 1, orders: 0, stock: 1 });
+  });
+
+  it("replays a completed checkout before reading a changed cart snapshot", async () => {
+    const agent = request.agent(app.getHttpServer());
+    const accessToken = await signin(agent);
+    const auth = { Authorization: `Bearer ${accessToken}` };
+    const cart = await agent
+      .post("/graphql")
+      .set(auth)
+      .send({
+        query: `mutation { upsertCartItem(input: { skuId: "${FIXTURE.skuId}", quantity: 2 }) {
+          items { cartItemId quantity sku { skuId price } }
+        } }`,
+      });
+    const item = cart.body.data.upsertCartItem.items[0];
+    const expectedCart = [
+      {
+        cartItemId: item.cartItemId,
+        skuId: item.sku.skuId,
+        quantity: item.quantity,
+        unitPrice: item.sku.price,
+      },
+    ];
+    const mutation = `mutation Checkout($input: CheckoutCartInput!) {
+      checkoutCart(input: $input) { orderId status paymentStatus totalAmount }
+    }`;
+    const input = { idempotencyKey: "replay-before-snapshot", expectedCart };
+    const first = await agent.post("/graphql").set(auth).send({ query: mutation, variables: { input } });
+    await agent
+      .post("/graphql")
+      .set(auth)
+      .send({
+        query: `mutation { upsertCartItem(input: { skuId: "${FIXTURE.secondSkuId}", quantity: 1 }) { cartId } }`,
+      });
+
+    const replay = await agent.post("/graphql").set(auth).send({ query: mutation, variables: { input } });
+    const currentCart = await agent
+      .post("/graphql")
+      .set(auth)
+      .send({ query: `{ cart { items { sku { skuId } quantity } } }` });
+    const orders = await pool.query<{ count: number }>(`SELECT count(*)::int AS count FROM "orders"`);
+
+    expect(first.body.errors).toBeUndefined();
+    expect(first.body.data.checkoutCart).toMatchObject({
+      status: "PAYMENT_PENDING",
+      paymentStatus: "PENDING",
+      totalAmount: 30000,
+    });
+    expect(replay.body.errors).toBeUndefined();
+    expect(replay.body.data.checkoutCart.orderId).toBe(first.body.data.checkoutCart.orderId);
+    expect(currentCart.body.data.cart.items).toEqual([{ sku: { skuId: FIXTURE.secondSkuId }, quantity: 1 }]);
+    expect(orders.rows[0]?.count).toBe(1);
+  });
+
+  it.each(["cartItemId", "skuId", "quantity", "unitPrice"])(
+    "rejects a %s cart snapshot mismatch and rolls back checkout",
+    async (changedField) => {
+      const agent = request.agent(app.getHttpServer());
+      const accessToken = await signin(agent);
+      const auth = { Authorization: `Bearer ${accessToken}` };
+      const cart = await agent
+        .post("/graphql")
+        .set(auth)
+        .send({
+          query: `mutation { upsertCartItem(input: { skuId: "${FIXTURE.skuId}", quantity: 1 }) {
+            items { cartItemId quantity sku { skuId price } }
+          } }`,
+        });
+      expect(cart.body.errors).toBeUndefined();
+      const item = cart.body.data.upsertCartItem.items[0];
+      const expectedItem = {
+        cartItemId: item.cartItemId,
+        skuId: item.sku.skuId,
+        quantity: item.quantity,
+        unitPrice: item.sku.price,
+      };
+      const expectedCart = [expectedItem];
+      if (changedField === "cartItemId") expectedItem.cartItemId = "00000000-0000-4000-8000-000000000099";
+      if (changedField === "skuId") expectedItem.skuId = FIXTURE.secondSkuId;
+      if (changedField === "quantity")
+        await agent
+          .post("/graphql")
+          .set(auth)
+          .send({
+            query: `mutation { upsertCartItem(input: { skuId: "${FIXTURE.skuId}", quantity: 2 }) { cartId } }`,
+          });
+      if (changedField === "unitPrice")
+        await pool.query(`UPDATE "productSkus" SET price = 16000 WHERE "skuId" = $1`, [FIXTURE.skuId]);
+      const before = await checkoutState(pool);
+
+      const response = await agent
+        .post("/graphql")
+        .set(auth)
+        .send({
+          query: `mutation Checkout($input: CheckoutCartInput!) {
+            checkoutCart(input: $input) { orderId }
+          }`,
+          variables: { input: { idempotencyKey: `snapshot-${changedField}`, expectedCart } },
+        });
+
+      expect(response.body.data).toBeNull();
+      expect(response.body.errors[0]).toMatchObject({
+        message: "Cart snapshot changed",
+        extensions: { code: "CART_SNAPSHOT_CHANGED" },
+      });
+      await expect(checkoutState(pool)).resolves.toEqual(before);
+    },
+  );
+
+  it("normalizes a matching cart snapshot and keeps server prices", async () => {
+    const agent = request.agent(app.getHttpServer());
+    const accessToken = await signin(agent);
+    const auth = { Authorization: `Bearer ${accessToken}` };
+    await agent
+      .post("/graphql")
+      .set(auth)
+      .send({
+        query: `mutation { upsertCartItem(input: { skuId: "${FIXTURE.skuId}", quantity: 1 }) { cartId } }`,
+      });
+    const cart = await agent
+      .post("/graphql")
+      .set(auth)
+      .send({
+        query: `mutation { upsertCartItem(input: { skuId: "${FIXTURE.secondSkuId}", quantity: 1 }) {
+          items { cartItemId quantity sku { skuId price } }
+        } }`,
+      });
+    const expectedCart = cart.body.data.upsertCartItem.items
+      .map((item: { cartItemId: string; quantity: number; sku: { skuId: string; price: number } }) => ({
+        cartItemId: item.cartItemId.toUpperCase(),
+        skuId: item.sku.skuId.toUpperCase(),
+        quantity: item.quantity,
+        unitPrice: item.sku.price,
+      }))
+      .reverse();
+
+    const response = await agent
+      .post("/graphql")
+      .set(auth)
+      .send({
+        query: `mutation Checkout($input: CheckoutCartInput!) {
+          checkoutCart(input: $input) { status paymentStatus totalAmount items { skuId unitPrice quantity } }
+        }`,
+        variables: { input: { idempotencyKey: "normalized-snapshot", expectedCart } },
+      });
+
+    expect(response.body.errors).toBeUndefined();
+    expect(response.body.data.checkoutCart).toMatchObject({
+      status: "PAYMENT_PENDING",
+      paymentStatus: "PENDING",
+      totalAmount: 45000,
+    });
+    expect(response.body.data.checkoutCart.items).toEqual(
+      expect.arrayContaining([
+        { skuId: FIXTURE.skuId, unitPrice: 15000, quantity: 1 },
+        { skuId: FIXTURE.secondSkuId, unitPrice: 30000, quantity: 1 },
+      ]),
+    );
   });
 });
