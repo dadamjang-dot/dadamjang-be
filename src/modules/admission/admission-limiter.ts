@@ -1,8 +1,9 @@
 import { Inject, Injectable } from "@nestjs/common";
-import { createHash } from "crypto";
+import { createHash, timingSafeEqual } from "crypto";
+import { isIP } from "node:net";
 import { sql } from "drizzle-orm";
 import type { Request } from "express";
-import { CustomTooManyRequestsException } from "src/common/errors/custom-exceptions";
+import { CustomBadRequestException, CustomTooManyRequestsException } from "src/common/errors/custom-exceptions";
 import { Database, DRIZZLE } from "src/modules/database/database.module";
 import { requestAdmissions } from "src/modules/database/schema";
 
@@ -24,7 +25,22 @@ class AdmissionRejected extends Error {
 export const requestOriginFromRequest = (req: Pick<Request, "headers" | "ip">): RequestOrigin => {
   const value = req.headers["x-device-id"];
   const deviceId = (Array.isArray(value) ? value[0] : value)?.trim();
-  const ip = req.ip?.trim() || "unknown";
+  let ip = req.ip?.trim() || "unknown";
+  const secret = process.env.DADAMJANG_BFF_SECRET;
+  const presented = req.headers["x-dadamjang-bff-secret"];
+  const forwardedIp = req.headers["x-dadamjang-client-ip"];
+  if (presented !== undefined || forwardedIp !== undefined) {
+    if (
+      !secret ||
+      secret.length < 32 ||
+      typeof presented !== "string" ||
+      !timingSafeEqual(createHash("sha256").update(secret).digest(), createHash("sha256").update(presented).digest())
+    )
+      throw new CustomBadRequestException("Untrusted BFF request origin");
+    if (typeof forwardedIp !== "string" || !isIP(forwardedIp))
+      throw new CustomBadRequestException("Invalid BFF client IP");
+    ip = forwardedIp;
+  }
   return deviceId ? { ip, deviceId } : { ip };
 };
 
