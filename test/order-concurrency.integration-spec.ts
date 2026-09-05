@@ -60,7 +60,19 @@ const addCartItem = async (app: INestApplication, accessToken: string, skuId: st
   expect(response.body.errors).toBeUndefined();
 };
 
-const checkout = (app: INestApplication, accessToken: string, idempotencyKey: string) =>
+type ExpectedCartItem = {
+  cartItemId: string;
+  skuId: string;
+  quantity: number;
+  unitPrice: number;
+};
+
+const checkout = (
+  app: INestApplication,
+  accessToken: string,
+  idempotencyKey: string,
+  expectedCart?: ExpectedCartItem[],
+) =>
   request(app.getHttpServer())
     .post("/graphql")
     .set("Authorization", `Bearer ${accessToken}`)
@@ -68,7 +80,7 @@ const checkout = (app: INestApplication, accessToken: string, idempotencyKey: st
       query: `mutation Checkout($input: CheckoutCartInput!) {
         checkoutCart(input: $input) { orderId status paymentStatus }
       }`,
-      variables: { input: { idempotencyKey } },
+      variables: { input: { idempotencyKey, expectedCart } },
     })
     .then((response) => response);
 
@@ -127,13 +139,24 @@ describe("PostgreSQL checkout concurrency", () => {
   it("returns one order to concurrent requests with the same idempotency key", async () => {
     const accessToken = await signin(app);
     await addCartItem(app, accessToken);
+    const cart = await pool.query<{ cartItemId: string }>(`SELECT "cartItemId" FROM "cartItems" WHERE "skuId" = $1`, [
+      FIXTURE.skuId,
+    ]);
+    const expectedCart = [
+      {
+        cartItemId: requireResult(cart.rows[0]).cartItemId,
+        skuId: FIXTURE.skuId,
+        quantity: 1,
+        unitPrice: 15000,
+      },
+    ];
     const blocker = await startBlockingTransaction(pool, `LOCK TABLE "checkoutIdempotencyKeys" IN SHARE MODE`);
     const requests: ReturnType<typeof checkout>[] = [];
     let released = false;
     let lockError: unknown;
     try {
-      requests.push(checkout(app, accessToken, "concurrent-same-key"));
-      requests.push(checkout(app, accessToken, "concurrent-same-key"));
+      requests.push(checkout(app, accessToken, "concurrent-same-key", expectedCart));
+      requests.push(checkout(app, accessToken, "concurrent-same-key", expectedCart));
       await waitFor(async () => {
         const waiting = await pool.query<{ count: number }>(
           `SELECT count(*)::int AS count

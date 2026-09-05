@@ -6,7 +6,7 @@ import { CustomUnauthorizedException } from "src/common/errors/custom-exceptions
 import { JwtAccessTokenGuard } from "src/guards/access-token.guard";
 import { RolesGuard } from "src/guards/roles.guard";
 import { OrderErrorMessage } from "./order.error";
-import { CheckoutCartInput, OrderType } from "./order.types";
+import { CheckoutAttemptType, CheckoutCartInput, OrderType } from "./order.types";
 import { OrderService } from "./order.service";
 
 const currentUserId = (context: { req?: { user?: { userId?: string } } }) => {
@@ -20,6 +20,13 @@ const currentUserId = (context: { req?: { user?: { userId?: string } } }) => {
 @Roles(UserRole.User)
 export class OrderResolver {
   constructor(private readonly orderService: OrderService) {}
+  @Query(() => CheckoutAttemptType)
+  checkoutAttempt(
+    @Args("idempotencyKey", { type: () => String }) idempotencyKey: string,
+    @Context() context: { req?: { user?: { userId?: string } } },
+  ) {
+    return this.orderService.checkoutAttempt(currentUserId(context), idempotencyKey);
+  }
   @Query(() => [OrderType])
   orders(@Context() context: { req?: { user?: { userId?: string } } }) {
     return this.orderService.listOrders(currentUserId(context));
